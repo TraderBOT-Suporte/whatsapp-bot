@@ -1,6 +1,6 @@
 // ===================== whatsapp-bot.js =====================
 // Bot WhatsApp Profissional com Firebase, Redis, API REST e gestao completa
-// v5.0.0 - Com múltiplos administradores, comandos via WhatsApp e frontend
+// v5.1.0 – Sessão persistente no Firestore (portável)
 
 import express from 'express';
 import cors from 'cors';
@@ -132,12 +132,18 @@ let groupConfig = {};
 let generatedCodesCache = {};
 const GENERATED_CODES_FILE = path.join(__dirname, 'generated-codes.json');
 
-// ========== ESTRATÉGIA DE AUTENTICAÇÃO VIA FIRESTORE ==========
+// ========== ESTRATÉGIA DE AUTENTICAÇÃO VIA FIRESTORE (CORRIGIDA) ==========
 class FirestoreAuth {
   constructor({ db, collectionName = 'sessions', sessionKey = 'whatsapp_bot' }) {
     this.db = db;
     this.collection = db.collection(collectionName);
     this.sessionKey = sessionKey;
+  }
+
+  // Método setup obrigatório para o whatsapp-web.js
+  async setup() {
+    // A lógica real de inicialização está no load()
+    console.log('FirestoreAuth: setup executado');
   }
 
   async save(session) {
@@ -862,11 +868,9 @@ app.post('/api/clear-invite-cache', authMiddleware, (req, res) => {
 app.get('/api/status', authMiddleware, async (req, res) => {
   let sessionExists = false;
   if (firebaseInitialized && db) {
-    // Verifica se existe sessão no Firestore
     const authCheck = new FirestoreAuth({ db });
     sessionExists = await authCheck.exists();
   } else {
-    // Verifica arquivo local
     sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
   }
   res.json({ ready: isReady, sessionExists, keepaliveActive: keepaliveInterval !== null, healthCheckActive: healthCheckInterval !== null, configuredGroups: Object.keys(groupConfig).length, envConfiguredGroups: Object.keys(configuredGroupIds).length, activeTimeouts: activeTimeouts.size, cachedInvites: inviteCodeCache.size, generatedCodes: Object.keys(generatedCodesCache).length, firebase: firebaseInitialized, redis: redisInitialized, puppeteerAlive: client?.pupPage ? !client.pupPage.isClosed() : false });
