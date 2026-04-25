@@ -665,8 +665,14 @@ async function authMiddleware(req, res, next) {
 }
 
 // ========== ROTA RAIZ (HEALTH CHECK) ==========
+// Rota raiz simples para o health check do Render
 app.get('/', (req, res) => {
-  res.status(200).json({ status: isReady ? 'online' : 'connecting', message: 'Bot WhatsApp API' });
+  res.status(200).send('OK');
+});
+
+// Também fornecemos /health como alternativa
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', ready: isReady });
 });
 
 // ========== API ENDPOINTS ==========
