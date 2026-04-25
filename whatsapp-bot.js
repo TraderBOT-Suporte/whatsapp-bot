@@ -1,6 +1,6 @@
 // ===================== whatsapp-bot.js =====================
 // Bot WhatsApp Profissional com Firebase, Redis, API REST e gestao completa
-// v5.0.0 - Com múltiplos administradores, comandos via WhatsApp e frontend
+// v5.2.0 - Backup de sessão no Firestore (usa LocalAuth nativo)
 
 import express from 'express';
 import cors from 'cors';
@@ -118,6 +118,7 @@ const KEEPALIVE_INTERVAL_MS = 30000;
 const HEALTH_CHECK_INTERVAL_MS = 30000;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const SESSION_DIR = './sessions';
+const SESSION_CLIENT_ID = 'render-wa-bot-v5'; // mesmo clientId usado no LocalAuth
 if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
 
 let client = null;
@@ -131,6 +132,75 @@ const inviteCodeCache = new Map();
 let groupConfig = {};
 let generatedCodesCache = {};
 const GENERATED_CODES_FILE = path.join(__dirname, 'generated-codes.json');
+
+// ========== BACKUP E RESTAURAÇÃO DA SESSÃO NO FIRESTORE ==========
+const SESSION_BACKUP_DOC_ID = 'whatsapp_bot';
+const SESSION_BACKUP_COLLECTION = 'sessions';
+
+async function backupSessionToFirestore() {
+  if (!firebaseInitialized || !isReady) return;
+  const sessionPath = path.join(SESSION_DIR, `session-${SESSION_CLIENT_ID}`);
+  if (!fs.existsSync(sessionPath)) return;
+
+  try {
+    const files = {};
+    const readRecursive = (dir, base = '') => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        const relativePath = base + entry.name;
+        if (entry.isDirectory()) {
+          readRecursive(fullPath, relativePath + '/');
+        } else {
+          const content = fs.readFileSync(fullPath);
+          files[relativePath] = content.toString('base64');
+        }
+      }
+    };
+    readRecursive(sessionPath);
+
+    await db.collection(SESSION_BACKUP_COLLECTION).doc(SESSION_BACKUP_DOC_ID).set({
+      session: JSON.stringify(files),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log('Sessão salva no Firestore (backup).');
+  } catch (err) {
+    console.error('Erro ao fazer backup da sessão:', err.message);
+  }
+}
+
+async function restoreSessionFromFirestore() {
+  if (!firebaseInitialized || !db) return false;
+  try {
+    const doc = await db.collection(SESSION_BACKUP_COLLECTION).doc(SESSION_BACKUP_DOC_ID).get();
+    if (!doc.exists) return false;
+
+    const data = doc.data();
+    if (!data.session) return false;
+
+    const files = JSON.parse(data.session);
+    const sessionPath = path.join(SESSION_DIR, `session-${SESSION_CLIENT_ID}`);
+
+    // Limpa a sessão local existente, se houver
+    if (fs.existsSync(sessionPath)) {
+      fs.rmSync(sessionPath, { recursive: true, force: true });
+    }
+
+    // Recria a estrutura de diretórios e arquivos
+    Object.entries(files).forEach(([relativePath, b64Content]) => {
+      const fullPath = path.join(sessionPath, relativePath);
+      const dir = path.dirname(fullPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(fullPath, Buffer.from(b64Content, 'base64'));
+    });
+
+    console.log('Sessão restaurada do Firestore.');
+    return true;
+  } catch (err) {
+    console.error('Erro ao restaurar sessão:', err.message);
+    return false;
+  }
+}
 
 // ========== FUNCOES DE PERSISTENCIA DE CODIGOS GERADOS ==========
 async function saveGeneratedCode(groupId, duration, codeData) {
@@ -546,7 +616,7 @@ async function handleAdminCommand(message) {
 // ========== CLIENTE WHATSAPP ==========
 function createClient() {
   const newClient = new Client({
-    authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
+    authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: SESSION_CLIENT_ID }),
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -586,6 +656,8 @@ function createClient() {
       await loadPendingRemovals();
     }, 5000);
     await sendAdminNotification('✅ Bot WhatsApp conectado e operacional!');
+    // Faz backup da sessão após 10 segundos
+    setTimeout(() => backupSessionToFirestore(), 10000);
   });
 
   newClient.on('auth_failure', (msg) => {
@@ -601,6 +673,8 @@ function createClient() {
     if (healthCheckInterval) clearInterval(healthCheckInterval);
     await logActivity('bot_disconnected', { reason });
     await sendAdminNotification(`⚠️ Bot desconectado: ${reason}`);
+    // Tenta fazer backup antes de reconectar
+    await backupSessionToFirestore();
     if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       const delay = Math.min(5000 * Math.pow(1.5, reconnectAttempts), 60000);
       reconnectAttempts++;
@@ -649,6 +723,12 @@ function createClient() {
 // ========== INICIALIZACAO ==========
 async function initializeBot() {
   if (client) { try { await client.destroy(); } catch(e) {} }
+
+  // Restaura sessão do Firestore se disponível
+  if (firebaseInitialized) {
+    await restoreSessionFromFirestore();
+  }
+
   client = createClient();
   await client.initialize();
 }
@@ -798,9 +878,29 @@ app.post('/api/clear-invite-cache', authMiddleware, (req, res) => {
   res.json({ message: groupId ? `Cache limpo para ${groupId}` : 'Todo cache de convites limpo' });
 });
 
-app.get('/api/status', authMiddleware, (req, res) => {
-  const sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
-  res.json({ ready: isReady, sessionExists, keepaliveActive: keepaliveInterval !== null, healthCheckActive: healthCheckInterval !== null, configuredGroups: Object.keys(groupConfig).length, envConfiguredGroups: Object.keys(configuredGroupIds).length, activeTimeouts: activeTimeouts.size, cachedInvites: inviteCodeCache.size, generatedCodes: Object.keys(generatedCodesCache).length, firebase: firebaseInitialized, redis: redisInitialized, puppeteerAlive: client?.pupPage ? !client.pupPage.isClosed() : false });
+app.get('/api/status', authMiddleware, async (req, res) => {
+  let sessionExists = false;
+  if (firebaseInitialized && db) {
+    try {
+      const doc = await db.collection(SESSION_BACKUP_COLLECTION).doc(SESSION_BACKUP_DOC_ID).get();
+      sessionExists = doc.exists;
+    } catch {}
+  } else {
+    const sessionPath = path.join(SESSION_DIR, `session-${SESSION_CLIENT_ID}`);
+    sessionExists = fs.existsSync(sessionPath);
+  }
+  res.json({
+    ready: isReady, sessionExists,
+    keepaliveActive: keepaliveInterval !== null,
+    healthCheckActive: healthCheckInterval !== null,
+    configuredGroups: Object.keys(groupConfig).length,
+    envConfiguredGroups: Object.keys(configuredGroupIds).length,
+    activeTimeouts: activeTimeouts.size,
+    cachedInvites: inviteCodeCache.size,
+    generatedCodes: Object.keys(generatedCodesCache).length,
+    firebase: firebaseInitialized, redis: redisInitialized,
+    puppeteerAlive: client?.pupPage ? !client.pupPage.isClosed() : false
+  });
 });
 
 // Endpoint para comandos via frontend
@@ -847,6 +947,7 @@ process.on('SIGTERM', async () => {
     if (timeouts.warning24h) clearTimeout(timeouts.warning24h);
     if (timeouts.warning1h) clearTimeout(timeouts.warning1h);
   }
+  await backupSessionToFirestore();
   if (client) await client.destroy();
   process.exit(0);
 });
