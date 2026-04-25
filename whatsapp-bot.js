@@ -4,8 +4,7 @@
 
 import express from 'express';
 import cors from 'cors';
-import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth } = pkg;
+import { Client, LocalAuth } from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import fs from 'fs';
@@ -553,6 +552,8 @@ function createClient() {
     authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
     puppeteer: {
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
+        '/opt/render/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome',
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu', '--single-process']
     }
   });
