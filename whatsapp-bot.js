@@ -21,7 +21,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 
@@ -217,7 +216,6 @@ async function loadGroupsFromFirebase() {
     return;
   }
   try {
-    // CORRIGIDO: whatsaap → whatsapp
     const snapshot = await db.collection('whatsapp').get();
     groupConfig = {};
     snapshot.forEach(doc => {
@@ -235,7 +233,6 @@ async function saveGroupToFirebase(groupId, data) {
     return true;
   }
   try {
-    // CORRIGIDO: whatsaap → whatsapp
     const docRef = db.collection('whatsapp').doc(groupId.replace(/[/.]/g, '_'));
     await docRef.set({ groupId, ...data, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     groupConfig[groupId] = { ...data, id: groupId };
@@ -250,7 +247,6 @@ async function deleteGroupFromFirebase(groupId) {
     return true;
   }
   try {
-    // CORRIGIDO: whatsaap → whatsapp
     await db.collection('whatsapp').doc(groupId.replace(/[/.]/g, '_')).delete();
     delete groupConfig[groupId];
     inviteCodeCache.delete(groupId);
@@ -551,21 +547,21 @@ async function handleAdminCommand(message) {
 function createClient() {
   const newClient = new Client({
     authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
-  puppeteer: {
-  headless: true,
-  executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
-    path.join(__dirname, '.cache', 'puppeteer', 'chrome', 'linux-146.0.7680.31', 'chrome-linux64', 'chrome'),
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-accelerated-2d-canvas',
-    '--no-first-run',
-    '--no-zygote',
-    '--disable-gpu',
-    '--single-process'
-  ]
-}
+    puppeteer: {
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
+        path.join(__dirname, '.cache', 'puppeteer', 'chrome', 'linux-146.0.7680.31', 'chrome-linux64', 'chrome'),
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--single-process'
+      ]
+    }
   });
 
   newClient.on('qr', async (qr) => {
@@ -667,6 +663,11 @@ async function authMiddleware(req, res, next) {
     next();
   } catch (err) { return res.status(401).json({ error: 'Token inválido' }); }
 }
+
+// ========== ROTA RAIZ (HEALTH CHECK) ==========
+app.get('/', (req, res) => {
+  res.status(200).json({ status: isReady ? 'online' : 'connecting', message: 'Bot WhatsApp API' });
+});
 
 // ========== API ENDPOINTS ==========
 app.get('/api/health', (req, res) => {
@@ -812,11 +813,6 @@ app.post('/api/command', authMiddleware, async (req, res) => {
     console.error('Erro ao executar comando:', err);
     res.status(500).json({ error: err.message });
   }
-});
-
-// Servir frontend
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // ========== INICIALIZACAO DO SERVIDOR ==========
