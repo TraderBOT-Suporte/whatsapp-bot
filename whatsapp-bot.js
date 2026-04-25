@@ -1,6 +1,6 @@
 // ===================== whatsapp-bot.js =====================
 // Bot WhatsApp Profissional com Firebase, Redis, API REST e gestao completa
-// v5.0.0 - Com múltiplos administradores, comandos via WhatsApp e frontend
+// v5.1.0 – Sessão persistente no Firestore (portável)
 
 import express from 'express';
 import cors from 'cors';
@@ -33,11 +33,10 @@ const ADMIN_NOTIFICACAO_LIST = process.env.ADMIN_NOTIFICACAO
   : [];
 const ALL_NOTIFICATION_NUMBERS = [...new Set([...ADMIN_PRINCIPAL_LIST, ...ADMIN_NOTIFICACAO_LIST])];
 
-// ========== CONFIGURACOES DE WEBHOOK/NOTIFICACOES ==========
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
-// ========== CONFIGURACAO DOS IDS DOS GRUPOS (VARIAVEL DE AMBIENTE OU JSON) ==========
+// ========== GRUPOS CONFIGURADOS ==========
 let configuredGroupIds = {};
 
 function loadGroupIdsFromEnvOrFile() {
@@ -47,18 +46,14 @@ function loadGroupIdsFromEnvOrFile() {
       configuredGroupIds = JSON.parse(envGroupIds);
       console.log('IDs dos grupos carregados da variável de ambiente:', Object.keys(configuredGroupIds).length);
       return;
-    } catch (err) {
-      console.error('Erro ao parsear GROUP_IDS:', err.message);
-    }
+    } catch (err) { console.error('Erro ao parsear GROUP_IDS:', err.message); }
   }
   try {
     const groupIdsPath = path.join(__dirname, 'group-ids.json');
     if (fs.existsSync(groupIdsPath)) {
-      const data = fs.readFileSync(groupIdsPath, 'utf8');
-      configuredGroupIds = JSON.parse(data);
+      configuredGroupIds = JSON.parse(fs.readFileSync(groupIdsPath, 'utf8'));
       console.log('IDs dos grupos carregados do arquivo JSON:', Object.keys(configuredGroupIds).length);
     } else {
-      console.warn('Arquivo group-ids.json não encontrado. Criando vazio.');
       fs.writeFileSync(groupIdsPath, '{}');
       configuredGroupIds = {};
     }
@@ -76,7 +71,7 @@ function initializeRedis() {
   const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
   const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
   if (!redisUrl || !redisToken) {
-    console.warn('Redis (Upstash) não configurado. Usando fallback local.');
+    console.warn('Redis (Upstash) não configurado.');
     return false;
   }
   redis = new Redis({ url: redisUrl, token: redisToken });
@@ -132,52 +127,77 @@ let groupConfig = {};
 let generatedCodesCache = {};
 const GENERATED_CODES_FILE = path.join(__dirname, 'generated-codes.json');
 
-// ========== FUNCOES DE PERSISTENCIA DE CODIGOS GERADOS ==========
-async function saveGeneratedCode(groupId, duration, codeData) {
-  const key = `${groupId}_${duration}`;
-  const data = { ...codeData, groupId, duration, generatedAt: new Date().toISOString() };
-  generatedCodesCache[key] = data;
-  try {
-    fs.writeFileSync(GENERATED_CODES_FILE, JSON.stringify(generatedCodesCache, null, 2));
-  } catch (err) { console.error('Erro ao salvar JSON:', err.message); }
-  if (redisInitialized && redis) {
-    try {
-      await redis.set(`generated_code:${key}`, JSON.stringify(data));
-      const durationMs = parseDurationToMs(duration);
-      if (durationMs > 0) await redis.expire(`generated_code:${key}`, Math.ceil(durationMs / 1000));
-    } catch (err) { console.error('Erro Redis:', err.message); }
+// ========== ESTRATÉGIA DE AUTENTICAÇÃO VIA FIRESTORE (COMPLETA) ==========
+class FirestoreAuth {
+  constructor({ db, collectionName = 'sessions', sessionKey = 'whatsapp_bot' }) {
+    this.db = db;
+    this.collection = db.collection(collectionName);
+    this.sessionKey = sessionKey;
   }
-  if (firebaseInitialized && db) {
-    try {
-      const docId = key.replace(/[/.@]/g, '_');
-      await db.collection('generated_codes').doc(docId).set({ ...data, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    } catch (err) { console.error('Erro Firebase:', err.message); }
+
+  async setup() {
+    console.log('FirestoreAuth: setup executado');
   }
-  return data;
+
+  async beforeBrowserInitialized() {
+    // Método exigido pelo whatsapp-web.js (sem ação necessária)
+  }
+
+  async afterBrowserInitialized() {
+    // Método exigido pelo whatsapp-web.js (sem ação necessária)
+  }
+
+  async save(session) {
+    if (!this.db) return;
+    try {
+      await this.collection.doc(this.sessionKey).set({
+        session: JSON.stringify(session),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log('Sessão salva no Firestore');
+    } catch (err) {
+      console.error('Erro ao salvar sessão no Firestore:', err.message);
+    }
+  }
+
+  async load() {
+    if (!this.db) return null;
+    try {
+      const doc = await this.collection.doc(this.sessionKey).get();
+      if (doc.exists) {
+        console.log('Sessão carregada do Firestore');
+        return JSON.parse(doc.data().session);
+      }
+    } catch (err) {
+      console.error('Erro ao carregar sessão do Firestore:', err.message);
+    }
+    return null;
+  }
+
+  async remove() {
+    if (!this.db) return;
+    try {
+      await this.collection.doc(this.sessionKey).delete();
+      console.log('Sessão removida do Firestore');
+    } catch (err) {
+      console.error('Erro ao remover sessão do Firestore:', err.message);
+    }
+  }
+
+  async exists() {
+    if (!this.db) return false;
+    try {
+      const doc = await this.collection.doc(this.sessionKey).get();
+      return doc.exists;
+    } catch {
+      return false;
+    }
+  }
 }
 
-async function loadGeneratedCodesFromFirebase() {
-  if (!firebaseInitialized || !db) {
-    try {
-      if (fs.existsSync(GENERATED_CODES_FILE)) {
-        const data = fs.readFileSync(GENERATED_CODES_FILE, 'utf8');
-        generatedCodesCache = JSON.parse(data);
-        console.log('Códigos carregados do JSON:', Object.keys(generatedCodesCache).length);
-      }
-    } catch (err) { console.error('Erro JSON:', err.message); }
-    return;
-  }
-  try {
-    const snapshot = await db.collection('generated_codes').get();
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      const key = `${data.groupId}_${data.duration}`;
-      generatedCodesCache[key] = data;
-    });
-    fs.writeFileSync(GENERATED_CODES_FILE, JSON.stringify(generatedCodesCache, null, 2));
-    console.log('Códigos carregados do Firebase:', Object.keys(generatedCodesCache).length);
-  } catch (err) { console.error('Erro Firebase:', err.message); }
-}
+// ========== FUNÇÕES AUXILIARES (JÁ EXISTENTES) ==========
+// (Manter todas as funções de parseDurationToMs, getDurationLabel, save/load codes...)
+// Incluídas abaixo de forma completa para o deploy
 
 function parseDurationToMs(duration) {
   const match = duration.match(/^(\d+)(d|h|m)?$/i);
@@ -205,12 +225,53 @@ function getDurationLabel(duration) {
   }
 }
 
-// ========== FUNCOES DO FIREBASE ==========
+async function saveGeneratedCode(groupId, duration, codeData) {
+  const key = `${groupId}_${duration}`;
+  const data = { ...codeData, groupId, duration, generatedAt: new Date().toISOString() };
+  generatedCodesCache[key] = data;
+  try { fs.writeFileSync(GENERATED_CODES_FILE, JSON.stringify(generatedCodesCache, null, 2)); } catch (err) { console.error('Erro JSON:', err.message); }
+  if (redisInitialized && redis) {
+    try {
+      await redis.set(`generated_code:${key}`, JSON.stringify(data));
+      const durationMs = parseDurationToMs(duration);
+      if (durationMs > 0) await redis.expire(`generated_code:${key}`, Math.ceil(durationMs / 1000));
+    } catch (err) { console.error('Erro Redis:', err.message); }
+  }
+  if (firebaseInitialized && db) {
+    try {
+      const docId = key.replace(/[/.@]/g, '_');
+      await db.collection('generated_codes').doc(docId).set({ ...data, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    } catch (err) { console.error('Erro Firebase:', err.message); }
+  }
+  return data;
+}
+
+async function loadGeneratedCodesFromFirebase() {
+  if (!firebaseInitialized || !db) {
+    try {
+      if (fs.existsSync(GENERATED_CODES_FILE)) {
+        generatedCodesCache = JSON.parse(fs.readFileSync(GENERATED_CODES_FILE, 'utf8'));
+        console.log('Códigos carregados do JSON:', Object.keys(generatedCodesCache).length);
+      }
+    } catch (err) { console.error('Erro JSON:', err.message); }
+    return;
+  }
+  try {
+    const snapshot = await db.collection('generated_codes').get();
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      generatedCodesCache[`${data.groupId}_${data.duration}`] = data;
+    });
+    fs.writeFileSync(GENERATED_CODES_FILE, JSON.stringify(generatedCodesCache, null, 2));
+    console.log('Códigos carregados do Firebase:', Object.keys(generatedCodesCache).length);
+  } catch (err) { console.error('Erro Firebase:', err.message); }
+}
+
+// ========== FUNÇÕES DO FIREBASE ==========
 async function loadGroupsFromFirebase() {
   if (!firebaseInitialized) {
     try {
-      const data = fs.readFileSync('./groups.json', 'utf8');
-      groupConfig = JSON.parse(data);
+      groupConfig = JSON.parse(fs.readFileSync('./groups.json', 'utf8'));
       console.log('Grupos carregados do arquivo local:', Object.keys(groupConfig).length);
     } catch { groupConfig = {}; }
     return;
@@ -254,7 +315,7 @@ async function deleteGroupFromFirebase(groupId) {
   } catch (err) { console.error('Erro ao deletar grupo:', err.message); return false; }
 }
 
-// ========== PERSISTENCIA DE PENDING REMOVALS ==========
+// ========== PERSISTÊNCIA DE REMOÇÕES PENDENTES ==========
 async function savePendingRemoval(groupId, memberId, data) {
   if (!firebaseInitialized) return;
   try {
@@ -289,14 +350,14 @@ async function loadPendingRemovals() {
           const chat = await client.getChatById(data.groupId);
           const groupInfo = groupConfig[data.groupId] || { name: data.groupName };
           scheduleRemovalInternal(chat, data.memberId, data.userName, remainingMs, groupInfo, false);
-          console.log(`Remocao reprogramada: ${data.userName} em ${Math.round(remainingMs/3600000)}h`);
+          console.log(`Remocao reprogramada: ${data.userName} em ${Math.round(remainingMs / 3600000)}h`);
         } catch (err) { console.error(`Erro ao reprogramar: ${err.message}`); }
       }
     }
   } catch (err) { console.error('Erro ao carregar pending removals:', err.message); }
 }
 
-// ========== FUNCOES DE NOTIFICACAO ==========
+// ========== NOTIFICAÇÕES E LOGS ==========
 async function sendAdminNotification(message) {
   for (const number of ALL_NOTIFICATION_NUMBERS) {
     if (number && isReady && client) {
@@ -317,8 +378,7 @@ async function sendAdminNotification(message) {
 }
 
 async function logActivity(type, data) {
-  const logMessage = `[${type}] ${JSON.stringify(data)}`;
-  console.log(logMessage);
+  console.log(`[${type}] ${JSON.stringify(data)}`);
   if (!firebaseInitialized) return;
   try {
     await db.collection('activity_logs').add({ type, ...data, timestamp: admin.firestore.FieldValue.serverTimestamp() });
@@ -367,7 +427,7 @@ function startHealthCheck() {
   }, HEALTH_CHECK_INTERVAL_MS);
 }
 
-// ========== EXECUCAO DE REMOCAO ==========
+// ========== EXECUÇÃO DE REMOÇÃO ==========
 async function executeRemoval(groupId, userId, userName, groupName) {
   try {
     const chat = await client.getChatById(groupId);
@@ -383,7 +443,7 @@ async function executeRemoval(groupId, userId, userName, groupName) {
   }
 }
 
-// ========== AGENDAR REMOCAO ==========
+// ========== AGENDAR REMOÇÃO ==========
 function scheduleRemovalInternal(chat, userId, userName, durationMs, groupInfo, saveToDB = true) {
   const key = `${chat.id._serialized}_${userId}`;
   if (activeTimeouts.has(key)) {
@@ -423,7 +483,7 @@ function scheduleRemoval(chat, userId, userName, durationMs, groupInfo) {
   scheduleRemovalInternal(chat, userId, userName, durationMs, groupInfo, true);
 }
 
-// ========== COMANDOS ADMINISTRATIVOS VIA WHATSAPP ==========
+// ========== COMANDOS ADMIN ==========
 async function handleAdminCommand(message) {
   const from = message.from.replace('@c.us', '');
   if (!ADMIN_PRINCIPAL_LIST.includes(from)) return;
@@ -545,8 +605,14 @@ async function handleAdminCommand(message) {
 
 // ========== CLIENTE WHATSAPP ==========
 function createClient() {
+  const authStrategy = (firebaseInitialized && db)
+    ? new FirestoreAuth({ db })
+    : new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' });
+
+  console.log(`Usando estratégia de autenticação: ${firebaseInitialized && db ? 'Firestore' : 'Local (arquivos)'}`);
+
   const newClient = new Client({
-    authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
+    authStrategy,
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -637,7 +703,6 @@ function createClient() {
     } catch (err) { console.error('Erro ao processar entrada:', err.message); }
   });
 
-  // Listener para comandos privados
   newClient.on('message', async (message) => {
     if (message.from.includes('@g.us')) return;
     await handleAdminCommand(message);
@@ -646,7 +711,7 @@ function createClient() {
   return newClient;
 }
 
-// ========== INICIALIZACAO ==========
+// ========== INICIALIZAÇÃO ==========
 async function initializeBot() {
   if (client) { try { await client.destroy(); } catch(e) {} }
   client = createClient();
@@ -664,18 +729,10 @@ async function authMiddleware(req, res, next) {
   } catch (err) { return res.status(401).json({ error: 'Token inválido' }); }
 }
 
-// ========== ROTA RAIZ (HEALTH CHECK) ==========
-// Rota raiz simples para o health check do Render
-app.get('/', (req, res) => {
-  res.status(200).send('OK');
-});
+// ========== ROTAS ==========
+app.get('/', (req, res) => res.status(200).send('OK'));
+app.get('/health', (req, res) => res.json({ status: 'ok', ready: isReady }));
 
-// Também fornecemos /health como alternativa
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', ready: isReady });
-});
-
-// ========== API ENDPOINTS ==========
 app.get('/api/health', (req, res) => {
   res.json({ status: isReady ? 'ready' : 'connecting', qrNeeded: !isReady && currentQR, reconnectAttempts, uptime: process.uptime(), firebase: firebaseInitialized, redis: redisInitialized, timestamp: new Date().toISOString() });
 });
@@ -798,12 +855,30 @@ app.post('/api/clear-invite-cache', authMiddleware, (req, res) => {
   res.json({ message: groupId ? `Cache limpo para ${groupId}` : 'Todo cache de convites limpo' });
 });
 
-app.get('/api/status', authMiddleware, (req, res) => {
-  const sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
-  res.json({ ready: isReady, sessionExists, keepaliveActive: keepaliveInterval !== null, healthCheckActive: healthCheckInterval !== null, configuredGroups: Object.keys(groupConfig).length, envConfiguredGroups: Object.keys(configuredGroupIds).length, activeTimeouts: activeTimeouts.size, cachedInvites: inviteCodeCache.size, generatedCodes: Object.keys(generatedCodesCache).length, firebase: firebaseInitialized, redis: redisInitialized, puppeteerAlive: client?.pupPage ? !client.pupPage.isClosed() : false });
+app.get('/api/status', authMiddleware, async (req, res) => {
+  let sessionExists = false;
+  if (firebaseInitialized && db) {
+    const authCheck = new FirestoreAuth({ db });
+    sessionExists = await authCheck.exists();
+  } else {
+    sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
+  }
+  res.json({
+    ready: isReady,
+    sessionExists,
+    keepaliveActive: keepaliveInterval !== null,
+    healthCheckActive: healthCheckInterval !== null,
+    configuredGroups: Object.keys(groupConfig).length,
+    envConfiguredGroups: Object.keys(configuredGroupIds).length,
+    activeTimeouts: activeTimeouts.size,
+    cachedInvites: inviteCodeCache.size,
+    generatedCodes: Object.keys(generatedCodesCache).length,
+    firebase: firebaseInitialized,
+    redis: redisInitialized,
+    puppeteerAlive: client?.pupPage ? !client.pupPage.isClosed() : false
+  });
 });
 
-// Endpoint para comandos via frontend
 app.post('/api/command', authMiddleware, async (req, res) => {
   const { command } = req.body;
   if (!command) return res.status(400).json({ error: 'Comando não fornecido' });
@@ -821,7 +896,7 @@ app.post('/api/command', authMiddleware, async (req, res) => {
   }
 });
 
-// ========== INICIALIZACAO DO SERVIDOR ==========
+// ========== INICIALIZAÇÃO DO SERVIDOR ==========
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Servidor rodando na porta ${PORT}`);
   console.log(`API: /api/health`);
