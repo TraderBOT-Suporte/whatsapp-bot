@@ -1,6 +1,6 @@
 // ===================== whatsapp-bot.js =====================
 // Bot WhatsApp Profissional com Firebase, Redis, API REST e gestao completa
-// v5.1.0 – Sessão persistente no Firestore (portável)
+// v5.0.0 - Com múltiplos administradores, comandos via WhatsApp e frontend
 
 import express from 'express';
 import cors from 'cors';
@@ -131,69 +131,6 @@ const inviteCodeCache = new Map();
 let groupConfig = {};
 let generatedCodesCache = {};
 const GENERATED_CODES_FILE = path.join(__dirname, 'generated-codes.json');
-
-// ========== ESTRATÉGIA DE AUTENTICAÇÃO VIA FIRESTORE (CORRIGIDA) ==========
-class FirestoreAuth {
-  constructor({ db, collectionName = 'sessions', sessionKey = 'whatsapp_bot' }) {
-    this.db = db;
-    this.collection = db.collection(collectionName);
-    this.sessionKey = sessionKey;
-  }
-
-  // Método setup obrigatório para o whatsapp-web.js
-  async setup() {
-    // A lógica real de inicialização está no load()
-    console.log('FirestoreAuth: setup executado');
-  }
-
-  async save(session) {
-    if (!this.db) return;
-    try {
-      await this.collection.doc(this.sessionKey).set({
-        session: JSON.stringify(session),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      console.log('Sessão salva no Firestore');
-    } catch (err) {
-      console.error('Erro ao salvar sessão no Firestore:', err.message);
-    }
-  }
-
-  async load() {
-    if (!this.db) return null;
-    try {
-      const doc = await this.collection.doc(this.sessionKey).get();
-      if (doc.exists) {
-        const data = doc.data();
-        console.log('Sessão carregada do Firestore');
-        return JSON.parse(data.session);
-      }
-    } catch (err) {
-      console.error('Erro ao carregar sessão do Firestore:', err.message);
-    }
-    return null;
-  }
-
-  async remove() {
-    if (!this.db) return;
-    try {
-      await this.collection.doc(this.sessionKey).delete();
-      console.log('Sessão removida do Firestore');
-    } catch (err) {
-      console.error('Erro ao remover sessão do Firestore:', err.message);
-    }
-  }
-
-  async exists() {
-    if (!this.db) return false;
-    try {
-      const doc = await this.collection.doc(this.sessionKey).get();
-      return doc.exists;
-    } catch {
-      return false;
-    }
-  }
-}
 
 // ========== FUNCOES DE PERSISTENCIA DE CODIGOS GERADOS ==========
 async function saveGeneratedCode(groupId, duration, codeData) {
@@ -608,14 +545,8 @@ async function handleAdminCommand(message) {
 
 // ========== CLIENTE WHATSAPP ==========
 function createClient() {
-  const authStrategy = (firebaseInitialized && db)
-    ? new FirestoreAuth({ db })
-    : new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' });
-
-  console.log(`Usando estratégia de autenticação: ${firebaseInitialized && db ? 'Firestore' : 'Local (arquivos)'}`);
-
   const newClient = new Client({
-    authStrategy,
+    authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -734,10 +665,12 @@ async function authMiddleware(req, res, next) {
 }
 
 // ========== ROTA RAIZ (HEALTH CHECK) ==========
+// Rota raiz simples para o health check do Render
 app.get('/', (req, res) => {
   res.status(200).send('OK');
 });
 
+// Também fornecemos /health como alternativa
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', ready: isReady });
 });
@@ -865,14 +798,8 @@ app.post('/api/clear-invite-cache', authMiddleware, (req, res) => {
   res.json({ message: groupId ? `Cache limpo para ${groupId}` : 'Todo cache de convites limpo' });
 });
 
-app.get('/api/status', authMiddleware, async (req, res) => {
-  let sessionExists = false;
-  if (firebaseInitialized && db) {
-    const authCheck = new FirestoreAuth({ db });
-    sessionExists = await authCheck.exists();
-  } else {
-    sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
-  }
+app.get('/api/status', authMiddleware, (req, res) => {
+  const sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
   res.json({ ready: isReady, sessionExists, keepaliveActive: keepaliveInterval !== null, healthCheckActive: healthCheckInterval !== null, configuredGroups: Object.keys(groupConfig).length, envConfiguredGroups: Object.keys(configuredGroupIds).length, activeTimeouts: activeTimeouts.size, cachedInvites: inviteCodeCache.size, generatedCodes: Object.keys(generatedCodesCache).length, firebase: firebaseInitialized, redis: redisInitialized, puppeteerAlive: client?.pupPage ? !client.pupPage.isClosed() : false });
 });
 
