@@ -4,8 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node whatsapp-bot.js",
-    "dev": "node whatsapp-bot.js",
-    "postinstall": "npx puppeteer browsers install chrome@146"
+    "dev": "node whatsapp-bot.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.34.0",
