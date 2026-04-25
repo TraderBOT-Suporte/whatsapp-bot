@@ -1,10 +1,11 @@
 // ===================== whatsapp-bot.js =====================
 // Bot WhatsApp Profissional com Firebase, Redis, API REST e gestao completa
-// v5.0.0 - Com múltiplos administradores, comandos via WhatsApp e frontend
+// v5.0.1 - Corrigido para CommonJS (whatsapp-web.js)
 
 import express from 'express';
 import cors from 'cors';
-import { Client, LocalAuth } from 'whatsapp-web.js';
+import pkg from 'whatsapp-web.js';
+const { Client, LocalAuth } = pkg;
 import qrcode from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import fs from 'fs';
@@ -216,7 +217,6 @@ async function loadGroupsFromFirebase() {
     return;
   }
   try {
-    // CORRIGIDO: whatsaap → whatsapp
     const snapshot = await db.collection('whatsapp').get();
     groupConfig = {};
     snapshot.forEach(doc => {
@@ -234,7 +234,6 @@ async function saveGroupToFirebase(groupId, data) {
     return true;
   }
   try {
-    // CORRIGIDO: whatsaap → whatsapp
     const docRef = db.collection('whatsapp').doc(groupId.replace(/[/.]/g, '_'));
     await docRef.set({ groupId, ...data, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     groupConfig[groupId] = { ...data, id: groupId };
@@ -249,7 +248,6 @@ async function deleteGroupFromFirebase(groupId) {
     return true;
   }
   try {
-    // CORRIGIDO: whatsaap → whatsapp
     await db.collection('whatsapp').doc(groupId.replace(/[/.]/g, '_')).delete();
     delete groupConfig[groupId];
     inviteCodeCache.delete(groupId);
@@ -552,8 +550,7 @@ function createClient() {
     authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
     puppeteer: {
       headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
-        '/opt/render/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable',
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu', '--single-process']
     }
   });
@@ -804,7 +801,7 @@ app.post('/api/command', authMiddleware, async (req, res) => {
   }
 });
 
-// Servir frontend
+// Servir frontend (caso queira acessar a interface via /public)
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
