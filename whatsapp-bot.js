@@ -1,6 +1,6 @@
 // ===================== whatsapp-bot.js =====================
 // Bot WhatsApp Profissional com Firebase, Redis, API REST e gestao completa
-// v5.0.2 - Usando Chromium (mais leve)
+// v5.0.0 - Com múltiplos administradores, comandos via WhatsApp e frontend
 
 import express from 'express';
 import cors from 'cors';
@@ -217,6 +217,7 @@ async function loadGroupsFromFirebase() {
     return;
   }
   try {
+    // CORRIGIDO: whatsaap → whatsapp
     const snapshot = await db.collection('whatsapp').get();
     groupConfig = {};
     snapshot.forEach(doc => {
@@ -234,6 +235,7 @@ async function saveGroupToFirebase(groupId, data) {
     return true;
   }
   try {
+    // CORRIGIDO: whatsaap → whatsapp
     const docRef = db.collection('whatsapp').doc(groupId.replace(/[/.]/g, '_'));
     await docRef.set({ groupId, ...data, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     groupConfig[groupId] = { ...data, id: groupId };
@@ -248,6 +250,7 @@ async function deleteGroupFromFirebase(groupId) {
     return true;
   }
   try {
+    // CORRIGIDO: whatsaap → whatsapp
     await db.collection('whatsapp').doc(groupId.replace(/[/.]/g, '_')).delete();
     delete groupConfig[groupId];
     inviteCodeCache.delete(groupId);
@@ -548,10 +551,12 @@ async function handleAdminCommand(message) {
 function createClient() {
   const newClient = new Client({
     authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
-   puppeteer: {
-  headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu', '--single-process']
-}
+    puppeteer: {
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
+        '/opt/render/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu', '--single-process']
+    }
   });
 
   newClient.on('qr', async (qr) => {
@@ -800,7 +805,7 @@ app.post('/api/command', authMiddleware, async (req, res) => {
   }
 });
 
-// Servir frontend (caso queira acessar a interface via /public)
+// Servir frontend
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
