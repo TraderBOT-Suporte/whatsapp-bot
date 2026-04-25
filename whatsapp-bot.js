@@ -132,6 +132,63 @@ let groupConfig = {};
 let generatedCodesCache = {};
 const GENERATED_CODES_FILE = path.join(__dirname, 'generated-codes.json');
 
+// ========== ESTRATÉGIA DE AUTENTICAÇÃO VIA FIRESTORE ==========
+class FirestoreAuth {
+  constructor({ db, collectionName = 'sessions', sessionKey = 'whatsapp_bot' }) {
+    this.db = db;
+    this.collection = db.collection(collectionName);
+    this.sessionKey = sessionKey;
+  }
+
+  async save(session) {
+    if (!this.db) return;
+    try {
+      await this.collection.doc(this.sessionKey).set({
+        session: JSON.stringify(session),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.log('Sessão salva no Firestore');
+    } catch (err) {
+      console.error('Erro ao salvar sessão no Firestore:', err.message);
+    }
+  }
+
+  async load() {
+    if (!this.db) return null;
+    try {
+      const doc = await this.collection.doc(this.sessionKey).get();
+      if (doc.exists) {
+        const data = doc.data();
+        console.log('Sessão carregada do Firestore');
+        return JSON.parse(data.session);
+      }
+    } catch (err) {
+      console.error('Erro ao carregar sessão do Firestore:', err.message);
+    }
+    return null;
+  }
+
+  async remove() {
+    if (!this.db) return;
+    try {
+      await this.collection.doc(this.sessionKey).delete();
+      console.log('Sessão removida do Firestore');
+    } catch (err) {
+      console.error('Erro ao remover sessão do Firestore:', err.message);
+    }
+  }
+
+  async exists() {
+    if (!this.db) return false;
+    try {
+      const doc = await this.collection.doc(this.sessionKey).get();
+      return doc.exists;
+    } catch {
+      return false;
+    }
+  }
+}
+
 // ========== FUNCOES DE PERSISTENCIA DE CODIGOS GERADOS ==========
 async function saveGeneratedCode(groupId, duration, codeData) {
   const key = `${groupId}_${duration}`;
@@ -545,8 +602,14 @@ async function handleAdminCommand(message) {
 
 // ========== CLIENTE WHATSAPP ==========
 function createClient() {
+  const authStrategy = (firebaseInitialized && db)
+    ? new FirestoreAuth({ db })
+    : new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' });
+
+  console.log(`Usando estratégia de autenticação: ${firebaseInitialized && db ? 'Firestore' : 'Local (arquivos)'}`);
+
   const newClient = new Client({
-    authStrategy: new LocalAuth({ dataPath: SESSION_DIR, clientId: 'render-wa-bot-v5' }),
+    authStrategy,
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -665,12 +728,10 @@ async function authMiddleware(req, res, next) {
 }
 
 // ========== ROTA RAIZ (HEALTH CHECK) ==========
-// Rota raiz simples para o health check do Render
 app.get('/', (req, res) => {
   res.status(200).send('OK');
 });
 
-// Também fornecemos /health como alternativa
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', ready: isReady });
 });
@@ -798,8 +859,16 @@ app.post('/api/clear-invite-cache', authMiddleware, (req, res) => {
   res.json({ message: groupId ? `Cache limpo para ${groupId}` : 'Todo cache de convites limpo' });
 });
 
-app.get('/api/status', authMiddleware, (req, res) => {
-  const sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
+app.get('/api/status', authMiddleware, async (req, res) => {
+  let sessionExists = false;
+  if (firebaseInitialized && db) {
+    // Verifica se existe sessão no Firestore
+    const authCheck = new FirestoreAuth({ db });
+    sessionExists = await authCheck.exists();
+  } else {
+    // Verifica arquivo local
+    sessionExists = fs.existsSync(path.join(SESSION_DIR, 'Default'));
+  }
   res.json({ ready: isReady, sessionExists, keepaliveActive: keepaliveInterval !== null, healthCheckActive: healthCheckInterval !== null, configuredGroups: Object.keys(groupConfig).length, envConfiguredGroups: Object.keys(configuredGroupIds).length, activeTimeouts: activeTimeouts.size, cachedInvites: inviteCodeCache.size, generatedCodes: Object.keys(generatedCodesCache).length, firebase: firebaseInitialized, redis: redisInitialized, puppeteerAlive: client?.pupPage ? !client.pupPage.isClosed() : false });
 });
 
