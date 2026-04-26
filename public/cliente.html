@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Meu Acesso · Trader Bot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --green: #00ffa3;
+      --green-mid: #00c97a;
+      --amber: #f5a623;
+      --red: #ff4d6d;
+      --glass-bg: rgba(255,255,255,0.04);
+      --glass-border: rgba(255,255,255,0.08);
+      --text-muted: rgba(255,255,255,0.38);
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'DM Sans', sans-serif;
+      background: #050508;
+      color: #fff;
+      min-height: 100dvh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+      overflow: hidden;
+      position: relative;
+    }
+    body::before, body::after {
+      content: '';
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(100px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    body::before {
+      width: 420px; height: 420px;
+      background: radial-gradient(circle, rgba(0,255,163,0.12) 0%, transparent 70%);
+      top: -100px; left: -80px;
+      animation: driftA 14s ease-in-out infinite alternate;
+    }
+    body::after {
+      width: 360px; height: 360px;
+      background: radial-gradient(circle, rgba(0,120,255,0.09) 0%, transparent 70%);
+      bottom: -80px; right: -60px;
+      animation: driftB 18s ease-in-out infinite alternate;
+    }
+    @keyframes driftA { to { transform: translate(40px, 60px) scale(1.1); } }
+    @keyframes driftB { to { transform: translate(-40px, -50px) scale(1.15); } }
+    .noise {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none; opacity: 0.025;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+      background-size: 200px;
+    }
+    .card {
+      position: relative; z-index: 1;
+      width: 100%; max-width: 400px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 24px;
+      padding: 32px 28px 28px;
+      backdrop-filter: blur(28px) saturate(180%);
+      -webkit-backdrop-filter: blur(28px) saturate(180%);
+      box-shadow: 0 0 0 1px rgba(0,255,163,0.06), 0 32px 80px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.08);
+      animation: cardIn 0.6s cubic-bezier(0.22,1,0.36,1) both;
+    }
+    @keyframes cardIn { from { opacity:0; transform: translateY(24px) scale(0.97); } to { opacity:1; transform: none; } }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(0,255,163,0.08); border: 1px solid rgba(0,255,163,0.2);
+      border-radius: 100px; padding: 5px 12px; font-size: 11px;
+      font-family: 'Syne', sans-serif; font-weight: 600; letter-spacing: 0.08em;
+      color: var(--green); margin-bottom: 20px; text-transform: uppercase;
+    }
+    .badge-dot {
+      width: 6px; height: 6px; background: var(--green); border-radius: 50%;
+      box-shadow: 0 0 6px var(--green); animation: pulse 2s ease infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    h1 {
+      font-family: 'Syne', sans-serif; font-size: 26px; font-weight: 800;
+      letter-spacing: -0.5px; line-height: 1.15; margin-bottom: 6px;
+      background: linear-gradient(135deg, #fff 40%, rgba(255,255,255,0.5));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+    p.sub { color: var(--text-muted); font-size: 13px; font-weight: 300; margin-bottom: 24px; line-height: 1.5; }
+
+    /* ── Custom Dropdown ── */
+    .dropdown-wrap { position: relative; margin-bottom: 12px; z-index: 10; }
+    .dropdown-trigger {
+      width: 100%; padding: 13px 16px;
+      background: rgba(255,255,255,0.05);
+      border: 1.5px solid rgba(255,255,255,0.1);
+      border-radius: 14px; color: #fff; font-size: 14px;
+      font-family: 'DM Sans', sans-serif; cursor: pointer;
+      display: flex; align-items: center; gap: 10px;
+      transition: border-color 0.2s, background 0.2s; user-select: none;
+    }
+    .dropdown-trigger:hover { border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.07); }
+    .dropdown-trigger.open { border-color: rgba(0,255,163,0.4); background: rgba(0,255,163,0.04); box-shadow: 0 0 0 4px rgba(0,255,163,0.07); }
+    .trigger-flag { font-size: 22px; line-height: 1; flex-shrink: 0; }
+    .trigger-name { flex: 1; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .trigger-ddi { color: var(--green); font-family: 'Syne', sans-serif; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+    .trigger-chevron { opacity: 0.35; font-size: 11px; transition: transform 0.2s; flex-shrink: 0; }
+    .dropdown-trigger.open .trigger-chevron { transform: rotate(180deg); }
+
+    .dropdown-panel {
+      position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+      background: #0f1117; border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 14px; overflow: hidden; z-index: 100; display: none;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.9);
+    }
+    .dropdown-panel.open { display: block; animation: dropIn 0.18s cubic-bezier(0.22,1,0.36,1); }
+    @keyframes dropIn { from { opacity:0; transform: translateY(-6px); } to { opacity:1; transform: none; } }
+
+    .dropdown-search { padding: 10px 10px 8px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+    .dropdown-search input {
+      width: 100%; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px; color: #fff; font-size: 13px; font-family: 'DM Sans', sans-serif;
+      padding: 8px 12px; outline: none; margin: 0;
+    }
+    .dropdown-search input::placeholder { color: var(--text-muted); }
+    .dropdown-search input:focus { border-color: rgba(0,255,163,0.3); background: rgba(0,255,163,0.05); }
+
+    .dropdown-list { max-height: 210px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.1) transparent; }
+    .dropdown-list::-webkit-scrollbar { width: 3px; }
+    .dropdown-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
+
+    .dropdown-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 14px; cursor: pointer; transition: background 0.1s; font-size: 13.5px;
+    }
+    .dropdown-item:hover { background: rgba(255,255,255,0.07); }
+    .dropdown-item.selected { background: rgba(0,255,163,0.09); }
+    .item-flag { font-size: 20px; line-height: 1; width: 28px; text-align: center; flex-shrink: 0; }
+    .item-name { flex: 1; color: #dde1ea; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .item-ddi { color: var(--green); font-family: 'Syne', sans-serif; font-weight: 600; font-size: 12px; flex-shrink: 0; }
+    .dropdown-empty { padding: 18px; text-align: center; color: var(--text-muted); font-size: 13px; }
+
+    /* ── Phone Input ── */
+    .input-wrap { position: relative; margin-bottom: 14px; }
+    .input-prefix {
+      position: absolute; left: 0; top: 0; bottom: 0;
+      display: flex; align-items: center; justify-content: center;
+      padding: 0 14px; font-family: 'Syne', sans-serif; font-weight: 700;
+      font-size: 13px; color: var(--green);
+      border-right: 1px solid rgba(255,255,255,0.08); min-width: 66px;
+      pointer-events: none; user-select: none; border-radius: 14px 0 0 14px;
+    }
+    input[type=tel] {
+      width: 100%; padding: 15px 16px 15px 78px;
+      background: rgba(255,255,255,0.04); border: 1.5px solid rgba(255,255,255,0.08);
+      border-radius: 14px; color: #fff; font-size: 15px; font-family: 'DM Sans', sans-serif;
+      transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+    }
+    input[type=tel]::placeholder { color: var(--text-muted); }
+    input[type=tel]:focus { outline: none; border-color: rgba(0,255,163,0.4); background: rgba(0,255,163,0.04); box-shadow: 0 0 0 4px rgba(0,255,163,0.07); }
+
+    button {
+      width: 100%; padding: 15px;
+      background: linear-gradient(135deg, var(--green-mid) 0%, #00a86b 100%);
+      border: none; border-radius: 14px; color: #fff; font-size: 15px; font-weight: 600;
+      font-family: 'Syne', sans-serif; letter-spacing: 0.04em; cursor: pointer;
+      position: relative; overflow: hidden;
+      transition: transform 0.15s, box-shadow 0.15s, opacity 0.15s;
+      box-shadow: 0 8px 32px rgba(0,201,122,0.25), 0 0 0 1px rgba(0,255,163,0.15);
+    }
+    button::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(255,255,255,0.15) 0%, transparent 60%); pointer-events: none; }
+    button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 12px 40px rgba(0,201,122,0.35), 0 0 0 1px rgba(0,255,163,0.2); }
+    button:active:not(:disabled) { transform: translateY(0); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* ── Result ── */
+    .result { margin-top: 20px; display: none; }
+    .result.show { display: block; animation: fadeUp 0.4s cubic-bezier(0.22,1,0.36,1); }
+    @keyframes fadeUp { from { opacity:0; transform: translateY(10px); } to { opacity:1; transform:none; } }
+    .result-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 16px; overflow: hidden; }
+    .result-header { padding: 16px 18px; border-bottom: 1px solid rgba(255,255,255,0.06); display: flex; align-items: center; gap: 10px; }
+    .result-header .icon { width: 36px; height: 36px; background: rgba(0,255,163,0.1); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+    .result-header .name { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 15px; letter-spacing: -0.2px; }
+    .result-header .plan-tag { font-size: 10px; font-weight: 600; font-family: 'Syne', sans-serif; letter-spacing: 0.1em; text-transform: uppercase; padding: 3px 8px; border-radius: 100px; background: rgba(0,255,163,0.12); color: var(--green); border: 1px solid rgba(0,255,163,0.2); margin-left: auto; }
+    .stats { padding: 6px 0; }
+    .stat { display: flex; align-items: center; justify-content: space-between; padding: 11px 18px; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 13.5px; transition: background 0.15s; }
+    .stat:last-child { border-bottom: none; }
+    .stat:hover { background: rgba(255,255,255,0.02); }
+    .stat .label { color: var(--text-muted); font-weight: 300; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .stat .label-icon { font-size: 14px; opacity: 0.7; }
+    .stat .value { font-weight: 600; font-family: 'Syne', sans-serif; font-size: 14px; letter-spacing: -0.2px; }
+    .stat .value.active { color: var(--green); }
+    .stat .value.expiring { color: var(--amber); }
+    .stat .value.expired { color: var(--red); }
+    .spinner-wrap { padding: 24px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+    .spinner { width: 20px; height: 20px; border: 2px solid rgba(0,255,163,0.15); border-top-color: var(--green); border-radius: 50%; animation: spin 0.7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner-label { color: var(--text-muted); font-size: 13px; }
+    .error-box { padding: 14px 18px; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--red); }
+    .error-box .err-icon { font-size: 18px; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+  <div class="noise"></div>
+  <div class="card">
+    <div class="badge"><span class="badge-dot"></span> Trader Bot</div>
+    <h1>Meu Acesso</h1>
+    <p class="sub">Selecione seu país e informe seu número</p>
+
+    <div class="dropdown-wrap" id="dropdownWrap">
+      <div class="dropdown-trigger" id="dropdownTrigger" onclick="toggleDropdown()">
+        <span class="trigger-flag" id="triggerFlag">🌐</span>
+        <span class="trigger-name" id="triggerName">Selecione o país...</span>
+        <span class="trigger-ddi" id="triggerDdi"></span>
+        <span class="trigger-chevron">▾</span>
+      </div>
+      <div class="dropdown-panel" id="dropdownPanel">
+        <div class="dropdown-search">
+          <input type="text" id="countrySearch" placeholder="Pesquisar país ou DDI..." oninput="filterCountries()" autocomplete="off" autocorrect="off" spellcheck="false">
+        </div>
+        <div class="dropdown-list" id="dropdownList"></div>
+      </div>
+    </div>
+
+    <div class="input-wrap">
+      <div class="input-prefix" id="ddiPrefix">+244</div>
+      <input type="tel" id="phoneInput" placeholder="Número sem DDI" autocomplete="off">
+    </div>
+
+    <button onclick="checkStatus()" id="btn">Consultar plano</button>
+    <div class="result" id="result"></div>
+  </div>
+
+  <script>
+    const COUNTRIES = {
+      '1':    { name: 'EUA / Canadá',       flag: '🇺🇸', ddi: '+1' },
+      '7':    { name: 'Rússia',             flag: '🇷🇺', ddi: '+7' },
+      '20':   { name: 'Egipto',             flag: '🇪🇬', ddi: '+20' },
+      '27':   { name: 'África do Sul',      flag: '🇿🇦', ddi: '+27' },
+      '30':   { name: 'Grécia',             flag: '🇬🇷', ddi: '+30' },
+      '31':   { name: 'Países Baixos',      flag: '🇳🇱', ddi: '+31' },
+      '32':   { name: 'Bélgica',            flag: '🇧🇪', ddi: '+32' },
+      '33':   { name: 'França',             flag: '🇫🇷', ddi: '+33' },
+      '34':   { name: 'Espanha',            flag: '🇪🇸', ddi: '+34' },
+      '36':   { name: 'Hungria',            flag: '🇭🇺', ddi: '+36' },
+      '39':   { name: 'Itália',             flag: '🇮🇹', ddi: '+39' },
+      '40':   { name: 'Roménia',            flag: '🇷🇴', ddi: '+40' },
+      '41':   { name: 'Suíça',              flag: '🇨🇭', ddi: '+41' },
+      '43':   { name: 'Áustria',            flag: '🇦🇹', ddi: '+43' },
+      '44':   { name: 'Reino Unido',        flag: '🇬🇧', ddi: '+44' },
+      '45':   { name: 'Dinamarca',          flag: '🇩🇰', ddi: '+45' },
+      '46':   { name: 'Suécia',             flag: '🇸🇪', ddi: '+46' },
+      '47':   { name: 'Noruega',            flag: '🇳🇴', ddi: '+47' },
+      '48':   { name: 'Polónia',            flag: '🇵🇱', ddi: '+48' },
+      '49':   { name: 'Alemanha',           flag: '🇩🇪', ddi: '+49' },
+      '51':   { name: 'Peru',               flag: '🇵🇪', ddi: '+51' },
+      '52':   { name: 'México',             flag: '🇲🇽', ddi: '+52' },
+      '54':   { name: 'Argentina',          flag: '🇦🇷', ddi: '+54' },
+      '55':   { name: 'Brasil',             flag: '🇧🇷', ddi: '+55' },
+      '56':   { name: 'Chile',              flag: '🇨🇱', ddi: '+56' },
+      '57':   { name: 'Colômbia',           flag: '🇨🇴', ddi: '+57' },
+      '58':   { name: 'Venezuela',          flag: '🇻🇪', ddi: '+58' },
+      '60':   { name: 'Malásia',            flag: '🇲🇾', ddi: '+60' },
+      '61':   { name: 'Austrália',          flag: '🇦🇺', ddi: '+61' },
+      '62':   { name: 'Indonésia',          flag: '🇮🇩', ddi: '+62' },
+      '63':   { name: 'Filipinas',          flag: '🇵🇭', ddi: '+63' },
+      '64':   { name: 'Nova Zelândia',      flag: '🇳🇿', ddi: '+64' },
+      '65':   { name: 'Singapura',          flag: '🇸🇬', ddi: '+65' },
+      '66':   { name: 'Tailândia',          flag: '🇹🇭', ddi: '+66' },
+      '81':   { name: 'Japão',              flag: '🇯🇵', ddi: '+81' },
+      '82':   { name: 'Coreia do Sul',      flag: '🇰🇷', ddi: '+82' },
+      '84':   { name: 'Vietname',           flag: '🇻🇳', ddi: '+84' },
+      '86':   { name: 'China',              flag: '🇨🇳', ddi: '+86' },
+      '90':   { name: 'Turquia',            flag: '🇹🇷', ddi: '+90' },
+      '91':   { name: 'Índia',              flag: '🇮🇳', ddi: '+91' },
+      '92':   { name: 'Paquistão',          flag: '🇵🇰', ddi: '+92' },
+      '94':   { name: 'Sri Lanka',          flag: '🇱🇰', ddi: '+94' },
+      '98':   { name: 'Irão',               flag: '🇮🇷', ddi: '+98' },
+      '212':  { name: 'Marrocos',           flag: '🇲🇦', ddi: '+212' },
+      '213':  { name: 'Argélia',            flag: '🇩🇿', ddi: '+213' },
+      '216':  { name: 'Tunísia',            flag: '🇹🇳', ddi: '+216' },
+      '218':  { name: 'Líbia',              flag: '🇱🇾', ddi: '+218' },
+      '220':  { name: 'Gâmbia',             flag: '🇬🇲', ddi: '+220' },
+      '221':  { name: 'Senegal',            flag: '🇸🇳', ddi: '+221' },
+      '222':  { name: 'Mauritânia',         flag: '🇲🇷', ddi: '+222' },
+      '223':  { name: 'Mali',               flag: '🇲🇱', ddi: '+223' },
+      '224':  { name: 'Guiné',              flag: '🇬🇳', ddi: '+224' },
+      '225':  { name: 'Costa do Marfim',    flag: '🇨🇮', ddi: '+225' },
+      '226':  { name: 'Burkina Faso',       flag: '🇧🇫', ddi: '+226' },
+      '227':  { name: 'Níger',              flag: '🇳🇪', ddi: '+227' },
+      '228':  { name: 'Togo',               flag: '🇹🇬', ddi: '+228' },
+      '229':  { name: 'Benim',              flag: '🇧🇯', ddi: '+229' },
+      '230':  { name: 'Maurícia',           flag: '🇲🇺', ddi: '+230' },
+      '231':  { name: 'Libéria',            flag: '🇱🇷', ddi: '+231' },
+      '232':  { name: 'Serra Leoa',         flag: '🇸🇱', ddi: '+232' },
+      '233':  { name: 'Gana',               flag: '🇬🇭', ddi: '+233' },
+      '234':  { name: 'Nigéria',            flag: '🇳🇬', ddi: '+234' },
+      '235':  { name: 'Chade',              flag: '🇹🇩', ddi: '+235' },
+      '236':  { name: 'Rep. Centro-Africana',flag: '🇨🇫', ddi: '+236' },
+      '237':  { name: 'Camarões',           flag: '🇨🇲', ddi: '+237' },
+      '238':  { name: 'Cabo Verde',         flag: '🇨🇻', ddi: '+238' },
+      '239':  { name: 'São Tomé e Príncipe',flag: '🇸🇹', ddi: '+239' },
+      '240':  { name: 'Guiné Equatorial',   flag: '🇬🇶', ddi: '+240' },
+      '241':  { name: 'Gabão',              flag: '🇬🇦', ddi: '+241' },
+      '242':  { name: 'Congo',              flag: '🇨🇬', ddi: '+242' },
+      '243':  { name: 'RD Congo',           flag: '🇨🇩', ddi: '+243' },
+      '244':  { name: 'Angola',             flag: '🇦🇴', ddi: '+244' },
+      '245':  { name: 'Guiné-Bissau',       flag: '🇬🇼', ddi: '+245' },
+      '248':  { name: 'Seicheles',          flag: '🇸🇨', ddi: '+248' },
+      '249':  { name: 'Sudão',              flag: '🇸🇩', ddi: '+249' },
+      '250':  { name: 'Ruanda',             flag: '🇷🇼', ddi: '+250' },
+      '251':  { name: 'Etiópia',            flag: '🇪🇹', ddi: '+251' },
+      '252':  { name: 'Somália',            flag: '🇸🇴', ddi: '+252' },
+      '253':  { name: 'Djibouti',           flag: '🇩🇯', ddi: '+253' },
+      '254':  { name: 'Quénia',             flag: '🇰🇪', ddi: '+254' },
+      '255':  { name: 'Tanzânia',           flag: '🇹🇿', ddi: '+255' },
+      '256':  { name: 'Uganda',             flag: '🇺🇬', ddi: '+256' },
+      '257':  { name: 'Burundi',            flag: '🇧🇮', ddi: '+257' },
+      '258':  { name: 'Moçambique',         flag: '🇲🇿', ddi: '+258' },
+      '260':  { name: 'Zâmbia',             flag: '🇿🇲', ddi: '+260' },
+      '261':  { name: 'Madagáscar',         flag: '🇲🇬', ddi: '+261' },
+      '262':  { name: 'Reunião',            flag: '🇷🇪', ddi: '+262' },
+      '263':  { name: 'Zimbabué',           flag: '🇿🇼', ddi: '+263' },
+      '264':  { name: 'Namíbia',            flag: '🇳🇦', ddi: '+264' },
+      '265':  { name: 'Malawi',             flag: '🇲🇼', ddi: '+265' },
+      '266':  { name: 'Lesoto',             flag: '🇱🇸', ddi: '+266' },
+      '267':  { name: 'Botswana',           flag: '🇧🇼', ddi: '+267' },
+      '268':  { name: 'Essuatíni',          flag: '🇸🇿', ddi: '+268' },
+      '269':  { name: 'Comores',            flag: '🇰🇲', ddi: '+269' },
+      '291':  { name: 'Eritreia',           flag: '🇪🇷', ddi: '+291' },
+      '297':  { name: 'Aruba',              flag: '🇦🇼', ddi: '+297' },
+      '298':  { name: 'Ilhas Faroé',        flag: '🇫🇴', ddi: '+298' },
+      '299':  { name: 'Gronelândia',        flag: '🇬🇱', ddi: '+299' },
+      '350':  { name: 'Gibraltar',          flag: '🇬🇮', ddi: '+350' },
+      '351':  { name: 'Portugal',           flag: '🇵🇹', ddi: '+351' },
+      '352':  { name: 'Luxemburgo',         flag: '🇱🇺', ddi: '+352' },
+      '353':  { name: 'Irlanda',            flag: '🇮🇪', ddi: '+353' },
+      '354':  { name: 'Islândia',           flag: '🇮🇸', ddi: '+354' },
+      '355':  { name: 'Albânia',            flag: '🇦🇱', ddi: '+355' },
+      '356':  { name: 'Malta',              flag: '🇲🇹', ddi: '+356' },
+      '357':  { name: 'Chipre',             flag: '🇨🇾', ddi: '+357' },
+      '358':  { name: 'Finlândia',          flag: '🇫🇮', ddi: '+358' },
+      '359':  { name: 'Bulgária',           flag: '🇧🇬', ddi: '+359' },
+      '370':  { name: 'Lituânia',           flag: '🇱🇹', ddi: '+370' },
+      '371':  { name: 'Letónia',            flag: '🇱🇻', ddi: '+371' },
+      '372':  { name: 'Estónia',            flag: '🇪🇪', ddi: '+372' },
+      '373':  { name: 'Moldávia',           flag: '🇲🇩', ddi: '+373' },
+      '374':  { name: 'Arménia',            flag: '🇦🇲', ddi: '+374' },
+      '375':  { name: 'Bielorrússia',       flag: '🇧🇾', ddi: '+375' },
+      '376':  { name: 'Andorra',            flag: '🇦🇩', ddi: '+376' },
+      '377':  { name: 'Mónaco',             flag: '🇲🇨', ddi: '+377' },
+      '378':  { name: 'São Marino',         flag: '🇸🇲', ddi: '+378' },
+      '380':  { name: 'Ucrânia',            flag: '🇺🇦', ddi: '+380' },
+      '381':  { name: 'Sérvia',             flag: '🇷🇸', ddi: '+381' },
+      '382':  { name: 'Montenegro',         flag: '🇲🇪', ddi: '+382' },
+      '383':  { name: 'Kosovo',             flag: '🇽🇰', ddi: '+383' },
+      '385':  { name: 'Croácia',            flag: '🇭🇷', ddi: '+385' },
+      '386':  { name: 'Eslovénia',          flag: '🇸🇮', ddi: '+386' },
+      '387':  { name: 'Bósnia e Herzegovina', flag: '🇧🇦', ddi: '+387' },
+      '389':  { name: 'Macedónia do Norte', flag: '🇲🇰', ddi: '+389' },
+      '420':  { name: 'República Checa',    flag: '🇨🇿', ddi: '+420' },
+      '421':  { name: 'Eslováquia',         flag: '🇸🇰', ddi: '+421' },
+      '423':  { name: 'Liechtenstein',      flag: '🇱🇮', ddi: '+423' },
+      '500':  { name: 'Malvinas',           flag: '🇫🇰', ddi: '+500' },
+      '501':  { name: 'Belize',             flag: '🇧🇿', ddi: '+501' },
+      '502':  { name: 'Guatemala',          flag: '🇬🇹', ddi: '+502' },
+      '503':  { name: 'El Salvador',        flag: '🇸🇻', ddi: '+503' },
+      '504':  { name: 'Honduras',           flag: '🇭🇳', ddi: '+504' },
+      '505':  { name: 'Nicarágua',          flag: '🇳🇮', ddi: '+505' },
+      '506':  { name: 'Costa Rica',         flag: '🇨🇷', ddi: '+506' },
+      '507':  { name: 'Panamá',             flag: '🇵🇦', ddi: '+507' },
+      '509':  { name: 'Haiti',              flag: '🇭🇹', ddi: '+509' },
+      '591':  { name: 'Bolívia',            flag: '🇧🇴', ddi: '+591' },
+      '592':  { name: 'Guiana',             flag: '🇬🇾', ddi: '+592' },
+      '593':  { name: 'Equador',            flag: '🇪🇨', ddi: '+593' },
+      '594':  { name: 'Guiana Francesa',    flag: '🇬🇫', ddi: '+594' },
+      '595':  { name: 'Paraguai',           flag: '🇵🇾', ddi: '+595' },
+      '596':  { name: 'Martinica',          flag: '🇲🇶', ddi: '+596' },
+      '597':  { name: 'Suriname',           flag: '🇸🇷', ddi: '+597' },
+      '598':  { name: 'Uruguai',            flag: '🇺🇾', ddi: '+598' },
+      '599':  { name: 'Curaçao',            flag: '🇨🇼', ddi: '+599' },
+      '673':  { name: 'Brunei',             flag: '🇧🇳', ddi: '+673' },
+      '674':  { name: 'Nauru',              flag: '🇳🇷', ddi: '+674' },
+      '675':  { name: 'Papua-Nova Guiné',   flag: '🇵🇬', ddi: '+675' },
+      '676':  { name: 'Tonga',              flag: '🇹🇴', ddi: '+676' },
+      '677':  { name: 'Ilhas Salomão',      flag: '🇸🇧', ddi: '+677' },
+      '678':  { name: 'Vanuatu',            flag: '🇻🇺', ddi: '+678' },
+      '679':  { name: 'Fiji',               flag: '🇫🇯', ddi: '+679' },
+      '680':  { name: 'Palau',              flag: '🇵🇼', ddi: '+680' },
+      '681':  { name: 'Wallis e Futuna',    flag: '🇼🇫', ddi: '+681' },
+      '682':  { name: 'Ilhas Cook',         flag: '🇨🇰', ddi: '+682' },
+      '683':  { name: 'Niue',               flag: '🇳🇺', ddi: '+683' },
+      '685':  { name: 'Samoa',              flag: '🇼🇸', ddi: '+685' },
+      '686':  { name: 'Kiribati',           flag: '🇰🇮', ddi: '+686' },
+      '687':  { name: 'Nova Caledónia',     flag: '🇳🇨', ddi: '+687' },
+      '688':  { name: 'Tuvalu',             flag: '🇹🇻', ddi: '+688' },
+      '689':  { name: 'Polinésia Francesa', flag: '🇵🇫', ddi: '+689' },
+      '690':  { name: 'Tokelau',            flag: '🇹🇰', ddi: '+690' },
+      '691':  { name: 'Micronésia',         flag: '🇫🇲', ddi: '+691' },
+      '692':  { name: 'Ilhas Marshall',     flag: '🇲🇭', ddi: '+692' },
+      '850':  { name: 'Coreia do Norte',    flag: '🇰🇵', ddi: '+850' },
+      '852':  { name: 'Hong Kong',          flag: '🇭🇰', ddi: '+852' },
+      '853':  { name: 'Macau',              flag: '🇲🇴', ddi: '+853' },
+      '855':  { name: 'Camboja',            flag: '🇰🇭', ddi: '+855' },
+      '856':  { name: 'Laos',               flag: '🇱🇦', ddi: '+856' },
+      '880':  { name: 'Bangladesh',         flag: '🇧🇩', ddi: '+880' },
+      '886':  { name: 'Taiwan',             flag: '🇹🇼', ddi: '+886' },
+      '960':  { name: 'Maldivas',           flag: '🇲🇻', ddi: '+960' },
+      '961':  { name: 'Líbano',             flag: '🇱🇧', ddi: '+961' },
+      '962':  { name: 'Jordânia',           flag: '🇯🇴', ddi: '+962' },
+      '963':  { name: 'Síria',              flag: '🇸🇾', ddi: '+963' },
+      '964':  { name: 'Iraque',             flag: '🇮🇶', ddi: '+964' },
+      '965':  { name: 'Kuwait',             flag: '🇰🇼', ddi: '+965' },
+      '966':  { name: 'Arábia Saudita',     flag: '🇸🇦', ddi: '+966' },
+      '967':  { name: 'Iémen',              flag: '🇾🇪', ddi: '+967' },
+      '968':  { name: 'Omã',                flag: '🇴🇲', ddi: '+968' },
+      '971':  { name: 'Emirados Árabes Unidos', flag: '🇦🇪', ddi: '+971' },
+      '972':  { name: 'Israel',             flag: '🇮🇱', ddi: '+972' },
+      '973':  { name: 'Bahrein',            flag: '🇧🇭', ddi: '+973' },
+      '974':  { name: 'Catar',              flag: '🇶🇦', ddi: '+974' },
+      '975':  { name: 'Butão',              flag: '🇧🇹', ddi: '+975' },
+      '976':  { name: 'Mongólia',           flag: '🇲🇳', ddi: '+976' },
+      '977':  { name: 'Nepal',              flag: '🇳🇵', ddi: '+977' },
+      '992':  { name: 'Tajiquistão',        flag: '🇹🇯', ddi: '+992' },
+      '993':  { name: 'Turquemenistão',     flag: '🇹🇲', ddi: '+993' },
+      '994':  { name: 'Azerbaijão',         flag: '🇦🇿', ddi: '+994' },
+      '995':  { name: 'Geórgia',            flag: '🇬🇪', ddi: '+995' },
+      '996':  { name: 'Quirguistão',        flag: '🇰🇬', ddi: '+996' },
+      '998':  { name: 'Uzbequistão',        flag: '🇺🇿', ddi: '+998' },
+    };
+
+    // Priority codes shown first
+    const PRIORITY = ['244','55','351','238','239','245','258'];
+    let selectedCode = '244';
+    let sortedEntries = [];
+
+    function buildList() {
+      const priority = PRIORITY.map(c => [c, COUNTRIES[c]]).filter(([,v]) => v);
+      const rest = Object.entries(COUNTRIES)
+        .filter(([c]) => !PRIORITY.includes(c))
+        .sort((a,b) => a[1].name.localeCompare(b[1].name, 'pt'));
+      sortedEntries = [...priority, ...rest];
+    }
+
+    function renderList(q = '') {
+      const list = document.getElementById('dropdownList');
+      const filter = q.toLowerCase().trim();
+      const items = filter
+        ? sortedEntries.filter(([c, d]) => d.name.toLowerCase().includes(filter) || ('+'+c).includes(filter))
+        : sortedEntries;
+
+      if (!items.length) {
+        list.innerHTML = '<div class="dropdown-empty">Nenhum país encontrado</div>';
+        return;
+      }
+      list.innerHTML = items.map(([code, d]) =>
+        `<div class="dropdown-item${code===selectedCode?' selected':''}" onclick="selectCountry('${code}')">
+          <span class="item-flag">${d.flag}</span>
+          <span class="item-name">${d.name}</span>
+          <span class="item-ddi">+${code}</span>
+        </div>`
+      ).join('');
+    }
+
+    function selectCountry(code) {
+      selectedCode = code;
+      const d = COUNTRIES[code];
+      document.getElementById('triggerFlag').textContent = d.flag;
+      document.getElementById('triggerName').textContent = d.name;
+      document.getElementById('triggerDdi').textContent = '+' + code;
+      document.getElementById('ddiPrefix').textContent = '+' + code;
+      closeDropdown();
+    }
+
+    function toggleDropdown() {
+      const panel = document.getElementById('dropdownPanel');
+      const trigger = document.getElementById('dropdownTrigger');
+      if (panel.classList.contains('open')) { closeDropdown(); return; }
+      panel.classList.add('open');
+      trigger.classList.add('open');
+      document.getElementById('countrySearch').value = '';
+      renderList();
+      setTimeout(() => document.getElementById('countrySearch').focus(), 60);
+    }
+
+    function closeDropdown() {
+      document.getElementById('dropdownPanel').classList.remove('open');
+      document.getElementById('dropdownTrigger').classList.remove('open');
+    }
+
+    function filterCountries() {
+      renderList(document.getElementById('countrySearch').value);
+    }
+
+    document.addEventListener('click', e => {
+      if (!document.getElementById('dropdownWrap').contains(e.target)) closeDropdown();
+    });
+
+    buildList();
+    selectCountry('244');
+
+    async function checkStatus() {
+      const localNumber = document.getElementById('phoneInput').value.trim();
+      const result = document.getElementById('result');
+      const btn = document.getElementById('btn');
+      if (!localNumber) {
+        result.className = 'result show';
+        result.innerHTML = `<div class="result-card"><div class="error-box"><span class="err-icon">⚠</span>Digite o seu número de telefone.</div></div>`;
+        return;
+      }
+      const fullNumber = selectedCode + localNumber;
+      btn.disabled = true;
+      result.className = 'result show';
+      result.innerHTML = `<div class="result-card"><div class="spinner-wrap"><div class="spinner"></div><span class="spinner-label">A consultar...</span></div></div>`;
+      try {
+        const res = await fetch(`/api/cliente/${fullNumber}`);
+        const data = await res.json();
+        if (data.notFound) {
+          result.innerHTML = `<div class="result-card"><div class="error-box"><span class="err-icon">⊘</span>Nenhum plano activo encontrado para este número.</div></div>`;
+        } else {
+          const sc = data.hoursLeft <= 0 ? 'expired' : data.hoursLeft <= 24 ? 'expiring' : 'active';
+          const expDate = new Date(data.expiration);
+          const expStr = expDate.toLocaleDateString('pt-BR') + ' · ' + expDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+          result.innerHTML = `
+            <div class="result-card">
+              <div class="result-header">
+                <div class="icon">◈</div>
+                <div>
+                  <div class="name">${data.groupName}</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">${data.flag||''} ${data.country||''} · ${data.userId||''}</div>
+                </div>
+                <div class="plan-tag">${data.level.toUpperCase()}</div>
+              </div>
+              <div class="stats">
+                <div class="stat"><span class="label"><span class="label-icon">◷</span> Dias restantes</span><span class="value ${sc}">${data.daysLeft} dia${data.daysLeft!==1?'s':''}</span></div>
+                <div class="stat"><span class="label"><span class="label-icon">⌛</span> Horas restantes</span><span class="value ${sc}">${data.hoursLeft}h</span></div>
+                <div class="stat"><span class="label"><span class="label-icon">◉</span> Expira em</span><span class="value">${expStr}</span></div>
+              </div>
+            </div>`;
+        }
+      } catch (e) {
+        result.innerHTML = `<div class="result-card"><div class="error-box"><span class="err-icon">⚡</span>Erro ao consultar. Tente novamente.</div></div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById('phoneInput').addEventListener('keydown', e => {
+      if (e.key === 'Enter') checkStatus();
+    });
+  </script>
+</body>
+</html>
