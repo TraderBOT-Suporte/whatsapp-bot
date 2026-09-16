@@ -1,7 +1,7 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
 // Toda a parte de WhatsApp (Baileys, QR, pairing, grupos, membros) foi removida.
-// v2.1 — headers PWA explícitos, assetlinks TWA, auth por token, watchlist por user.
+// v2.2 — handlers de erro detalhados + try/catch VAPID (servidor não crasha com chaves más).
 
 import express from 'express';
 import cors from 'cors';
@@ -15,8 +15,30 @@ import webpush from 'web-push';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-process.on('unhandledRejection', (reason) => logger.error('Unhandled Rejection:', reason));
-process.on('uncaughtException', (err) => logger.error('Uncaught Exception:', err.message));
+// ⭐ CORRIGIDO v2.2: handlers de erro detalhados.
+// Antes: logger.error('Uncaught Exception:', err.message) — se err.message fosse
+// undefined, o log saía vazio e não se percebia o que crashou.
+// Agora: mostra message, name, code e stack completos.
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled Rejection:', {
+    message: reason?.message || String(reason),
+    name: reason?.name,
+    code: reason?.code,
+    stack: reason?.stack
+  });
+  console.error('RAW REJECTION:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught Exception:', {
+    message: err?.message || String(err),
+    name: err?.name,
+    code: err?.code,
+    stack: err?.stack
+  });
+  console.error('RAW ERROR:', err);
+  console.error('RAW STACK:', err?.stack);
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,7 +47,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ⭐ CORRIGIDO: rotas PWA explícitas ANTES do static (headers corretos p/ iOS)
+// Rotas PWA explícitas ANTES do static (headers corretos p/ iOS)
 app.get('/service-worker.js', (req, res) => {
   res.set('Content-Type', 'application/javascript; charset=utf-8');
   res.set('Service-Worker-Allowed', '/');
@@ -39,7 +61,7 @@ app.get('/manifest.json', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'manifest.json'));
 });
 
-// ⭐ NOVO: assetlinks.json para TWA (APK Android). Se não existir, devolve 404 limpo.
+// assetlinks.json para TWA (APK Android). Se não existir, devolve 404 limpo.
 app.get('/.well-known/assetlinks.json', (req, res) => {
   res.type('application/json');
   res.sendFile(path.join(__dirname, 'public', '.well-known', 'assetlinks.json'), (err) => {
@@ -79,10 +101,27 @@ const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
 let pushConfigured = false;
 
+// ⭐ CORRIGIDO v2.2: try/catch no setVapidDetails.
+// Antes: se as chaves fossem inválidas, o web-push lançava exceção não tratada
+// e o processo morria (Application exited early). Agora: o servidor arranca
+// na mesma, o push fica desativado, e os logs mostram exatamente o que está mal.
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
-  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-  pushConfigured = true;
-  logger.info('Web Push configurado.');
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    pushConfigured = true;
+    logger.info('Web Push configurado.');
+  } catch (err) {
+    logger.error('❌ Falha ao configurar Web Push:', err.message || String(err));
+    logger.error(`   VAPID_SUBJECT: "${VAPID_SUBJECT}"`);
+    logger.error(`   VAPID_PUBLIC_KEY:  ${VAPID_PUBLIC_KEY.length} caracteres (esperado ~87)`);
+    logger.error(`   VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY.length} caracteres (esperado ~43)`);
+    logger.error('   Verifica:');
+    logger.error('     • VAPID_SUBJECT tem de começar por "mailto:" ou "https://"');
+    logger.error('     • VAPID_PUBLIC_KEY começa por "B" e tem ~87 chars');
+    logger.error('     • VAPID_PRIVATE_KEY tem ~43 chars');
+    logger.error('     • Sem espaços, sem aspas, sem quebras de linha');
+    logger.error('   Push desativado — servidor continua a arrancar normalmente.');
+  }
 } else {
   logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado. Gere com: npx web-push generate-vapid-keys');
 }
@@ -853,7 +892,7 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
 });
 
 // ========== SERVE FRONTEND (PWA) ==========
-// ⭐ CORRIGIDO: catch-all DEPOIS de todas as rotas API e PWA
+// catch-all DEPOIS de todas as rotas API e PWA
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 app.listen(PORT, '0.0.0.0', () => {
