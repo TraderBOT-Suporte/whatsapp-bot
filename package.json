@@ -1,23 +1,19 @@
 {
-  "name": "whatsapp-bot-multigroup",
-  "version": "4.0.0",
+  "name": "painel-sinais",
+  "version": "1.0.0",
   "type": "module",
+  "description": "Painel web de análise de ativos e notificações push de sinais (sem WhatsApp)",
+  "main": "server.js",
   "scripts": {
-    "start": "node whatsapp-bot.js",
-    "dev": "node whatsapp-bot.js",
-    "postinstall": "PUPPETEER_CACHE_DIR=$PWD/.cache/puppeteer npx puppeteer browsers install chrome@146.0.7680.31"
+    "start": "node server.js",
+    "generate-vapid-keys": "web-push generate-vapid-keys"
   },
   "dependencies": {
-    "@upstash/redis": "^1.34.0",
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "firebase-admin": "^12.0.0",
-    "puppeteer": "^22.0.0",
-    "qrcode": "^1.5.3",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.23.0"
-  },
-  "engines": {
-    "node": "20.x"
+    "express": "^4.19.2",
+    "firebase-admin": "^12.1.0",
+    "node-cron": "^3.0.3",
+    "pino": "^9.1.0",
+    "web-push": "^3.6.7"
   }
 }
