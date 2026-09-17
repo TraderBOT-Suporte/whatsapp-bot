@@ -893,8 +893,10 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
 
 // ========== SERVE FRONTEND (PWA) ==========
 // catch-all DEPOIS de todas as rotas API e PWA
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-
+// Catch-all apenas para rotas que NÃO parecem ser ficheiros (sem extensão)
+app.get(/^\/(?!.*\.(png|jpg|jpeg|gif|svg|ico|json|js|css|woff|woff2|ttf|webp)).*$/, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`🚀 Servidor rodando na porta ${PORT}`);
   logger.info(`Firebase: ${firebaseInitialized ? 'Conectado' : 'Não'}`);
