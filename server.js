@@ -186,7 +186,7 @@ app.post('/api/validate-token', async (req, res) => {
   }
   const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
   try {
-    const r = await fetch(`${API_URL}/validate-token`, {
+    const r = await fetch(`${API_URL}/api/validate-token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token })
@@ -243,13 +243,18 @@ async function authMiddleware(req, res, next) {
 
   const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
   try {
-    const response = await fetch(`${API_URL}/validate-token`, {
+        const response = await fetch(`${API_URL}/api/validate-token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token })
     });
     const data = await response.json().catch(() => ({}));
     const valid = data && data.valid === true;
+    // ⭐ LOG DE DIAGNÓSTICO: mostra o que o servidor de análise devolveu
+    logger.info(`[AUTH] ${API_URL}/validate-token → status=${response.status} valid=${valid} periodDays=${data.periodDays ?? 'AUSENTE'}`);
+    if (!valid) {
+      logger.warn(`[AUTH] Token rejeitado pelo servidor de análise: ${JSON.stringify(data)}`);
+    }
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
        const user = valid ? {
