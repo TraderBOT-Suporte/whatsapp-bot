@@ -156,6 +156,22 @@ async function sendPushToWatchers(watchers, payload) {
     logger.error('sendPushToWatchers erro:', err.message);
   }
 }
+// ========== PLANOS (limite de ativos por modo) ==========
+// ⭐ NOVO: mapeia o `periodDays` devolvido pelo /validate-token
+// para o plano comercial e o respetivo limite de ativos por modo.
+const PLANOS = {
+  7:    { nome: '7 Dias',  maxAtivosPorModo: 3,  prioridade: false },
+  30:   { nome: '1 Mês',   maxAtivosPorModo: 5,  prioridade: false },
+  90:   { nome: '3 Meses', maxAtivosPorModo: 7,  prioridade: false },
+  180:  { nome: '6 Meses', maxAtivosPorModo: 10, prioridade: false },
+  365:  { nome: '1 Ano',   maxAtivosPorModo: 10, prioridade: true  },
+  9999: { nome: 'Admin',   maxAtivosPorModo: 10, prioridade: true  }
+};
+const PLANO_DEFAULT = { nome: 'Sem plano', maxAtivosPorModo: 0, prioridade: false };
+
+function getPlano(periodDays) {
+  return PLANOS[periodDays] || PLANO_DEFAULT;
+}
 
 // ========== MIDDLEWARE DE AUTENTICAÇÃO (token-based + admin) ==========
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -179,9 +195,15 @@ async function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Token inválido' });
   }
 
-  if (ADMIN_SECRET && token === ADMIN_SECRET) {
+    if (ADMIN_SECRET && token === ADMIN_SECRET) {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
-    req.user = { token, tokenHash, email: 'admin@local', name: 'Admin', isAdmin: true };
+    req.user = {
+      token, tokenHash,
+      email: 'admin@local', name: 'Admin',
+      periodDays: 9999,
+      plano: PLANOS[9999],
+      isAdmin: true
+    };
     return next();
   }
 
@@ -203,11 +225,13 @@ async function authMiddleware(req, res, next) {
     const valid = data && data.valid === true;
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
-    const user = valid ? {
+       const user = valid ? {
       token,
       tokenHash,
       email: data.email || data.user?.email || null,
       name: data.name || data.user?.name || null,
+      periodDays: data.periodDays || 0,
+      plano: getPlano(data.periodDays || 0),
       isAdmin: false
     } : null;
 
@@ -672,19 +696,23 @@ app.get('/api/user-me', authMiddleware, (req, res) => {
   res.json({
     tokenHash: req.user.tokenHash,
     email: req.user.email,
-    name: req.user.name
+    name: req.user.name,
+    periodDays: req.user.periodDays,
+    plano: req.user.plano,
+    maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10
   });
 });
-
 // ---------- MOTOR DE SINAIS (por user) ----------
 app.get('/api/engine-config', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) {
     return res.json({ active: false, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
   }
   try {
-    const wl = await getUserWatchlist(req.user.tokenHash);
+      const wl = await getUserWatchlist(req.user.tokenHash);
     res.json({
       active: wl.engineActive,
+      plano: req.user.plano,
+      maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10,
       watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO }
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -719,16 +747,24 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
   const { watchlist } = req.body || {};
   if (!watchlist || typeof watchlist !== 'object') return res.status(400).json({ error: 'watchlist deve ser um objeto' });
   try {
+    // ⭐ NOVO: aplica o limite consoante o plano do utilizador
+    const maxAtivos = req.user.plano?.maxAtivosPorModo ?? 10;
+    if (maxAtivos <= 0) {
+      return res.status(403).json({
+        error: 'A tua conta não tem um plano ativo. Contacta o suporte para ativares o acesso.'
+      });
+    }
+
     const current = await getUserWatchlist(req.user.tokenHash);
     const final = {
-      SNIPER:    Array.isArray(watchlist.SNIPER)    ? [...new Set(watchlist.SNIPER)].slice(0,10)    : current.SNIPER,
-      'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) ? [...new Set(watchlist['CAÇADOR'])].slice(0,10) : current['CAÇADOR'],
-      PESCADOR:  Array.isArray(watchlist.PESCADOR)  ? [...new Set(watchlist.PESCADOR)].slice(0,10)  : current.PESCADOR,
-      BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  ? [...new Set(watchlist.BALEEIRO)].slice(0,10)  : current.BALEEIRO,
+      SNIPER:    Array.isArray(watchlist.SNIPER)    ? [...new Set(watchlist.SNIPER)].slice(0, maxAtivos)    : current.SNIPER,
+      'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) ? [...new Set(watchlist['CAÇADOR'])].slice(0, maxAtivos) : current['CAÇADOR'],
+      PESCADOR:  Array.isArray(watchlist.PESCADOR)  ? [...new Set(watchlist.PESCADOR)].slice(0, maxAtivos)  : current.PESCADOR,
+      BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  ? [...new Set(watchlist.BALEEIRO)].slice(0, maxAtivos)  : current.BALEEIRO,
       email: req.user.email || null
     };
     await saveUserWatchlist(req.user.tokenHash, final);
-    res.json({ success: true, watchlist: final });
+    res.json({ success: true, watchlist: final, plano: req.user.plano, maxAtivosPorModo: maxAtivos });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
