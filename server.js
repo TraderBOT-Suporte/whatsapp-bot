@@ -57,6 +57,12 @@ app.get('/manifest.json', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'manifest.json'));
 });
 
+// ⭐ NOVO — Política de Privacidade (obrigatório para Play Store)
+app.get('/privacy', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.sendFile(path.join(__dirname, 'public', 'privacy.html'));
+});
+
 app.get('/.well-known/assetlinks.json', (req, res) => {
   res.type('application/json');
   res.sendFile(path.join(__dirname, 'public', '.well-known', 'assetlinks.json'), (err) => {
