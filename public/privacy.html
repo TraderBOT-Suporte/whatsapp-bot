@@ -2,28 +2,102 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Política de Privacidade — Trader BOT</title>
+<meta name="description" content="Política de Privacidade do Trader BOT — análise técnica automatizada e notificações push.">
+<meta name="theme-color" content="#08090d">
+<meta name="robots" content="index,follow">
+
+<!-- Favicon / PWA icons -->
+<link rel="icon" type="image/png" sizes="32x32" href="/icon-192.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/icon-192.png">
+<link rel="shortcut icon" href="/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icon-192.png">
+<link rel="apple-touch-icon" sizes="192x192" href="/icon-192.png">
+<link rel="apple-touch-icon" sizes="512x512" href="/icon-512.png">
+<link rel="mask-icon" href="/icon-192.png" color="#08090d">
+
+<!-- PWA meta -->
+<link rel="manifest" href="/manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="TraderBOT">
+
 <style>
-body{font-family:system-ui,-apple-system,sans-serif;max-width:820px;margin:0 auto;padding:24px;background:#08090d;color:#eaecef;line-height:1.65}
-h1{color:#60a5fa;font-size:24px;margin-bottom:8px}
-h2{color:#60a5fa;font-size:17px;margin-top:28px;margin-bottom:10px}
-p,li{color:#b8bcc4;font-size:14px}
+*,*::before,*::after{box-sizing:border-box}
+body{
+  font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
+  max-width:820px;margin:0 auto;padding:24px;
+  background:#08090d;color:#eaecef;line-height:1.7;
+  -webkit-font-smoothing:antialiased;
+}
+.header{
+  display:flex;align-items:center;gap:14px;
+  padding-bottom:20px;margin-bottom:8px;
+  border-bottom:1px solid rgba(255,255,255,.08);
+}
+.header img{
+  width:52px;height:52px;border-radius:12px;
+  background:#11141c;padding:6px;
+  border:1px solid rgba(255,255,255,.10);
+  flex-shrink:0;
+}
+.header-text h1{margin:0;font-size:22px;font-weight:800;color:#eaecef;letter-spacing:-.5px}
+.header-text h1 span{color:#3b82f6}
+.header-text p{margin:2px 0 0;font-size:12px;color:#5e6673;text-transform:uppercase;letter-spacing:1.5px}
+h2{color:#60a5fa;font-size:16px;margin-top:30px;margin-bottom:10px;font-weight:700}
+p,li{color:#b8bcc4;font-size:14.5px;line-height:1.7}
 ul{padding-left:22px}
-.meta{font-size:12px;color:#5e6673;margin-bottom:24px}
-a{color:#60a5fa}
+strong{color:#eaecef;font-weight:600}
+.meta{
+  font-size:12px;color:#5e6673;
+  margin:0 0 24px;
+  font-style:italic;
+}
+a{color:#60a5fa;text-decoration:none}
+a:hover{text-decoration:underline}
+.back-btn{
+  display:inline-flex;align-items:center;gap:8px;
+  margin-top:36px;padding:12px 20px;
+  background:linear-gradient(180deg,#3b82f6,#2563eb);
+  color:#fff;border-radius:999px;
+  font-weight:700;font-size:13.5px;
+  text-transform:uppercase;letter-spacing:.5px;
+  box-shadow:0 4px 20px rgba(59,130,246,.25);
+  transition:transform .15s ease;
+}
+.back-btn:hover{transform:translateY(-1px);text-decoration:none}
+.footer{
+  margin-top:40px;padding-top:20px;
+  border-top:1px solid rgba(255,255,255,.06);
+  text-align:center;font-size:12px;color:#5e6673;
+}
+@media (max-width:520px){
+  body{padding:18px}
+  .header img{width:44px;height:44px}
+  .header-text h1{font-size:18px}
+  h2{font-size:15px}
+  p,li{font-size:13.5px}
+}
 </style>
 </head>
 <body>
-<h1>Política de Privacidade — Trader BOT</h1>
-<p class="meta">Última atualização: <script>document.write(new Date().toLocaleDateString('pt-BR'))</script></p>
+
+<div class="header">
+  <img src="/icon-192.png" alt="Trader BOT">
+  <div class="header-text">
+    <h1><span>TRADER</span> BOT</h1>
+    <p>Política de Privacidade</p>
+  </div>
+</div>
+
+<p class="meta">Última atualização: <span id="lastUpdate">—</span></p>
 
 <h2>1. Informações que recolhemos</h2>
 <ul>
-<li><strong>Token de acesso</strong>: usado para autenticação e identificação da sua conta.</li>
-<li><strong>Subscrição de notificações push</strong>: endpoint e chaves técnicas, para enviar alertas de sinais.</li>
-<li><strong>Watchlist</strong>: lista de ativos que escolheu monitorizar (guardada nos servidores).</li>
-<li><strong>Histórico de sinais</strong>: registos dos sinais recebidos.</li>
+<li><strong>Token de acesso</strong> — usado para autenticação e identificação da sua conta.</li>
+<li><strong>Subscrição de notificações push</strong> — endpoint e chaves técnicas, para enviar alertas de sinais.</li>
+<li><strong>Watchlist</strong> — lista de ativos que escolheu monitorizar (guardada nos servidores).</li>
+<li><strong>Histórico de sinais</strong> — registos dos sinais recebidos.</li>
 </ul>
 
 <h2>2. Como usamos os dados</h2>
@@ -59,10 +133,26 @@ a{color:#60a5fa}
 <p>O Trader BOT é uma ferramenta de <strong>análise técnica automatizada</strong>. Não constitui aconselhamento financeiro. Todas as decisões de investimento são da exclusiva responsabilidade do utilizador.</p>
 
 <h2>9. Contacto</h2>
-<p>Para questões sobre privacidade: <a href="mailto:trader.bot.83.28@gmail.com">traderbotanalyzer@zohomail.com</a></p>
+<p>Para questões sobre privacidade: <a href="mailto:traderbotanalyzer@zohomail.com">traderbotanalyzer@zohomail.com</a></p>
 
 <h2>10. Alterações a esta política</h2>
 <p>Podemos atualizar esta política periodicamente. A data de "última atualização" no topo será sempre a referência.</p>
+
+<a href="/" class="back-btn">← Voltar à App</a>
+
+<div class="footer">
+  © <span id="year"></span> Trader BOT Technologies · Todos os direitos reservados
+</div>
+
+<script>
+(function(){
+  var now = new Date();
+  document.getElementById('lastUpdate').textContent = now.toLocaleDateString('pt-BR', {
+    day: '2-digit', month: 'long', year: 'numeric'
+  });
+  document.getElementById('year').textContent = now.getFullYear();
+})();
+</script>
 
 </body>
 </html>
