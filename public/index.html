@@ -150,7 +150,25 @@ function startClock(){if(clockIntervalId)return;var tick=function(){var n=new Da
 function stopClock(){if(clockIntervalId){clearInterval(clockIntervalId);clockIntervalId=null;}}
 function showLoginScreen(){document.body.classList.remove('dashboard-active');stopClock();clockActive=false;setClockVisibility(false);document.getElementById('login-wrapper').classList.add('active');document.getElementById('dashboard-wrapper').classList.remove('active');var hb=document.getElementById('hamburger-btn');if(hb)hb.style.display='none';}
 function showDashboard(){document.getElementById('login-wrapper').classList.remove('active');document.getElementById('dashboard-wrapper').classList.add('active');var hb=document.getElementById('hamburger-btn');if(hb)hb.style.display='flex';setClockVisibility(true);startClock();clockActive=true;removeBackgroundEffects();}
-function logout(){localStorage.removeItem('authToken');_cache={engineConfig:null,engineConfigTs:0,userMe:null,userMeTs:0,watchlist:null,watchlistTs:0};if(statusRefreshInterval){clearInterval(statusRefreshInterval);statusRefreshInterval=null;}showLoginScreen();}
+// ⭐ CORRIGIDO — Fecha TUDO antes de mostrar o login (evita ficar estagnado no modal)
+function logout(){
+  localStorage.removeItem('authToken');
+  _cache={engineConfig:null,engineConfigTs:0,userMe:null,userMeTs:0,watchlist:null,watchlistTs:0};
+  if(statusRefreshInterval){clearInterval(statusRefreshInterval);statusRefreshInterval=null;}
+  try{closeAllModals();}catch(e){}
+  try{closeSideMenu();}catch(e){}
+  document.body.style.overflow='';
+  document.querySelectorAll('.app-modal.active,.manual-modal.active').forEach(function(m){m.classList.remove('active');});
+  document.querySelectorAll('.csel-wrapper.csel-open').forEach(function(w){w.classList.remove('csel-open');});
+  document.querySelectorAll('.toast-notification').forEach(function(t){t.remove();});
+  var _dw=document.getElementById('dashboard-wrapper');
+  if(_dw)_dw.scrollTop=0;
+  showLoginScreen();
+  var _ti=document.getElementById('tokenCode');
+  if(_ti)_ti.value='';
+  var _lm=document.getElementById('login-message');
+  if(_lm){_lm.textContent='';_lm.className='message';}
+}
 window.doLogout=function(){if(confirm('Deseja realmente terminar a sessão?')){logout();showToast('Sessão terminada.','info');}};
 function initDashboard(token){
   if(token)localStorage.setItem('authToken',token);
