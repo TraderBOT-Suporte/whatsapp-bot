@@ -174,6 +174,33 @@ function getPlano(periodDays) {
 }
 
 // ========== MIDDLEWARE DE AUTENTICAÇÃO (token-based + admin) ==========
+// ========== PROXY DE VALIDAÇÃO DE TOKEN ==========
+// O frontend chama POST /api/validate-token → este endpoint encaminha
+// para o servidor de análise real (ANALYSIS_API_URL) e devolve a resposta
+// tal e qual — incluindo periodDays, que o frontend usa para saber o plano.
+// Elimina problemas de CORS e esconde o URL do servidor de análise.
+app.post('/api/validate-token', async (req, res) => {
+  const { token } = req.body || {};
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ valid: false, message: 'Token não fornecido' });
+  }
+  const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
+  try {
+    const r = await fetch(`${API_URL}/validate-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token })
+    });
+    const data = await r.json().catch(() => ({}));
+    logger.info(`[VALIDATE-PROXY] token=${token.slice(0, 8)}... status=${r.status} periodDays=${data.periodDays ?? 'null'}`);
+    return res.status(r.status).json(data);
+  } catch (err) {
+    logger.error('[VALIDATE-PROXY] Erro ao contactar servidor de análise:', err.message);
+    return res.status(503).json({ valid: false, message: 'Serviço de validação indisponível' });
+  }
+});
+
+// ========== MIDDLEWARE DE AUTENTICAÇÃO (token-based + admin) ==========
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 const tokenValidationCache = new Map();
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
