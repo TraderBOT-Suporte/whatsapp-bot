@@ -156,49 +156,6 @@ async function sendPushToWatchers(watchers, payload) {
     logger.error('sendPushToWatchers erro:', err.message);
   }
 }
-// ========== PLANOS (limite de ativos por modo) ==========
-// ⭐ NOVO: mapeia o `periodDays` devolvido pelo /validate-token
-// para o plano comercial e o respetivo limite de ativos por modo.
-const PLANOS = {
-  7:    { nome: '7 Dias',  maxAtivosPorModo: 3,  prioridade: false },
-  30:   { nome: '1 Mês',   maxAtivosPorModo: 5,  prioridade: false },
-  90:   { nome: '3 Meses', maxAtivosPorModo: 7,  prioridade: false },
-  180:  { nome: '6 Meses', maxAtivosPorModo: 10, prioridade: false },
-  365:  { nome: '1 Ano',   maxAtivosPorModo: 10, prioridade: true  },
-  9999: { nome: 'Admin',   maxAtivosPorModo: 10, prioridade: true  }
-};
-const PLANO_DEFAULT = { nome: 'Sem plano', maxAtivosPorModo: 0, prioridade: false };
-
-function getPlano(periodDays) {
-  return PLANOS[periodDays] || PLANO_DEFAULT;
-}
-
-// ========== MIDDLEWARE DE AUTENTICAÇÃO (token-based + admin) ==========
-// ========== PROXY DE VALIDAÇÃO DE TOKEN ==========
-// O frontend chama POST /api/validate-token → este endpoint encaminha
-// para o servidor de análise real (ANALYSIS_API_URL) e devolve a resposta
-// tal e qual — incluindo periodDays, que o frontend usa para saber o plano.
-// Elimina problemas de CORS e esconde o URL do servidor de análise.
-app.post('/api/validate-token', async (req, res) => {
-  const { token } = req.body || {};
-  if (!token || typeof token !== 'string') {
-    return res.status(400).json({ valid: false, message: 'Token não fornecido' });
-  }
-  const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
-  try {
-    const r = await fetch(`${API_URL}/api/validate-token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token })
-    });
-    const data = await r.json().catch(() => ({}));
-    logger.info(`[VALIDATE-PROXY] token=${token.slice(0, 8)}... status=${r.status} periodDays=${data.periodDays ?? 'null'}`);
-    return res.status(r.status).json(data);
-  } catch (err) {
-    logger.error('[VALIDATE-PROXY] Erro ao contactar servidor de análise:', err.message);
-    return res.status(503).json({ valid: false, message: 'Serviço de validação indisponível' });
-  }
-});
 
 // ========== MIDDLEWARE DE AUTENTICAÇÃO (token-based + admin) ==========
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -222,15 +179,9 @@ async function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Token inválido' });
   }
 
-    if (ADMIN_SECRET && token === ADMIN_SECRET) {
+  if (ADMIN_SECRET && token === ADMIN_SECRET) {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
-    req.user = {
-      token, tokenHash,
-      email: 'admin@local', name: 'Admin',
-      periodDays: 9999,
-      plano: PLANOS[9999],
-      isAdmin: true
-    };
+    req.user = { token, tokenHash, email: 'admin@local', name: 'Admin', isAdmin: true };
     return next();
   }
 
@@ -243,27 +194,20 @@ async function authMiddleware(req, res, next) {
 
   const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
   try {
-        const response = await fetch(`${API_URL}/api/validate-token`, {
+    const response = await fetch(`${API_URL}/validate-token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token })
     });
     const data = await response.json().catch(() => ({}));
     const valid = data && data.valid === true;
-    // ⭐ LOG DE DIAGNÓSTICO: mostra o que o servidor de análise devolveu
-    logger.info(`[AUTH] ${API_URL}/validate-token → status=${response.status} valid=${valid} periodDays=${data.periodDays ?? 'AUSENTE'}`);
-    if (!valid) {
-      logger.warn(`[AUTH] Token rejeitado pelo servidor de análise: ${JSON.stringify(data)}`);
-    }
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
-       const user = valid ? {
+    const user = valid ? {
       token,
       tokenHash,
       email: data.email || data.user?.email || null,
       name: data.name || data.user?.name || null,
-      periodDays: data.periodDays || 0,
-      plano: getPlano(data.periodDays || 0),
       isAdmin: false
     } : null;
 
@@ -728,23 +672,19 @@ app.get('/api/user-me', authMiddleware, (req, res) => {
   res.json({
     tokenHash: req.user.tokenHash,
     email: req.user.email,
-    name: req.user.name,
-    periodDays: req.user.periodDays,
-    plano: req.user.plano,
-    maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10
+    name: req.user.name
   });
 });
+
 // ---------- MOTOR DE SINAIS (por user) ----------
 app.get('/api/engine-config', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) {
     return res.json({ active: false, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
   }
   try {
-      const wl = await getUserWatchlist(req.user.tokenHash);
+    const wl = await getUserWatchlist(req.user.tokenHash);
     res.json({
       active: wl.engineActive,
-      plano: req.user.plano,
-      maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10,
       watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO }
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -779,24 +719,16 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
   const { watchlist } = req.body || {};
   if (!watchlist || typeof watchlist !== 'object') return res.status(400).json({ error: 'watchlist deve ser um objeto' });
   try {
-    // ⭐ NOVO: aplica o limite consoante o plano do utilizador
-    const maxAtivos = req.user.plano?.maxAtivosPorModo ?? 10;
-    if (maxAtivos <= 0) {
-      return res.status(403).json({
-        error: 'A tua conta não tem um plano ativo. Contacta o suporte para ativares o acesso.'
-      });
-    }
-
     const current = await getUserWatchlist(req.user.tokenHash);
     const final = {
-      SNIPER:    Array.isArray(watchlist.SNIPER)    ? [...new Set(watchlist.SNIPER)].slice(0, maxAtivos)    : current.SNIPER,
-      'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) ? [...new Set(watchlist['CAÇADOR'])].slice(0, maxAtivos) : current['CAÇADOR'],
-      PESCADOR:  Array.isArray(watchlist.PESCADOR)  ? [...new Set(watchlist.PESCADOR)].slice(0, maxAtivos)  : current.PESCADOR,
-      BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  ? [...new Set(watchlist.BALEEIRO)].slice(0, maxAtivos)  : current.BALEEIRO,
+      SNIPER:    Array.isArray(watchlist.SNIPER)    ? [...new Set(watchlist.SNIPER)].slice(0,10)    : current.SNIPER,
+      'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) ? [...new Set(watchlist['CAÇADOR'])].slice(0,10) : current['CAÇADOR'],
+      PESCADOR:  Array.isArray(watchlist.PESCADOR)  ? [...new Set(watchlist.PESCADOR)].slice(0,10)  : current.PESCADOR,
+      BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  ? [...new Set(watchlist.BALEEIRO)].slice(0,10)  : current.BALEEIRO,
       email: req.user.email || null
     };
     await saveUserWatchlist(req.user.tokenHash, final);
-    res.json({ success: true, watchlist: final, plano: req.user.plano, maxAtivosPorModo: maxAtivos });
+    res.json({ success: true, watchlist: final });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
