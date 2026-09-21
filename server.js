@@ -1,7 +1,7 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
 // Toda a parte de WhatsApp (Baileys, QR, pairing, grupos, membros) foi removida.
-// v2.2 — handlers de erro detalhados + try/catch VAPID (servidor não crasha com chaves más).
+// v2.3 — persistência anti-restart de trades/cooldowns/prontidão + anti-duplicado.
 
 import express from 'express';
 import cors from 'cors';
@@ -15,10 +15,6 @@ import webpush from 'web-push';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-// ⭐ CORRIGIDO v2.2: handlers de erro detalhados.
-// Antes: logger.error('Uncaught Exception:', err.message) — se err.message fosse
-// undefined, o log saía vazio e não se percebia o que crashou.
-// Agora: mostra message, name, code e stack completos.
 process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled Rejection:', {
     message: reason?.message || String(reason),
@@ -61,7 +57,6 @@ app.get('/manifest.json', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'manifest.json'));
 });
 
-// assetlinks.json para TWA (APK Android). Se não existir, devolve 404 limpo.
 app.get('/.well-known/assetlinks.json', (req, res) => {
   res.type('application/json');
   res.sendFile(path.join(__dirname, 'public', '.well-known', 'assetlinks.json'), (err) => {
@@ -101,10 +96,6 @@ const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
 let pushConfigured = false;
 
-// ⭐ CORRIGIDO v2.2: try/catch no setVapidDetails.
-// Antes: se as chaves fossem inválidas, o web-push lançava exceção não tratada
-// e o processo morria (Application exited early). Agora: o servidor arranca
-// na mesma, o push fica desativado, e os logs mostram exatamente o que está mal.
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   try {
     webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
@@ -126,7 +117,6 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado. Gere com: npx web-push generate-vapid-keys');
 }
 
-// Envia push SÓ para os utilizadores em `watchers` (array de tokenHash)
 async function sendPushToWatchers(watchers, payload) {
   if (!pushConfigured || !firebaseInitialized || !watchers || watchers.length === 0) return;
   try {
@@ -185,8 +175,6 @@ setInterval(() => {
 }, 60 * 1000);
 
 // ========== PROXY DE VALIDAÇÃO DE TOKEN ==========
-// O frontend chama POST /api/validate-token (same-origin, sem CORS)
-// Este endpoint encaminha para o servidor de análise real.
 app.post('/api/validate-token', async (req, res) => {
   const { token } = req.body || {};
   if (!token || typeof token !== 'string') {
@@ -337,6 +325,116 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
+// ========== PERSISTÊNCIA DE ESTADO (anti-restart) ==========
+async function persistTradeOpen(tradeKey, trade) {
+  if (!firebaseInitialized) return;
+  try {
+    await db.collection('open_trades').doc(tradeKey).set({
+      ...trade,
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (err) { logger.error('Erro persistTradeOpen:', err.message); }
+}
+
+async function persistTradeUpdate(tradeKey, trade) {
+  if (!firebaseInitialized) return;
+  try {
+    await db.collection('open_trades').doc(tradeKey).set({
+      currentPrice: trade.currentPrice,
+      avisoSeguindoEnviado: trade.avisoSeguindoEnviado,
+      avisoZeroRiscoEnviado: trade.avisoZeroRiscoEnviado,
+      avisoQuaseLaEnviado: trade.avisoQuaseLaEnviado,
+      avisoAceleracaoEnviado: trade.avisoAceleracaoEnviado,
+      avisoTempoEsgotadoEnviado: trade.avisoTempoEsgotadoEnviado,
+      aviso5MinEnviado: trade.aviso5MinEnviado,
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (err) { logger.error('Erro persistTradeUpdate:', err.message); }
+}
+
+async function removePersistedTrade(tradeKey) {
+  if (!firebaseInitialized) return;
+  try { await db.collection('open_trades').doc(tradeKey).delete(); }
+  catch (err) { logger.error('Erro removePersistedTrade:', err.message); }
+}
+
+async function persistCooldown(tradeKey, expiresAt) {
+  if (!firebaseInitialized) return;
+  try {
+    await db.collection('cooldowns').doc(tradeKey).set({
+      expiresAt, atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (err) { logger.error('Erro persistCooldown:', err.message); }
+}
+
+async function removePersistedCooldown(tradeKey) {
+  if (!firebaseInitialized) return;
+  try { await db.collection('cooldowns').doc(tradeKey).delete(); }
+  catch (err) { logger.error('Erro removePersistedCooldown:', err.message); }
+}
+
+async function persistProntidao(tradeKey, historico, ativa) {
+  if (!firebaseInitialized) return;
+  try {
+    await db.collection('prontidao_state').doc(tradeKey).set({
+      historico: historico || [],
+      ativa: !!ativa,
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (err) { logger.error('Erro persistProntidao:', err.message); }
+}
+
+async function removePersistedProntidao(tradeKey) {
+  if (!firebaseInitialized) return;
+  try { await db.collection('prontidao_state').doc(tradeKey).delete(); }
+  catch (err) { logger.error('Erro removePersistedProntidao:', err.message); }
+}
+
+async function loadStateFromFirestore() {
+  if (!firebaseInitialized) {
+    logger.warn('⏭️ loadStateFromFirestore: Firebase indisponível, a saltar.');
+    return;
+  }
+  try {
+    // --- 1. Trades abertos ---
+    const tradesSnap = await db.collection('open_trades').get();
+    const agora = Date.now();
+    let tradesRestaurados = 0, tradesExpirados = 0;
+    for (const doc of tradesSnap.docs) {
+      const t = doc.data();
+      const timestampTrade = t.timestamp || 0;
+      if (agora - timestampTrade > TRADE_TIMEOUT_MS) {
+        await doc.ref.delete(); tradesExpirados++; continue;
+      }
+      tradesAbertos.set(doc.id, t);
+      tradesRestaurados++;
+    }
+
+    // --- 2. Cooldowns ---
+    const cdSnap = await db.collection('cooldowns').get();
+    let cdRestaurados = 0, cdExpirados = 0;
+    for (const doc of cdSnap.docs) {
+      const c = doc.data();
+      if (c.expiresAt && c.expiresAt > agora) { cooldownPosTrade.set(doc.id, c.expiresAt); cdRestaurados++; }
+      else { await doc.ref.delete(); cdExpirados++; }
+    }
+
+    // --- 3. Prontidão ---
+    const prSnap = await db.collection('prontidao_state').get();
+    let prRestaurados = 0;
+    for (const doc of prSnap.docs) {
+      const p = doc.data();
+      if (Array.isArray(p.historico) && p.historico.length > 0) prontidaoHistorico.set(doc.id, p.historico);
+      if (p.ativa) prontidaoAtiva.add(doc.id);
+      prRestaurados++;
+    }
+
+    logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${tradesExpirados} trade(s) expirado(s), ${cdExpirados} cooldown(s) expirado(s)`);
+  } catch (err) {
+    logger.error('Erro ao carregar estado do Firestore:', err.message);
+  }
+}
+
 function cleanSymbolName(symbol) {
   let nome = symbol.replace('frx', '').replace('cry', '').replace('OTC_', '');
   if (nome.length === 6) nome = nome.slice(0, 3) + '/' + nome.slice(3);
@@ -483,6 +581,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
   if (cooldownPosTrade.has(tradeKey)) {
     if (agora < cooldownPosTrade.get(tradeKey)) return;
     cooldownPosTrade.delete(tradeKey);
+    removePersistedCooldown(tradeKey);
   }
 
   const trade = tradesAbertos.get(tradeKey);
@@ -491,7 +590,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     trade.currentPrice = currentPrice;
     if (agora - trade.timestamp > TRADE_TIMEOUT_MS) {
       tradesAbertos.delete(tradeKey);
+      removePersistedTrade(tradeKey);
       cooldownPosTrade.set(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
+      persistCooldown(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
       return;
     }
 
@@ -517,7 +618,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
     if (fecharTrade) {
       tradesAbertos.delete(tradeKey);
+      removePersistedTrade(tradeKey);
       cooldownPosTrade.set(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
+      persistCooldown(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
+    } else {
+      persistTradeUpdate(tradeKey, trade);
     }
 
     if (msgObj) {
@@ -526,10 +631,33 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     return;
   }
 
+  // ⭐ Anti-duplicado: verifica se já existe SINAL_CONFIRMADO recente (últimos 5min)
+  // para o mesmo symbol+mode. Só se aplica quando NÃO existe trade aberto (que é
+  // o caso aqui, porque o bloco `if (trade)` acima já tratou desse cenário).
+  if (firebaseInitialized) {
+    try {
+      const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
+      const snap = await db.collection('signals')
+        .where('symbol', '==', symbol)
+        .where('mode', '==', mode)
+        .where('tipo', '==', 'SINAL_CONFIRMADO')
+        .where('criadoEm', '>=', cincoMinAtras)
+        .limit(1)
+        .get();
+      if (!snap.empty) {
+        logger.info(`⏭️ Anti-duplicado: sinal já emitido nos últimos 5min para ${symbol}/${mode} — a saltar`);
+        return;
+      }
+    } catch (err) {
+      // Se falhar por índice em falta, ignora e continua (não bloqueia o motor)
+      logger.warn('Anti-duplicado indisponível (índice?):', err.message);
+    }
+  }
+
   if (dados.consolidated.signal !== 'HOLD' && dados.consolidated.zona === 'A') {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
-      tradesAbertos.set(tradeKey, {
+      const novoTrade = {
         symbol,
         signal: dados.consolidated.signal,
         entry: dados.suggestion.entry,
@@ -543,7 +671,10 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         avisoAceleracaoEnviado: false,
         avisoTempoEsgotadoEnviado: false,
         aviso5MinEnviado: false
-      });
+      };
+      tradesAbertos.set(tradeKey, novoTrade);
+      persistTradeOpen(tradeKey, novoTrade);
+
       await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', formatarMensagemSinal(dados), {
         score: dados.consolidated.score,
         confidence: dados.consolidated.confidence,
@@ -554,6 +685,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
+      removePersistedProntidao(tradeKey);
     }
   }
   else if (dados.consolidated.signal === 'HOLD' && dados.consolidated.zona === 'B') {
@@ -562,6 +694,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     historico.push({ score: dados.consolidated.score, t: agora });
     if (historico.length > 5) historico.shift();
     prontidaoHistorico.set(tradeKey, historico);
+    persistProntidao(tradeKey, historico, prontidaoAtiva.has(tradeKey));
 
     if (!prontidaoAtiva.has(tradeKey)) {
       const direcaoPrep = extrairDirecaoPrep(dados);
@@ -574,6 +707,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           watchers
         );
         prontidaoAtiva.add(tradeKey);
+        persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
       }
     }
   }
@@ -590,6 +724,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
+      removePersistedProntidao(tradeKey);
     }
   }
 }
@@ -671,7 +806,13 @@ const fullAssets = {
 
 // ========== API ENDPOINTS ==========
 
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: Math.floor(process.uptime()) }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  uptime: Math.floor(process.uptime()),
+  tradesAbertos: tradesAbertos.size,
+  cooldowns: cooldownPosTrade.size,
+  prontidoes: prontidaoAtiva.size
+}));
 
 app.get('/api/vapid-public-key', (req, res) => {
   if (!pushConfigured) return res.status(503).json({ error: 'Push não configurado no servidor' });
@@ -774,7 +915,6 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
   try {
     const maxAtivos = req.user.plano?.maxAtivosPorModo ?? 10;
 
-    // Sem plano ativo → bloqueia
     if (maxAtivos <= 0) {
       return res.status(403).json({
         error: 'A tua conta não tem um plano ativo. Contacta o suporte para ativares o acesso.'
@@ -783,7 +923,6 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
 
     const current = await getUserWatchlist(req.user.tokenHash);
 
-    // Detetar se houve corte em cada modo
     const cortado = {
       SNIPER:    Array.isArray(watchlist.SNIPER)    && [...new Set(watchlist.SNIPER)].length    > maxAtivos,
       'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) && [...new Set(watchlist['CAÇADOR'])].length > maxAtivos,
@@ -974,15 +1113,16 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
 });
 
 // ========== SERVE FRONTEND (PWA) ==========
-// catch-all DEPOIS de todas as rotas API e PWA
-// Catch-all apenas para rotas que NÃO parecem ser ficheiros (sem extensão)
 app.get(/^\/(?!.*\.(png|jpg|jpeg|gif|svg|ico|json|js|css|woff|woff2|ttf|webp)).*$/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
-app.listen(PORT, '0.0.0.0', () => {
+
+app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`🚀 Servidor rodando na porta ${PORT}`);
   logger.info(`Firebase: ${firebaseInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
+  // ⭐ Restaura estado persistido (trades abertos, cooldowns, prontidão)
+  await loadStateFromFirestore();
 });
 
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
