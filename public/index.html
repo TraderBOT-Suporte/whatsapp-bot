@@ -106,7 +106,7 @@
 <div id="signals-modal" class="app-modal"><div class="app-modal-header"><h2><i class="ph-fill ph-list-checks"></i> Painel de Sinais</h2><button class="close-menu-btn" onclick="closeSignalsModal()" aria-label="Fechar"><i class="ph-fill ph-x"></i></button></div><div class="app-modal-body"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap"><div class="panel-title" style="margin:0;flex:1">Histórico</div><div id="signals-mode-filter-wrapper" style="min-width:170px;max-width:230px"></div></div><div class="signals-list" id="signalsList"></div></div></div>
 
 <!-- DASHBOARD = SCAN (PÁGINA PRINCIPAL) -->
-<div id="dashboard-wrapper" class="dashboard-wrapper"><div class="container"><div class="terminal-header"><h1>TRADER BOT SCANNER</h1><div class="subtitle">v2.5.0 | Scanner Multi-Grupo</div><div class="subtitle">🎯 SNIPER &nbsp;|&nbsp; 🏹 CAÇADOR &nbsp;|&nbsp; 🎣 PESCADOR &nbsp;|&nbsp; 🐋 BALEEIRO</div></div><div class="scan-form"><div class="form-row"><div class="form-group"><label>Grupo de Ativos</label><div id="scan-group-wrapper"></div></div><div class="form-group"><label>Modo de Trading</label><div id="scan-mode-wrapper"></div></div></div><button class="scan-run-btn" id="scanRunBtn" onclick="runScan()">🔍 Analisar Grupo</button></div><div id="scanProgress" class="scan-progress" style="display:none"><div class="spinner"></div><span>Analisando ativos... aguarde</span></div><div id="scanPlanInfo" style="font-size:12.5px;color:var(--t-2);padding:10px 14px;background:#161a23;border:1px solid var(--accent-border);border-radius:var(--r);margin-bottom:12px;display:none"></div><div id="scanResultsWrap" style="display:none"><div class="scan-actions"><button class="scan-action-btn" onclick="selectZonaB()">✅ Selecionar Zona B</button><button class="scan-action-btn primary" id="scanAddBtn" onclick="addSelectedToWatchlist()" disabled>➕ Monitorar (<span id="scanSelectedCount">0</span>)</button></div><p id="scanStatusMsg" style="font-size:12px;color:var(--t-3);margin-bottom:12px"></p><div id="scanResultsList"></div></div></div><div class="terminal-footer"><span><i class="ph-fill ph-warning"></i> AVISO LEGAL: Use com responsabilidade!</span><br><span><i class="ph-fill ph-broadcast"></i> v2.5.0 | Trader BOT ANALYZER | Powered by TRADER BOT</span></div></div>
+<div id="dashboard-wrapper" class="dashboard-wrapper"><div class="container"><div class="terminal-header"><h1>TRADER BOT SCANNER</h1><div class="subtitle">v2.5.0 | Scanner Multi-Grupo</div><div class="subtitle">🎯 SNIPER &nbsp;|&nbsp; 🏹 CAÇADOR &nbsp;|&nbsp; 🎣 PESCADOR &nbsp;|&nbsp; 🐋 BALEEIRO</div></div><div class="scan-form"><div class="form-row"><div class="form-group"><label>Grupo de Ativos</label><div id="scan-group-wrapper"></div></div><div class="form-group"><label>Modo de Trading</label><div id="scan-mode-wrapper"></div></div></div><button class="scan-run-btn" id="scanRunBtn" onclick="runScan()">🔍 Analisar Grupo</button></div><div id="scanProgress" class="scan-progress" style="display:none"><div class="spinner"></div><span>Analisando ativos... aguarde</span></div><div id="scanPlanInfo" style="font-size:12.5px;color:var(--t-2);padding:10px 14px;background:#161a23;border:1px solid var(--accent-border);border-radius:var(--r);margin-bottom:12px;display:none"></div><div id="scanResultsWrap" style="display:none"><div class="scan-actions"><button class="scan-action-btn" onclick="selectZonaB()">✅ Selecionar Zona B</button><button class="scan-action-btn primary" id="scanAddBtn" onclick="addSelectedToWatchlist()" disabled>➕ Monitorar (<span id="scanSelectedCount">0</span>)</button></div><p id="scanStatusMsg" style="font-size:12px;color:var(--t-3);margin-bottom:12px"></p><div id="scanResultsList"></div></div></div><div class="terminal-footer"><span><i class="ph-fill ph-warning"></i> AVISO LEGAL: Use com responsabilidade!</span><br><span><i class="ph-fill ph-broadcast"></i> v2.5.0 | Powered by TRADER BOT</span></div></div>
 
 <script>
 (function(){
@@ -166,7 +166,43 @@ async function refreshStats(){try{var d=await apiMain('/api/stats');setText('sta
 function renderEngineUI(active){var ic=document.getElementById('engineIconBig');var ti=document.getElementById('engineTitleBig');var de=document.getElementById('engineDescBig');var bt=document.getElementById('engineToggleBtn');if(!ic||!bt)return;if(active){ic.textContent='🟢';ti.textContent='Motor Ativo';de.textContent='O servidor está a analisar continuamente os ativos vigiados.';bt.textContent='⏹ Desativar Motor';bt.className='engine-toggle-btn stop';}else{ic.textContent='🔴';ti.textContent='Motor Desativado';de.textContent='Ativa o motor para o servidor analisar continuamente os ativos vigiados.';bt.textContent='▶ Ativar Motor';bt.className='engine-toggle-btn start';}}
 async function loadEngineConfig(){if(_cache.engineConfig&&(Date.now()-_cache.engineConfigTs)<CACHE_TTL){var c=_cache.engineConfig;if(c.plano)currentPlan=c.plano;if(c.maxAtivosPorModo!=null)currentMaxAtivos=c.maxAtivosPorModo;if(c.watchlist){['SNIPER','CAÇADOR','PESCADOR','BALEEIRO'].forEach(function(m){scanWatchlistCounts[m]=(c.watchlist[m]||[]).length;});}updateManualPlanInfo();renderEngineUI(c.active);renderWatchlistGrid(c.watchlist||{});apiMain('/api/engine-config').then(function(d){_cache.engineConfig=d;_cache.engineConfigTs=Date.now();if(d.plano)currentPlan=d.plano;if(d.maxAtivosPorModo!=null)currentMaxAtivos=d.maxAtivosPorModo;if(d.watchlist){['SNIPER','CAÇADOR','PESCADOR','BALEEIRO'].forEach(function(m){scanWatchlistCounts[m]=(d.watchlist[m]||[]).length;});}updateManualPlanInfo();renderEngineUI(d.active);renderWatchlistGrid(d.watchlist||{});}).catch(function(){});return;}try{var d=await apiMain('/api/engine-config');_cache.engineConfig=d;_cache.engineConfigTs=Date.now();if(d.plano)currentPlan=d.plano;if(d.maxAtivosPorModo!=null)currentMaxAtivos=d.maxAtivosPorModo;if(d.watchlist){['SNIPER','CAÇADOR','PESCADOR','BALEEIRO'].forEach(function(m){scanWatchlistCounts[m]=(d.watchlist[m]||[]).length;});}updateManualPlanInfo();renderEngineUI(d.active);renderWatchlistGrid(d.watchlist||{});await refreshStats();}catch(e){}}
 function renderWatchlistGrid(wl){var c=document.getElementById('watchlistGrid');if(!c)return;var modos=['SNIPER','CAÇADOR','PESCADOR','BALEEIRO'];var html='';var max=currentMaxAtivos>0?currentMaxAtivos:10;if(currentPlan){html+='<div style="grid-column:1/-1;padding:12px 16px;background:#161a23;border:1px solid var(--accent-border);border-radius:var(--r);margin-bottom:4px;font-size:12.5px;color:var(--t-2)">📋 Plano: <strong style="color:var(--accent-light)">'+escapeHtml(currentPlan.nome)+'</strong> · Limite: <strong style="color:var(--accent-light)">'+max+' ativos por modo</strong>'+(currentPlan.prioridade?' · <span style="color:var(--green)">⭐ Prioridade</span>':'')+'</div>';}modos.forEach(function(m){var ativos=wl[m]||[];var nomes=ativos.map(function(a){return fullAssets[a]||a;});var cor=ativos.length>=max?' style="color:var(--accent-light)"':'';html+='<div class="watchlist-card"><h4>'+m+' <span class="watchlist-count"'+cor+'>'+ativos.length+'/'+max+'</span></h4><div class="watchlist-assets '+(ativos.length?'':'empty')+'">'+(ativos.length?nomes.map(escapeHtml).join(', '):'Nenhum ativo — adiciona em Scan Manual')+'</div><button class="watchlist-clear" onclick="clearModeWatchlist(\''+m+'\')" '+(ativos.length?'':'disabled')+'>Limpar '+m+'</button></div>';});c.innerHTML=html;}
-window.toggleEngine=async function(){var btn=document.getElementById('engineToggleBtn');if(!btn)return;var ot=btn.textContent;btn.disabled=true;btn.textContent='⏳ Aguarde...';try{var cfg=await apiMain('/api/engine-config');var ep=cfg.active?'/api/engine-stop':'/api/engine-start';var d=await apiMain(ep,{method:'POST'});renderEngineUI(d.active);showToast('Motor '+(d.active?'ativado':'desativado')+' com sucesso!','success');_cache.engineConfigTs=0;refreshStats();}catch(err){showToast(err.message,'error');btn.textContent=ot;}finally{btn.disabled=false;}};
+// ⭐ CORRIGIDO — bloqueia ativação do motor quando a watchlist está vazia
+window.toggleEngine=async function(){
+  var btn=document.getElementById('engineToggleBtn');
+  if(!btn)return;
+  var ot=btn.textContent;
+  btn.disabled=true;
+  btn.textContent='⏳ Aguarde...';
+  try{
+    var cfg=await apiMain('/api/engine-config');
+    // Bloqueia ativação sem ativos vigiados
+    if(!cfg.active){
+      var totalAtivos=0;
+      if(cfg.watchlist){
+        ['SNIPER','CAÇADOR','PESCADOR','BALEEIRO'].forEach(function(m){
+          totalAtivos+=(cfg.watchlist[m]||[]).length;
+        });
+      }
+      if(totalAtivos===0){
+        showToast('⚠️ Adiciona pelo menos 1 ativo à watchlist antes de ativar o motor.','warning');
+        btn.textContent=ot;
+        btn.disabled=false;
+        return;
+      }
+    }
+    var ep=cfg.active?'/api/engine-stop':'/api/engine-start';
+    var d=await apiMain(ep,{method:'POST'});
+    renderEngineUI(d.active);
+    showToast('Motor '+(d.active?'ativado':'desativado')+' com sucesso!','success');
+    _cache.engineConfigTs=0;
+    refreshStats();
+  }catch(err){
+    showToast(err.message,'error');
+    btn.textContent=ot;
+  }finally{
+    btn.disabled=false;
+  }
+};
 window.clearModeWatchlist=async function(mode){if(!confirm('Remover todos os ativos vigiados em '+mode+'?'))return;try{var wl=await apiMain('/api/engine-watchlist');var cur=wl.watchlist||{};cur[mode]=[];await apiMain('/api/engine-watchlist',{method:'POST',body:JSON.stringify({watchlist:cur})});showToast('Watchlist de '+mode+' limpa.','success');_cache.engineConfigTs=0;_cache.watchlistTs=0;loadEngineConfig();}catch(err){showToast(err.message,'error');}};
 var signalsModeFilter=null;
 function initSignalsFilter(){if(signalsModeFilter)return;signalsModeFilter=new CustomSelect({wrapperId:'signals-mode-filter-wrapper',placeholder:'Todos os modos',onChange:function(){loadSignals();}});signalsModeFilter.setOptions([{value:'',label:'Todos os modos'},{value:'SNIPER',label:'🎯 SNIPER'},{value:'CAÇADOR',label:'🏹 CAÇADOR'},{value:'PESCADOR',label:'🎣 PESCADOR'},{value:'BALEEIRO',label:'🐋 BALEEIRO'}],'');}
