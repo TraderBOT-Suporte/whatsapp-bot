@@ -29,8 +29,9 @@ self.addEventListener('push', (event) => {
   }
 
   const options = {
-    body: String(data.body || ''),
     icon: '/icon-192.png',
+    badge: '/badge-72.png',
+    tag: String(data.tag || 'sinal'),
     // badge removido: Android usa o ícone da app do manifest.json
     tag: String(data.tag || 'sinal'),
     data: {
