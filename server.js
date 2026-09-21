@@ -157,6 +157,21 @@ async function sendPushToWatchers(watchers, payload) {
   }
 }
 
+// ========== PLANOS (limite de ativos por modo) ==========
+const PLANOS = {
+  7:    { nome: '7 Dias',  maxAtivosPorModo: 3,  prioridade: false },
+  30:   { nome: '1 Mês',   maxAtivosPorModo: 5,  prioridade: false },
+  90:   { nome: '3 Meses', maxAtivosPorModo: 7,  prioridade: false },
+  180:  { nome: '6 Meses', maxAtivosPorModo: 10, prioridade: false },
+  365:  { nome: '1 Ano',   maxAtivosPorModo: 10, prioridade: true  },
+  9999: { nome: 'Admin',   maxAtivosPorModo: 10, prioridade: true  }
+};
+const PLANO_DEFAULT = { nome: 'Sem plano', maxAtivosPorModo: 0, prioridade: false };
+
+function getPlano(periodDays) {
+  return PLANOS[periodDays] || PLANO_DEFAULT;
+}
+
 // ========== MIDDLEWARE DE AUTENTICAÇÃO (token-based + admin) ==========
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 const tokenValidationCache = new Map();
@@ -168,6 +183,30 @@ setInterval(() => {
     if (e.expiresAt <= now) tokenValidationCache.delete(tok);
   }
 }, 60 * 1000);
+
+// ========== PROXY DE VALIDAÇÃO DE TOKEN ==========
+// O frontend chama POST /api/validate-token (same-origin, sem CORS)
+// Este endpoint encaminha para o servidor de análise real.
+app.post('/api/validate-token', async (req, res) => {
+  const { token } = req.body || {};
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ valid: false, message: 'Token não fornecido' });
+  }
+  const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
+  try {
+    const r = await fetch(`${API_URL}/validate-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token })
+    });
+    const data = await r.json().catch(() => ({}));
+    logger.info(`[VALIDATE-PROXY] token=${token.slice(0, 8)}... status=${r.status} periodDays=${data.periodDays ?? 'null'}`);
+    return res.status(r.status).json(data);
+  } catch (err) {
+    logger.error('[VALIDATE-PROXY] Erro ao contactar servidor de análise:', err.message);
+    return res.status(503).json({ valid: false, message: 'Serviço de validação indisponível' });
+  }
+});
 
 async function authMiddleware(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -181,7 +220,13 @@ async function authMiddleware(req, res, next) {
 
   if (ADMIN_SECRET && token === ADMIN_SECRET) {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
-    req.user = { token, tokenHash, email: 'admin@local', name: 'Admin', isAdmin: true };
+    req.user = {
+      token, tokenHash,
+      email: 'admin@local', name: 'Admin',
+      periodDays: 9999,
+      plano: PLANOS[9999],
+      isAdmin: true
+    };
     return next();
   }
 
@@ -201,6 +246,7 @@ async function authMiddleware(req, res, next) {
     });
     const data = await response.json().catch(() => ({}));
     const valid = data && data.valid === true;
+    logger.info(`[AUTH] ${API_URL}/validate-token → status=${response.status} valid=${valid} periodDays=${data.periodDays ?? 'AUSENTE'}`);
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
     const user = valid ? {
@@ -208,6 +254,8 @@ async function authMiddleware(req, res, next) {
       tokenHash,
       email: data.email || data.user?.email || null,
       name: data.name || data.user?.name || null,
+      periodDays: data.periodDays || 0,
+      plano: getPlano(data.periodDays || 0),
       isAdmin: false
     } : null;
 
@@ -408,7 +456,7 @@ async function buscarSinalAnalise(symbol, mode) {
     return null;
   }
   try {
-    const response = await fetch(`${API_URL}/api/analyze`, {
+    const response = await fetch(`${API_URL}/analyze`, {
       method: 'POST',
       headers: { 'x-admin-key': adminKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ symbol, mode })
@@ -672,7 +720,10 @@ app.get('/api/user-me', authMiddleware, (req, res) => {
   res.json({
     tokenHash: req.user.tokenHash,
     email: req.user.email,
-    name: req.user.name
+    name: req.user.name,
+    periodDays: req.user.periodDays,
+    plano: req.user.plano,
+    maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10
   });
 });
 
@@ -685,6 +736,8 @@ app.get('/api/engine-config', authMiddleware, async (req, res) => {
     const wl = await getUserWatchlist(req.user.tokenHash);
     res.json({
       active: wl.engineActive,
+      plano: req.user.plano,
+      maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10,
       watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO }
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -719,16 +772,45 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
   const { watchlist } = req.body || {};
   if (!watchlist || typeof watchlist !== 'object') return res.status(400).json({ error: 'watchlist deve ser um objeto' });
   try {
+    const maxAtivos = req.user.plano?.maxAtivosPorModo ?? 10;
+
+    // Sem plano ativo → bloqueia
+    if (maxAtivos <= 0) {
+      return res.status(403).json({
+        error: 'A tua conta não tem um plano ativo. Contacta o suporte para ativares o acesso.'
+      });
+    }
+
     const current = await getUserWatchlist(req.user.tokenHash);
+
+    // Detetar se houve corte em cada modo
+    const cortado = {
+      SNIPER:    Array.isArray(watchlist.SNIPER)    && [...new Set(watchlist.SNIPER)].length    > maxAtivos,
+      'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) && [...new Set(watchlist['CAÇADOR'])].length > maxAtivos,
+      PESCADOR:  Array.isArray(watchlist.PESCADOR)  && [...new Set(watchlist.PESCADOR)].length  > maxAtivos,
+      BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  && [...new Set(watchlist.BALEEIRO)].length  > maxAtivos
+    };
+
     const final = {
-      SNIPER:    Array.isArray(watchlist.SNIPER)    ? [...new Set(watchlist.SNIPER)].slice(0,10)    : current.SNIPER,
-      'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) ? [...new Set(watchlist['CAÇADOR'])].slice(0,10) : current['CAÇADOR'],
-      PESCADOR:  Array.isArray(watchlist.PESCADOR)  ? [...new Set(watchlist.PESCADOR)].slice(0,10)  : current.PESCADOR,
-      BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  ? [...new Set(watchlist.BALEEIRO)].slice(0,10)  : current.BALEEIRO,
+      SNIPER:    Array.isArray(watchlist.SNIPER)    ? [...new Set(watchlist.SNIPER)].slice(0, maxAtivos)    : current.SNIPER,
+      'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) ? [...new Set(watchlist['CAÇADOR'])].slice(0, maxAtivos) : current['CAÇADOR'],
+      PESCADOR:  Array.isArray(watchlist.PESCADOR)  ? [...new Set(watchlist.PESCADOR)].slice(0, maxAtivos)  : current.PESCADOR,
+      BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  ? [...new Set(watchlist.BALEEIRO)].slice(0, maxAtivos)  : current.BALEEIRO,
       email: req.user.email || null
     };
     await saveUserWatchlist(req.user.tokenHash, final);
-    res.json({ success: true, watchlist: final });
+
+    const houveCorte = Object.values(cortado).some(Boolean);
+    res.json({
+      success: true,
+      watchlist: final,
+      plano: req.user.plano,
+      maxAtivosPorModo: maxAtivos,
+      cortado: houveCorte ? cortado : null,
+      mensagem: houveCorte
+        ? `Plano ${req.user.plano?.nome || 'atual'} permite ${maxAtivos} por modo. Excesso removido.`
+        : null
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
