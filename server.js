@@ -57,7 +57,7 @@ app.get('/manifest.json', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'manifest.json'));
 });
 
-// ⭐ NOVO — Política de Privacidade (obrigatório para Play Store)
+// ⭐ Política de Privacidade (obrigatório para Play Store)
 app.get('/privacy', (req, res) => {
   res.set('Cache-Control', 'public, max-age=3600');
   res.sendFile(path.join(__dirname, 'public', 'privacy.html'));
@@ -307,6 +307,15 @@ async function getAllUserWatchlists() {
       BALEEIRO: data.BALEEIRO || []
     };
   });
+}
+
+// ⭐ NOVO — Conta total de ativos vigiados (todos os modos)
+function contarAtivosWatchlist(wl) {
+  if (!wl) return 0;
+  return (wl.SNIPER || []).length
+       + (wl['CAÇADOR'] || []).length
+       + (wl.PESCADOR || []).length
+       + (wl.BALEEIRO || []).length;
 }
 
 // ========== ESTADO DE TRADES / PRONTIDÃO ==========
@@ -890,12 +899,30 @@ app.get('/api/engine-config', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ⭐ BLINDADO — Bloqueia ativação do motor sem ativos na watchlist
 app.post('/api/engine-start', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   try {
+    const wl = await getUserWatchlist(req.user.tokenHash);
+    const totalAtivos = contarAtivosWatchlist(wl);
+
+    if (totalAtivos === 0) {
+      logger.warn(`⚠️ [ENGINE-START] user=${req.user.tokenHash} tentou ativar motor SEM ativos vigiados`);
+      return res.status(400).json({
+        success: false,
+        error: 'Adiciona pelo menos 1 ativo à watchlist antes de ativar o motor.',
+        code: 'WATCHLIST_EMPTY',
+        totalAtivos: 0
+      });
+    }
+
     await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null });
-    res.json({ success: true, active: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    logger.info(`✅ [ENGINE-START] user=${req.user.tokenHash} ativou motor com ${totalAtivos} ativo(s)`);
+    res.json({ success: true, active: true, totalAtivos });
+  } catch (err) {
+    logger.error('Erro em /api/engine-start:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/engine-stop', authMiddleware, async (req, res) => {
