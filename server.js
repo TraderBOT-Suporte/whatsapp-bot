@@ -1,8 +1,7 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
-// Toda a parte de WhatsApp (Baileys, QR, pairing, grupos, membros) foi removida.
-// v2.4 — persistência anti-restart + config por modo para PRONTIDAO/ARREFECIMENTO
-//        (evita spam no SNIPER com cadência de 1min).
+// v2.5 — timeout inteligente (estende se o trade está a avançar) +
+//        mensagens detalhadas com estrutura `detalhes` (para o modal no app).
 
 import express from 'express';
 import cors from 'cors';
@@ -113,15 +112,10 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
     logger.error(`   VAPID_SUBJECT: "${VAPID_SUBJECT}"`);
     logger.error(`   VAPID_PUBLIC_KEY:  ${VAPID_PUBLIC_KEY.length} caracteres (esperado ~87)`);
     logger.error(`   VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY.length} caracteres (esperado ~43)`);
-    logger.error('   Verifica:');
-    logger.error('     • VAPID_SUBJECT tem de começar por "mailto:" ou "https://"');
-    logger.error('     • VAPID_PUBLIC_KEY começa por "B" e tem ~87 chars');
-    logger.error('     • VAPID_PRIVATE_KEY tem ~43 chars');
-    logger.error('     • Sem espaços, sem aspas, sem quebras de linha');
     logger.error('   Push desativado — servidor continua a arrancar normalmente.');
   }
 } else {
-  logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado. Gere com: npx web-push generate-vapid-keys');
+  logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado.');
 }
 
 async function sendPushToWatchers(watchers, payload) {
@@ -154,7 +148,7 @@ async function sendPushToWatchers(watchers, payload) {
   }
 }
 
-// ========== PLANOS (limite de ativos por modo) ==========
+// ========== PLANOS ==========
 const PLANOS = {
   7:    { nome: '7 Dias',  maxAtivosPorModo: 3,  prioridade: false },
   30:   { nome: '1 Mês',   maxAtivosPorModo: 5,  prioridade: false },
@@ -169,7 +163,7 @@ function getPlano(periodDays) {
   return PLANOS[periodDays] || PLANO_DEFAULT;
 }
 
-// ========== MIDDLEWARE DE AUTENTICAÇÃO (token-based + admin) ==========
+// ========== MIDDLEWARE DE AUTENTICAÇÃO ==========
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 const tokenValidationCache = new Map();
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
@@ -181,7 +175,6 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// ========== PROXY DE VALIDAÇÃO DE TOKEN ==========
 app.post('/api/validate-token', async (req, res) => {
   const { token } = req.body || {};
   if (!token || typeof token !== 'string') {
@@ -270,10 +263,7 @@ let cronEmExecucao = false;
 const MODOS_OK = ['SNIPER', 'CAÇADOR', 'PESCADOR', 'BALEEIRO'];
 const CADENCIAS = { SNIPER: 1, 'CAÇADOR': 3, PESCADOR: 10, BALEEIRO: 30 };
 
-// ⭐ NOVO — Config por modo para PRONTIDAO/ARREFECIMENTO
-// Resolve o problema de spam no SNIPER (1 min por ciclo).
-// - cooldownMs: tempo mínimo entre PRONTIDAOs do mesmo par symbol+mode
-// - ciclosForaParaArrefecer: quantos ciclos fora da Zona B antes de enviar ARREFECIMENTO
+// ⭐ Config por modo para PRONTIDAO/ARREFECIMENTO
 const PRONTIDAO_CONFIG = {
   SNIPER:    { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 10 },
   'CAÇADOR': { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 5  },
@@ -283,6 +273,12 @@ const PRONTIDAO_CONFIG = {
 function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
 }
+
+// ⭐ Config do timeout inteligente
+const TRADE_TIMEOUT_MS = 20 * 60 * 1000;              // 1ª janela: 20 min
+const TRADE_TIMEOUT_EXTEND_MS = 15 * 60 * 1000;       // cada extensão: +15 min
+const PROGRESSO_MINIMO_EXTENSAO = 0.05;               // 5% de avanço mínimo para estender
+const EXTENSOES_MAX = 3;                              // máximo 3 extensões (~65 min no total)
 
 // ========== WATCHLIST POR USER (Firestore) ==========
 async function getUserWatchlist(tokenHash) {
@@ -324,7 +320,6 @@ async function getAllUserWatchlists() {
   });
 }
 
-// ⭐ NOVO — Conta total de ativos vigiados (todos os modos)
 function contarAtivosWatchlist(wl) {
   if (!wl) return 0;
   return (wl.SNIPER || []).length
@@ -340,11 +335,9 @@ const prontidaoHistorico = new Map();
 const prontidaoAtiva = new Set();
 const prontidaoForaContagem = new Map();
 const COOLDOWN_POS_TRADE_MS = 10 * 60 * 1000;
-const TRADE_TIMEOUT_MS = 20 * 60 * 1000;
 
-// ⭐ NOVO — Controla quando foi enviada a última PRONTIDAO e ARREFECIMENTO por tradeKey
-const prontidaoUltimoEnvio = new Map();   // tradeKey → timestamp da última PRONTIDAO
-const arrefecimentoUltimoEnvio = new Map(); // tradeKey → timestamp do último ARREFECIMENTO
+const prontidaoUltimoEnvio = new Map();
+const arrefecimentoUltimoEnvio = new Map();
 
 setInterval(() => {
   const agora = Date.now();
@@ -383,6 +376,10 @@ async function persistTradeUpdate(tradeKey, trade) {
       avisoAceleracaoEnviado: trade.avisoAceleracaoEnviado,
       avisoTempoEsgotadoEnviado: trade.avisoTempoEsgotadoEnviado,
       aviso5MinEnviado: trade.aviso5MinEnviado,
+      // ⭐ Timeout inteligente
+      timeoutAt: trade.timeoutAt,
+      extensoes: trade.extensoes,
+      percentualNoUltimoCheck: trade.percentualNoUltimoCheck,
       atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
   } catch (err) { logger.error('Erro persistTradeUpdate:', err.message); }
@@ -439,9 +436,17 @@ async function loadStateFromFirestore() {
     for (const doc of tradesSnap.docs) {
       const t = doc.data();
       const timestampTrade = t.timestamp || 0;
-      if (agora - timestampTrade > TRADE_TIMEOUT_MS) {
-        await doc.ref.delete(); tradesExpirados++; continue;
+      const timeoutAt = t.timeoutAt || (timestampTrade + TRADE_TIMEOUT_MS);
+
+      if (agora > timeoutAt && !t.timeoutAt) {
+        // trade legado (sem timeoutAt) que já passou o timeout inicial
+        // Vamos dar uma chance — restaura com timeout curto para o próximo ciclo decidir
+        t.timeoutAt = agora + 60 * 1000; // 1 min para reavaliar
+      } else if (agora > timeoutAt) {
+        // já passou timeoutAt, mas tem extensões — restaura para o próximo ciclo decidir
+        t.timeoutAt = agora + 60 * 1000;
       }
+      if (!t.timeoutAt) t.timeoutAt = timestampTrade + TRADE_TIMEOUT_MS;
       tradesAbertos.set(doc.id, t);
       tradesRestaurados++;
     }
@@ -509,64 +514,195 @@ function diagnosticoProximidade(reasons) {
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
-// ========== FORMATAÇÃO DE MENSAGENS ==========
+// ========== FORMATAÇÃO DE MENSAGENS (com `detalhes` estruturados) ==========
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
-  const acao = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
+  const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
+  const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
   const score = dados.consolidated.score;
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
   let proximidade, detalhe;
-  if (/ADX muito fraco/i.test(reasons)) { proximidade = 'LONGE'; detalhe = 'tendência macro sem força — pode demorar horas'; }
-  else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(reasons)) { proximidade = 'PERTO'; detalhe = 'gatilho em ajuste — pode disparar a minutos'; }
-  else { proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento dos timeframes'; }
+  if (/ADX muito fraco/i.test(reasons)) { proximidade = 'LONGE'; detalhe = 'tendência macro sem força'; }
+  else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(reasons)) { proximidade = 'PERTO'; detalhe = 'gatilho em ajuste'; }
+  else { proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento'; }
 
   return {
     titulo: `👀 Atenção: ${cleanSymbolName(symbol)}`,
-    corpo: `${acao} · Score ${score}/100 (Zona B) · ${proximidade} — ${detalhe}`
+    corpo: `${dirLabel} · ${nomeAmigavel}\n⚡ Score ${score}/100 · Zona B · ${proximidade}\n💡 ${detalhe}`,
+    detalhes: {
+      tipo: 'PRONTIDAO', nomeAmigavel, direcao, modo: extras.mode || null,
+      score, zona: 'B', proximidade, detalhe,
+      reasons: (dados.consolidated.score_reasons || []).slice(0, 8),
+      price: dados.consolidated.price
+    }
   };
 }
-function formatarMensagemArrefecimento(symbol, score) {
-  return { titulo: `😴 Prontidão encerrada: ${cleanSymbolName(symbol)}`, corpo: `Score atual ${score}/100. Setup arrefeceu, saiu da Zona B.` };
-}
-function formatarMensagemSinal(dados) {
-  const { symbol, consolidated, suggestion } = dados;
-  const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
-  let corpo = `${emoji} ${consolidated.signal} · Confiança ${(consolidated.confidence * 100).toFixed(1)}% · Score ${consolidated.score}/100`;
-  if (suggestion && suggestion.action === 'ENTRADA') {
-    corpo += ` · Entrada ${suggestion.entry} · TP ${suggestion.takeProfit} · SL ${suggestion.stopLoss}`;
-  }
-  return { titulo: `🚨 SINAL CONFIRMADO: ${cleanSymbolName(symbol)}`, corpo };
-}
-function formatarMensagem5Min(trade) {
-  return { titulo: `⏱️ Atualização (5min): ${cleanSymbolName(trade.symbol)}`, corpo: `${trade.signal} · Preço atual ${trade.currentPrice} · Entrada ${trade.entry}. Mantenha a posição.` };
-}
-function formatarMensagemAceleracao(trade) {
-  return { titulo: `🚀 Mercado acelerando: ${cleanSymbolName(trade.symbol)}`, corpo: `${trade.signal} · Preço atual ${trade.currentPrice}. Deixe o lucro correr até o TP.` };
-}
-function formatarMensagemSeguindo(trade) {
-  return { titulo: `✅ Seguindo o sinal: ${cleanSymbolName(trade.symbol)}`, corpo: `${trade.signal} · Preço atual ${trade.currentPrice}. Tendência confirmada.` };
-}
-function formatarMensagemZeroRisco(trade) {
-  return { titulo: `🛡️ Zero Risco: ${cleanSymbolName(trade.symbol)}`, corpo: `Mova o Stop Loss para a entrada (${trade.entry}).` };
-}
-function formatarMensagemQuaseLa(trade) {
-  return { titulo: `⏳ Quase no alvo: ${cleanSymbolName(trade.symbol)}`, corpo: `Preço atual ${trade.currentPrice} · Alvo ${trade.takeProfit}. Fique atento.` };
-}
-function formatarMensagemWin(trade) {
-  return { titulo: `🎯 WIN: ${cleanSymbolName(trade.symbol)}`, corpo: `Alvo ${trade.takeProfit} atingido! Feche a posição.` };
-}
-function formatarMensagemStop(trade) {
-  return { titulo: `🛑 Stop Loss: ${cleanSymbolName(trade.symbol)}`, corpo: `O mercado reverteu contra a entrada.` };
-}
-function formatarMensagemTempoEsgotado(trade) {
-  return { titulo: `⏱️ Tempo esgotado: ${cleanSymbolName(trade.symbol)}`, corpo: `Preço perto da entrada (${trade.currentPrice}). Considere fechar no breakeven.` };
+
+function formatarMensagemArrefecimento(symbol, score, dados) {
+  const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
+  return {
+    titulo: `😴 Prontidão encerrada: ${cleanSymbolName(symbol)}`,
+    corpo: `${nomeAmigavel}\n📉 Score atual ${score}/100 · saiu da Zona B\n✅ A espera anterior foi cancelada`,
+    detalhes: {
+      tipo: 'ARREFECIMENTO', nomeAmigavel, score,
+      motivo: 'Setup perdeu força e saiu da Zona B',
+      reasons: (dados?.consolidated?.score_reasons || []).slice(0, 5)
+    }
+  };
 }
 
-async function registrarEEnviarSinal(symbol, mode, tipo, { titulo, corpo }, extra = {}, watchers = []) {
+function formatarMensagemSinal(dados, mode) {
+  const { symbol, consolidated, suggestion } = dados;
+  const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
+  const dirLabel = consolidated.signal === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
+  const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
+  const conf = (consolidated.confidence * 100).toFixed(1);
+
+  return {
+    titulo: `🚨 SINAL CONFIRMADO: ${cleanSymbolName(symbol)}`,
+    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}%`,
+    detalhes: {
+      tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
+      entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
+      score: consolidated.score, confidence: conf, price: consolidated.price,
+      reasons: (consolidated.score_reasons || []).slice(0, 8),
+      zona: 'A'
+    }
+  };
+}
+
+function formatarMensagem5Min(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  return {
+    titulo: `⏱️ Atualização (5min): ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n💵 Preço atual ${trade.currentPrice} (entrada ${trade.entry})\n📈 Mantém a posição — trade em curso`,
+    detalhes: {
+      tipo: '5MIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, currentPrice: trade.currentPrice,
+      takeProfit: trade.takeProfit, stopLoss: trade.stopLoss
+    }
+  };
+}
+
+function formatarMensagemAceleracao(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  return {
+    titulo: `🚀 Mercado acelerando: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} — movimento forte\n🎯 Deixe correr até o TP ${trade.takeProfit}`,
+    detalhes: {
+      tipo: 'ACELERACAO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
+    }
+  };
+}
+
+function formatarMensagemSeguindo(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  return {
+    titulo: `✅ Seguindo o sinal: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · tendência confirmada\n📊 +30% do alvo percorrido`,
+    detalhes: {
+      tipo: 'SEGUINDO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
+    }
+  };
+}
+
+function formatarMensagemZeroRisco(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  return {
+    titulo: `🛡️ Zero Risco: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n✅ +50% do alvo — move SL para a entrada\n🎯 Entrada ${trade.entry} (proteção ativa)`,
+    detalhes: {
+      tipo: 'ZERO_RISCO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
+    }
+  };
+}
+
+function formatarMensagemQuaseLa(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  return {
+    titulo: `⏳ Quase no alvo: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · 🎯 Alvo ${trade.takeProfit}\n📊 +80% percorrido — atenção máxima`,
+    detalhes: {
+      tipo: 'QUASE_LA', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
+    }
+  };
+}
+
+function formatarMensagemWin(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `🎯 WIN: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal} ✅\n💰 Alvo ${trade.takeProfit} atingido!\n⏱️ Duração: ${duracao}min · fecha a posição`,
+    detalhes: {
+      tipo: 'WIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, takeProfit: trade.takeProfit, currentPrice: trade.currentPrice,
+      duracao: duracao + 'min'
+    }
+  };
+}
+
+function formatarMensagemStop(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `🛑 Stop Loss: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n📉 Preço ${trade.currentPrice} bateu SL ${trade.stopLoss}\n⏱️ Duração: ${duracao}min · fecha a posição`,
+    detalhes: {
+      tipo: 'STOP', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, stopLoss: trade.stopLoss, currentPrice: trade.currentPrice,
+      duracao: duracao + 'min'
+    }
+  };
+}
+
+function formatarMensagemTempoEsgotado(trade) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `⏱️ Tempo esgotado: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n💵 Preço perto da entrada (${trade.currentPrice})\n✅ Considera fechar no breakeven`,
+    detalhes: {
+      tipo: 'TEMPO_ESGOTADO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, currentPrice: trade.currentPrice,
+      takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: duracao + 'min'
+    }
+  };
+}
+
+// ⭐ NOVA — Timeout inteligente (trade não avançou o suficiente)
+function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo) {
+  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
+  const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
+  const pct = distanciaTotal > 0 ? ((distanciaPercorrida / distanciaTotal) * 100).toFixed(1) : '0.0';
+
+  return {
+    titulo: `🕐 Encerrado por timeout: ${cleanSymbolName(trade.symbol)}`,
+    corpo: `${nome} · ${trade.signal}\n⏱️ ${tempoDecorridoMin}min sem avanço suficiente (${pct}% do alvo)\n❌ Motivo: ${motivo} · fecha a posição`,
+    detalhes: {
+      tipo: 'TIMEOUT', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
+      entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss,
+      duracao: tempoDecorridoMin + 'min',
+      motivo,
+      percentualPercorrido: pct + '%',
+      extensoes: trade.extensoes || 0
+    }
+  };
+}
+
+async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watchers = []) {
+  const { titulo, corpo, detalhes } = msg;
   logger.info(`[SINAL] ${symbol} (${mode}) [${tipo}] ${titulo} — ${corpo} · ${watchers.length} watcher(s)`);
   if (firebaseInitialized) {
     try {
       await db.collection('signals').add({
-        symbol, mode, tipo, titulo, corpo, ...extra,
+        symbol, mode, tipo, titulo, corpo,
+        detalhes: detalhes || null,
+        ...extra,
         watchers,
         origem: 'motor',
         criadoEm: admin.firestore.FieldValue.serverTimestamp()
@@ -624,22 +760,52 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
   if (trade) {
     trade.currentPrice = currentPrice;
-    if (agora - trade.timestamp > TRADE_TIMEOUT_MS) {
-      tradesAbertos.delete(tradeKey);
-      removePersistedTrade(tradeKey);
-      cooldownPosTrade.set(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
-      persistCooldown(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
-      return;
-    }
-
-    let msgObj = null;
-    let tipo = null;
-    let fecharTrade = false;
 
     const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
     const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
     const percentualPercorrido = distanciaTotal > 0 ? (distanciaPercorrida / distanciaTotal) : 0;
     const tempoDecorridoMin = Math.floor((agora - trade.timestamp) / 60000);
+
+    // ⭐ TIMEOUT INTELIGENTE — Verifica se já passou o timeout
+    const timeoutAtual = trade.timeoutAt || (trade.timestamp + TRADE_TIMEOUT_MS);
+    if (agora > timeoutAtual) {
+      const extensoes = trade.extensoes || 0;
+      const progressoAnterior = trade.percentualNoUltimoCheck || 0;
+      const progressoNovo = percentualPercorrido - progressoAnterior;
+      const estaAvancando = progressoNovo >= PROGRESSO_MINIMO_EXTENSAO;
+
+      if (estaAvancando && extensoes < EXTENSOES_MAX) {
+        // ✅ Trade está a caminhar → estender
+        trade.timeoutAt = agora + TRADE_TIMEOUT_EXTEND_MS;
+        trade.extensoes = extensoes + 1;
+        trade.percentualNoUltimoCheck = percentualPercorrido;
+        logger.info(`⏭️ Trade ${tradeKey} estendido (${trade.extensoes}/${EXTENSOES_MAX}) — progresso ${(percentualPercorrido*100).toFixed(1)}% (+${(progressoNovo*100).toFixed(1)}%)`);
+        persistTradeUpdate(tradeKey, trade);
+        // NÃO retorna — continua para avaliar WIN/STOP/marcos neste mesmo ciclo
+      } else {
+        // ❌ Não avançou ou atingiu máximo de extensões → fechar com notificação
+        const motivo = extensoes >= EXTENSOES_MAX
+          ? `limite de ${EXTENSOES_MAX} extensões atingido`
+          : `sem avanço suficiente nas últimas ${Math.floor(TRADE_TIMEOUT_EXTEND_MS/60000)}min`;
+
+        await registrarEEnviarSinal(
+          symbol, mode, 'TIMEOUT',
+          formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo),
+          { score: dados.consolidated.score },
+          watchers
+        );
+
+        tradesAbertos.delete(tradeKey);
+        removePersistedTrade(tradeKey);
+        cooldownPosTrade.set(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
+        persistCooldown(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
+        return;
+      }
+    }
+
+    let msgObj = null;
+    let tipo = null;
+    let fecharTrade = false;
 
     if (trade.signal === 'CALL' && currentPrice >= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
     else if (trade.signal === 'PUT' && currentPrice <= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
@@ -667,9 +833,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     return;
   }
 
-  // ⭐ Anti-duplicado: verifica se já existe SINAL_CONFIRMADO recente (últimos 5min)
-  // para o mesmo symbol+mode. Só se aplica quando NÃO existe trade aberto (que é
-  // o caso aqui, porque o bloco `if (trade)` acima já tratou desse cenário).
+  // ⭐ Anti-duplicado
   if (firebaseInitialized) {
     try {
       const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
@@ -685,7 +849,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         return;
       }
     } catch (err) {
-      // Se falhar por índice em falta, ignora e continua (não bloqueia o motor)
       logger.warn('Anti-duplicado indisponível (índice?):', err.message);
     }
   }
@@ -695,6 +858,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
       const novoTrade = {
         symbol,
+        mode,
         signal: dados.consolidated.signal,
         entry: dados.suggestion.entry,
         takeProfit: dados.suggestion.takeProfit,
@@ -706,12 +870,16 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         avisoQuaseLaEnviado: false,
         avisoAceleracaoEnviado: false,
         avisoTempoEsgotadoEnviado: false,
-        aviso5MinEnviado: false
+        aviso5MinEnviado: false,
+        // ⭐ Timeout inteligente
+        timeoutAt: agora + TRADE_TIMEOUT_MS,
+        extensoes: 0,
+        percentualNoUltimoCheck: 0
       };
       tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
 
-      await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', formatarMensagemSinal(dados), {
+      await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', formatarMensagemSinal(dados, mode), {
         score: dados.consolidated.score,
         confidence: dados.consolidated.confidence,
         entry: dados.suggestion.entry,
@@ -738,20 +906,18 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const ultimoEnvio = prontidaoUltimoEnvio.get(tradeKey) || 0;
     const podeEnviarAgora = (agora - ultimoEnvio) >= cfg.cooldownMs;
 
-    // Só envia PRONTIDAO se: (a) nunca foi enviado OU (b) já passou o cooldown do modo
     if (!prontidaoAtiva.has(tradeKey) || podeEnviarAgora) {
       const direcaoPrep = extrairDirecaoPrep(dados);
       if (direcaoPrep) {
         const subindo = historico.length >= 3 && historico[historico.length - 1].score > historico[0].score;
         await registrarEEnviarSinal(
           symbol, mode, 'PRONTIDAO',
-          formatarMensagemPrep(symbol, direcaoPrep, dados, { subindo, historico }),
+          formatarMensagemPrep(symbol, direcaoPrep, dados, { subindo, historico, mode }),
           { score: dados.consolidated.score },
           watchers
         );
         prontidaoAtiva.add(tradeKey);
         prontidaoUltimoEnvio.set(tradeKey, agora);
-        // Reset do contador de fora — sinaliza novo ciclo
         prontidaoForaContagem.set(tradeKey, 0);
         persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
       }
@@ -763,13 +929,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     prontidaoForaContagem.set(tradeKey, fora);
 
     if (fora >= cfg.ciclosForaParaArrefecer) {
-      // Cooldown mínimo de ARREFECIMENTO (evita ping-pong em modos rápidos)
       const ultimoArref = arrefecimentoUltimoEnvio.get(tradeKey) || 0;
-      const cooldownArrefMs = cfg.cooldownMs; // mesmo cooldown da prontidao
+      const cooldownArrefMs = cfg.cooldownMs;
       if ((agora - ultimoArref) >= cooldownArrefMs) {
         await registrarEEnviarSinal(
           symbol, mode, 'ARREFECIMENTO',
-          formatarMensagemArrefecimento(symbol, dados.consolidated.score),
+          formatarMensagemArrefecimento(symbol, dados.consolidated.score, dados),
           { score: dados.consolidated.score },
           watchers
         );
@@ -873,7 +1038,6 @@ app.get('/api/vapid-public-key', (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
-// ---------- PUSH ----------
 app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   const { subscription } = req.body;
@@ -910,7 +1074,6 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
   res.json({ success: true });
 });
 
-// ---------- USER INFO ----------
 app.get('/api/user-me', authMiddleware, (req, res) => {
   res.json({
     tokenHash: req.user.tokenHash,
@@ -922,7 +1085,6 @@ app.get('/api/user-me', authMiddleware, (req, res) => {
   });
 });
 
-// ---------- MOTOR DE SINAIS (por user) ----------
 app.get('/api/engine-config', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) {
     return res.json({ active: false, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
@@ -938,7 +1100,6 @@ app.get('/api/engine-config', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ⭐ BLINDADO — Bloqueia ativação do motor sem ativos na watchlist
 app.post('/api/engine-start', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   try {
@@ -1033,7 +1194,6 @@ app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ---------- SCAN MANUAL ----------
 app.post('/api/scan-group', authMiddleware, async (req, res) => {
   const { group, mode } = req.body;
   if (!group || !mode) return res.status(400).json({ error: 'Os campos "group" e "mode" são obrigatórios.' });
@@ -1072,7 +1232,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- SINAIS DO MOTOR (por user) ----------
 app.get('/api/signals', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.json({ signals: [] });
   try {
@@ -1101,7 +1260,6 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- HISTÓRICO DE ANÁLISES DO USER ----------
 app.post('/api/analysis-history', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   const { symbol, mode, result } = req.body || {};
@@ -1160,7 +1318,6 @@ app.get('/api/analysis-history', authMiddleware, async (req, res) => {
   }
 });
 
-// ---------- STATS (por user) ----------
 app.get('/api/stats', authMiddleware, async (req, res) => {
   const wl = firebaseInitialized ? await getUserWatchlist(req.user.tokenHash).catch(() => null) : null;
   const stats = {
@@ -1193,7 +1350,6 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`🚀 Servidor rodando na porta ${PORT}`);
   logger.info(`Firebase: ${firebaseInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
-  // ⭐ Restaura estado persistido (trades abertos, cooldowns, prontidão)
   await loadStateFromFirestore();
 });
 
