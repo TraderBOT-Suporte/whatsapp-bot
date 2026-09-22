@@ -1,8 +1,8 @@
 // Service Worker — corre em background, mesmo com a app/aba fechada.
-// v2.2 — compatível com iOS 16.4+ (data achatada + navigate no click).
-//        Badge removido (usa o ícone da app via manifest.json).
+// v2.5 — compatível com iOS 16.4+ (data achatada + navigate no click).
+//        Badge ativo (silhueta branca do logo).
 
-const CACHE_NAME = 'painel-sinais-v5';
+const CACHE_NAME = 'painel-sinais-v6';
 const APP_SHELL = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', (event) => {
@@ -31,8 +31,6 @@ self.addEventListener('push', (event) => {
   const options = {
     icon: '/icon-192.png',
     badge: '/badge-72.png',
-    tag: String(data.tag || 'sinal'),
-    // badge removido: Android usa o ícone da app do manifest.json
     tag: String(data.tag || 'sinal'),
     data: {
       url: String((data.data && data.data.url) || '/'),
