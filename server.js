@@ -1,7 +1,6 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
-// v2.5 — timeout inteligente (estende se o trade está a avançar) +
-//        mensagens detalhadas com estrutura `detalhes` (para o modal no app).
+// v2.6 — timeout inteligente + mensagens detalhadas + limpar histórico (por user)
 
 import express from 'express';
 import cors from 'cors';
@@ -263,7 +262,6 @@ let cronEmExecucao = false;
 const MODOS_OK = ['SNIPER', 'CAÇADOR', 'PESCADOR', 'BALEEIRO'];
 const CADENCIAS = { SNIPER: 1, 'CAÇADOR': 3, PESCADOR: 10, BALEEIRO: 30 };
 
-// ⭐ Config por modo para PRONTIDAO/ARREFECIMENTO
 const PRONTIDAO_CONFIG = {
   SNIPER:    { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 10 },
   'CAÇADOR': { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 5  },
@@ -274,13 +272,12 @@ function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
 }
 
-// ⭐ Config do timeout inteligente
-const TRADE_TIMEOUT_MS = 20 * 60 * 1000;              // 1ª janela: 20 min
-const TRADE_TIMEOUT_EXTEND_MS = 15 * 60 * 1000;       // cada extensão: +15 min
-const PROGRESSO_MINIMO_EXTENSAO = 0.05;               // 5% de avanço mínimo para estender
-const EXTENSOES_MAX = 3;                              // máximo 3 extensões (~65 min no total)
+const TRADE_TIMEOUT_MS = 20 * 60 * 1000;
+const TRADE_TIMEOUT_EXTEND_MS = 15 * 60 * 1000;
+const PROGRESSO_MINIMO_EXTENSAO = 0.05;
+const EXTENSOES_MAX = 3;
 
-// ========== WATCHLIST POR USER (Firestore) ==========
+// ========== WATCHLIST POR USER ==========
 async function getUserWatchlist(tokenHash) {
   if (!firebaseInitialized) return null;
   const doc = await db.collection('user_watchlists').doc(tokenHash).get();
@@ -354,7 +351,7 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// ========== PERSISTÊNCIA DE ESTADO (anti-restart) ==========
+// ========== PERSISTÊNCIA ==========
 async function persistTradeOpen(tradeKey, trade) {
   if (!firebaseInitialized) return;
   try {
@@ -376,7 +373,6 @@ async function persistTradeUpdate(tradeKey, trade) {
       avisoAceleracaoEnviado: trade.avisoAceleracaoEnviado,
       avisoTempoEsgotadoEnviado: trade.avisoTempoEsgotadoEnviado,
       aviso5MinEnviado: trade.aviso5MinEnviado,
-      // ⭐ Timeout inteligente
       timeoutAt: trade.timeoutAt,
       extensoes: trade.extensoes,
       percentualNoUltimoCheck: trade.percentualNoUltimoCheck,
@@ -429,7 +425,6 @@ async function loadStateFromFirestore() {
     return;
   }
   try {
-    // --- 1. Trades abertos ---
     const tradesSnap = await db.collection('open_trades').get();
     const agora = Date.now();
     let tradesRestaurados = 0, tradesExpirados = 0;
@@ -439,11 +434,8 @@ async function loadStateFromFirestore() {
       const timeoutAt = t.timeoutAt || (timestampTrade + TRADE_TIMEOUT_MS);
 
       if (agora > timeoutAt && !t.timeoutAt) {
-        // trade legado (sem timeoutAt) que já passou o timeout inicial
-        // Vamos dar uma chance — restaura com timeout curto para o próximo ciclo decidir
-        t.timeoutAt = agora + 60 * 1000; // 1 min para reavaliar
+        t.timeoutAt = agora + 60 * 1000;
       } else if (agora > timeoutAt) {
-        // já passou timeoutAt, mas tem extensões — restaura para o próximo ciclo decidir
         t.timeoutAt = agora + 60 * 1000;
       }
       if (!t.timeoutAt) t.timeoutAt = timestampTrade + TRADE_TIMEOUT_MS;
@@ -451,7 +443,6 @@ async function loadStateFromFirestore() {
       tradesRestaurados++;
     }
 
-    // --- 2. Cooldowns ---
     const cdSnap = await db.collection('cooldowns').get();
     let cdRestaurados = 0, cdExpirados = 0;
     for (const doc of cdSnap.docs) {
@@ -460,7 +451,6 @@ async function loadStateFromFirestore() {
       else { await doc.ref.delete(); cdExpirados++; }
     }
 
-    // --- 3. Prontidão ---
     const prSnap = await db.collection('prontidao_state').get();
     let prRestaurados = 0;
     for (const doc of prSnap.docs) {
@@ -514,7 +504,7 @@ function diagnosticoProximidade(reasons) {
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
-// ========== FORMATAÇÃO DE MENSAGENS (com `detalhes` estruturados) ==========
+// ========== FORMATAÇÃO DE MENSAGENS ==========
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
@@ -673,7 +663,6 @@ function formatarMensagemTempoEsgotado(trade) {
   };
 }
 
-// ⭐ NOVA — Timeout inteligente (trade não avançou o suficiente)
 function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo) {
   const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
   const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
@@ -766,7 +755,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const percentualPercorrido = distanciaTotal > 0 ? (distanciaPercorrida / distanciaTotal) : 0;
     const tempoDecorridoMin = Math.floor((agora - trade.timestamp) / 60000);
 
-    // ⭐ TIMEOUT INTELIGENTE — Verifica se já passou o timeout
     const timeoutAtual = trade.timeoutAt || (trade.timestamp + TRADE_TIMEOUT_MS);
     if (agora > timeoutAtual) {
       const extensoes = trade.extensoes || 0;
@@ -775,15 +763,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       const estaAvancando = progressoNovo >= PROGRESSO_MINIMO_EXTENSAO;
 
       if (estaAvancando && extensoes < EXTENSOES_MAX) {
-        // ✅ Trade está a caminhar → estender
         trade.timeoutAt = agora + TRADE_TIMEOUT_EXTEND_MS;
         trade.extensoes = extensoes + 1;
         trade.percentualNoUltimoCheck = percentualPercorrido;
         logger.info(`⏭️ Trade ${tradeKey} estendido (${trade.extensoes}/${EXTENSOES_MAX}) — progresso ${(percentualPercorrido*100).toFixed(1)}% (+${(progressoNovo*100).toFixed(1)}%)`);
         persistTradeUpdate(tradeKey, trade);
-        // NÃO retorna — continua para avaliar WIN/STOP/marcos neste mesmo ciclo
       } else {
-        // ❌ Não avançou ou atingiu máximo de extensões → fechar com notificação
         const motivo = extensoes >= EXTENSOES_MAX
           ? `limite de ${EXTENSOES_MAX} extensões atingido`
           : `sem avanço suficiente nas últimas ${Math.floor(TRADE_TIMEOUT_EXTEND_MS/60000)}min`;
@@ -871,7 +856,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         avisoAceleracaoEnviado: false,
         avisoTempoEsgotadoEnviado: false,
         aviso5MinEnviado: false,
-        // ⭐ Timeout inteligente
         timeoutAt: agora + TRADE_TIMEOUT_MS,
         extensoes: 0,
         percentualNoUltimoCheck: 0
@@ -948,7 +932,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
   }
 }
 
-// ========== CRON — motor a cada minuto ==========
+// ========== CRON ==========
 cron.schedule('* * * * *', async () => {
   if (cronEmExecucao) { logger.warn('⏭️ Ciclo anterior ainda em execução — skip'); return; }
   cronEmExecucao = true;
@@ -1256,6 +1240,65 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
     res.json({ signals });
   } catch (err) {
     logger.error('Erro ao buscar sinais:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ⭐ NOVO — Limpar histórico de sinais do utilizador (remove tokenHash dos watchers)
+app.delete('/api/signals', authMiddleware, async (req, res) => {
+  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  const mode = req.query.mode || null;
+  try {
+    let q = db.collection('signals')
+      .where('watchers', 'array-contains', req.user.tokenHash);
+    if (mode) q = q.where('mode', '==', mode);
+
+    const snap = await q.get();
+    if (snap.empty) {
+      return res.json({ success: true, deletados: 0, atualizados: 0, total: 0, mensagem: 'Nada para apagar' });
+    }
+
+    let deletados = 0, atualizados = 0;
+    let batch = db.batch();
+    let ops = 0;
+    const commits = [];
+
+    for (const doc of snap.docs) {
+      const data = doc.data();
+      const watchers = Array.isArray(data.watchers) ? data.watchers : [];
+      const restantes = watchers.filter(t => t !== req.user.tokenHash);
+
+      if (restantes.length === 0) {
+        // Era o único watcher → apaga do Firestore
+        batch.delete(doc.ref);
+        deletados++;
+      } else {
+        // Há outros → só remove o meu tokenHash
+        batch.update(doc.ref, { watchers: restantes });
+        atualizados++;
+      }
+      ops++;
+
+      if (ops >= 450) {
+        commits.push(batch.commit());
+        batch = db.batch();
+        ops = 0;
+      }
+    }
+    if (ops > 0) commits.push(batch.commit());
+    await Promise.all(commits);
+
+    const total = deletados + atualizados;
+    logger.info(`🗑️ [SIGNALS-CLEAR] user=${req.user.tokenHash}${mode?' mode='+mode:''} → ${deletados} apagado(s), ${atualizados} atualizado(s)`);
+    res.json({
+      success: true,
+      deletados,
+      atualizados,
+      total,
+      mensagem: `${total} sinal(is) removido(s) do teu histórico`
+    });
+  } catch (err) {
+    logger.error('Erro em DELETE /api/signals:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
