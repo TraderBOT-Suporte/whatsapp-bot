@@ -1,6 +1,6 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
-// v2.6 — timeout inteligente + mensagens detalhadas + limpar histórico (por user)
+// v2.7 — cooldown global por símbolo + limpar histórico + timeout inteligente
 
 import express from 'express';
 import cors from 'cors';
@@ -272,6 +272,9 @@ function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
 }
 
+// ⭐ NOVO — Cooldown GLOBAL por símbolo (evita spam do mesmo ativo em vários modos)
+const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000; // 10 min
+
 const TRADE_TIMEOUT_MS = 20 * 60 * 1000;
 const TRADE_TIMEOUT_EXTEND_MS = 15 * 60 * 1000;
 const PROGRESSO_MINIMO_EXTENSAO = 0.05;
@@ -335,6 +338,8 @@ const COOLDOWN_POS_TRADE_MS = 10 * 60 * 1000;
 
 const prontidaoUltimoEnvio = new Map();
 const arrefecimentoUltimoEnvio = new Map();
+// ⭐ NOVO — Última PRONTIDAO enviada por SÍMBOLO (independente do modo)
+const prontidaoGlobalPorSymbol = new Map();
 
 setInterval(() => {
   const agora = Date.now();
@@ -348,6 +353,10 @@ setInterval(() => {
       prontidaoUltimoEnvio.delete(key);
       arrefecimentoUltimoEnvio.delete(key);
     }
+  }
+  // ⭐ NOVO — Limpa o cooldown global de PRONTIDAO
+  for (const [sym, ts] of prontidaoGlobalPorSymbol.entries()) {
+    if (agora - ts > 30 * 60 * 1000) prontidaoGlobalPorSymbol.delete(sym);
   }
 }, 60 * 1000);
 
@@ -890,7 +899,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const ultimoEnvio = prontidaoUltimoEnvio.get(tradeKey) || 0;
     const podeEnviarAgora = (agora - ultimoEnvio) >= cfg.cooldownMs;
 
-    if (!prontidaoAtiva.has(tradeKey) || podeEnviarAgora) {
+    // ⭐ NOVO — Verifica cooldown GLOBAL (mesmo símbolo noutros modos)
+    const ultimoGlobal = prontidaoGlobalPorSymbol.get(symbol) || 0;
+    const podeEnviarGlobal = (agora - ultimoGlobal) >= PRONTIDAO_GLOBAL_COOLDOWN_MS;
+
+    // Só envia PRONTIDAO se: (a) nunca foi enviado OU (b) já passou o cooldown do modo
+    // E também (c) já passou o cooldown global do símbolo
+    if ((!prontidaoAtiva.has(tradeKey) || podeEnviarAgora) && podeEnviarGlobal) {
       const direcaoPrep = extrairDirecaoPrep(dados);
       if (direcaoPrep) {
         const subindo = historico.length >= 3 && historico[historico.length - 1].score > historico[0].score;
@@ -902,6 +917,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         );
         prontidaoAtiva.add(tradeKey);
         prontidaoUltimoEnvio.set(tradeKey, agora);
+        prontidaoGlobalPorSymbol.set(symbol, agora);   // ⭐ NOVO
         prontidaoForaContagem.set(tradeKey, 0);
         persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
       }
@@ -1269,11 +1285,9 @@ app.delete('/api/signals', authMiddleware, async (req, res) => {
       const restantes = watchers.filter(t => t !== req.user.tokenHash);
 
       if (restantes.length === 0) {
-        // Era o único watcher → apaga do Firestore
         batch.delete(doc.ref);
         deletados++;
       } else {
-        // Há outros → só remove o meu tokenHash
         batch.update(doc.ref, { watchers: restantes });
         atualizados++;
       }
