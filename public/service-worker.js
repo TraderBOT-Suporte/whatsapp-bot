@@ -2,7 +2,7 @@
 // v2.2 — compatível com iOS 16.4+ (data achatada + navigate no click).
 //        Badge removido (usa o ícone da app via manifest.json).
 
-const CACHE_NAME = 'painel-sinais-v4';
+const CACHE_NAME = 'painel-sinais-v5';
 const APP_SHELL = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', (event) => {
