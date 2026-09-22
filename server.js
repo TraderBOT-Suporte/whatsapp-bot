@@ -1,7 +1,8 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
 // Toda a parte de WhatsApp (Baileys, QR, pairing, grupos, membros) foi removida.
-// v2.3 — persistência anti-restart de trades/cooldowns/prontidão + anti-duplicado.
+// v2.4 — persistência anti-restart + config por modo para PRONTIDAO/ARREFECIMENTO
+//        (evita spam no SNIPER com cadência de 1min).
 
 import express from 'express';
 import cors from 'cors';
@@ -269,6 +270,20 @@ let cronEmExecucao = false;
 const MODOS_OK = ['SNIPER', 'CAÇADOR', 'PESCADOR', 'BALEEIRO'];
 const CADENCIAS = { SNIPER: 1, 'CAÇADOR': 3, PESCADOR: 10, BALEEIRO: 30 };
 
+// ⭐ NOVO — Config por modo para PRONTIDAO/ARREFECIMENTO
+// Resolve o problema de spam no SNIPER (1 min por ciclo).
+// - cooldownMs: tempo mínimo entre PRONTIDAOs do mesmo par symbol+mode
+// - ciclosForaParaArrefecer: quantos ciclos fora da Zona B antes de enviar ARREFECIMENTO
+const PRONTIDAO_CONFIG = {
+  SNIPER:    { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 10 },
+  'CAÇADOR': { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 5  },
+  PESCADOR:  { cooldownMs: 30 * 60 * 1000, ciclosForaParaArrefecer: 4  },
+  BALEEIRO:  { cooldownMs: 60 * 60 * 1000, ciclosForaParaArrefecer: 3  }
+};
+function getProntidaoConfig(mode) {
+  return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
+}
+
 // ========== WATCHLIST POR USER (Firestore) ==========
 async function getUserWatchlist(tokenHash) {
   if (!firebaseInitialized) return null;
@@ -327,6 +342,10 @@ const prontidaoForaContagem = new Map();
 const COOLDOWN_POS_TRADE_MS = 10 * 60 * 1000;
 const TRADE_TIMEOUT_MS = 20 * 60 * 1000;
 
+// ⭐ NOVO — Controla quando foi enviada a última PRONTIDAO e ARREFECIMENTO por tradeKey
+const prontidaoUltimoEnvio = new Map();   // tradeKey → timestamp da última PRONTIDAO
+const arrefecimentoUltimoEnvio = new Map(); // tradeKey → timestamp do último ARREFECIMENTO
+
 setInterval(() => {
   const agora = Date.now();
   for (const [key, expira] of cooldownPosTrade.entries()) if (agora > expira) cooldownPosTrade.delete(key);
@@ -336,6 +355,8 @@ setInterval(() => {
       prontidaoHistorico.delete(key);
       prontidaoAtiva.delete(key);
       prontidaoForaContagem.delete(key);
+      prontidaoUltimoEnvio.delete(key);
+      arrefecimentoUltimoEnvio.delete(key);
     }
   }
 }, 60 * 1000);
@@ -700,6 +721,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
+      prontidaoUltimoEnvio.delete(tradeKey);
+      arrefecimentoUltimoEnvio.delete(tradeKey);
       removePersistedProntidao(tradeKey);
     }
   }
@@ -711,7 +734,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     prontidaoHistorico.set(tradeKey, historico);
     persistProntidao(tradeKey, historico, prontidaoAtiva.has(tradeKey));
 
-    if (!prontidaoAtiva.has(tradeKey)) {
+    const cfg = getProntidaoConfig(mode);
+    const ultimoEnvio = prontidaoUltimoEnvio.get(tradeKey) || 0;
+    const podeEnviarAgora = (agora - ultimoEnvio) >= cfg.cooldownMs;
+
+    // Só envia PRONTIDAO se: (a) nunca foi enviado OU (b) já passou o cooldown do modo
+    if (!prontidaoAtiva.has(tradeKey) || podeEnviarAgora) {
       const direcaoPrep = extrairDirecaoPrep(dados);
       if (direcaoPrep) {
         const subindo = historico.length >= 3 && historico[historico.length - 1].score > historico[0].score;
@@ -722,20 +750,31 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           watchers
         );
         prontidaoAtiva.add(tradeKey);
+        prontidaoUltimoEnvio.set(tradeKey, agora);
+        // Reset do contador de fora — sinaliza novo ciclo
+        prontidaoForaContagem.set(tradeKey, 0);
         persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
       }
     }
   }
   else if (dados.consolidated.signal === 'HOLD' && prontidaoAtiva.has(tradeKey)) {
+    const cfg = getProntidaoConfig(mode);
     const fora = (prontidaoForaContagem.get(tradeKey) || 0) + 1;
     prontidaoForaContagem.set(tradeKey, fora);
-    if (fora >= 2) {
-      await registrarEEnviarSinal(
-        symbol, mode, 'ARREFECIMENTO',
-        formatarMensagemArrefecimento(symbol, dados.consolidated.score),
-        { score: dados.consolidated.score },
-        watchers
-      );
+
+    if (fora >= cfg.ciclosForaParaArrefecer) {
+      // Cooldown mínimo de ARREFECIMENTO (evita ping-pong em modos rápidos)
+      const ultimoArref = arrefecimentoUltimoEnvio.get(tradeKey) || 0;
+      const cooldownArrefMs = cfg.cooldownMs; // mesmo cooldown da prontidao
+      if ((agora - ultimoArref) >= cooldownArrefMs) {
+        await registrarEEnviarSinal(
+          symbol, mode, 'ARREFECIMENTO',
+          formatarMensagemArrefecimento(symbol, dados.consolidated.score),
+          { score: dados.consolidated.score },
+          watchers
+        );
+        arrefecimentoUltimoEnvio.set(tradeKey, agora);
+      }
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
