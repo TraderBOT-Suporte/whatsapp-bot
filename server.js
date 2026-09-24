@@ -1311,9 +1311,9 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
     }));
     res.json({ signals });
   } catch (err) {
-    logger.error('Erro ao buscar sinais:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  logger.error(`Erro ao buscar sinais: ${err.message}`);
+  res.status(500).json({ error: err.message });
+}
 });
 
 // ⭐ NOVO — Limpar histórico de sinais do utilizador (remove tokenHash dos watchers)
