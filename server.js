@@ -500,6 +500,7 @@ async function loadStateFromFirestore() {
 }
 
 function cleanSymbolName(symbol) {
+  if (!symbol || typeof symbol !== 'string') return '?';
   let nome = symbol.replace('frx', '').replace('cry', '').replace('OTC_', '');
   if (nome.length === 6) nome = nome.slice(0, 3) + '/' + nome.slice(3);
   if (symbol.includes('XAU')) nome = 'XAU/USD';
@@ -573,8 +574,8 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   };
 }
 
-function formatarMensagemSinal(dados, mode) {
-  const { symbol, consolidated, suggestion } = dados;
+function formatarMensagemSinal(symbol, dados, mode) {
+  const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
   const dirLabel = consolidated.signal === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
   const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
@@ -928,7 +929,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       logger.info(`🚀 [ENTRAR AGORA] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | score ${dados.consolidated.score}`);
 
       try {
-        const msgSinal = formatarMensagemSinal(dados, mode);
+        const msgSinal = formatarMensagemSinal(symbol, dados, mode);
         logger.info(`🚀 [MSG OK] ${symbol} (${mode}) → titulo="${msgSinal.titulo}"`);
 
         await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', msgSinal, {
