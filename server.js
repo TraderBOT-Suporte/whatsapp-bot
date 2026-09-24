@@ -275,8 +275,31 @@ function getProntidaoConfig(mode) {
 // ⭐ NOVO — Cooldown GLOBAL por símbolo (evita spam do mesmo ativo em vários modos)
 const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000; // 10 min
 
-const TRADE_TIMEOUT_MS = 20 * 60 * 1000;
-const TRADE_TIMEOUT_EXTEND_MS = 15 * 60 * 1000;
+// ⭐ Timeout variável por modo — alinhado com a duração real de cada estratégia
+const TRADE_TIMEOUT_POR_MODO_MS = {
+  'SNIPER':   20 * 60 * 1000,            // 20 min
+  'CAÇADOR':  90 * 60 * 1000,            // 1h30
+  'PESCADOR': 12 * 60 * 60 * 1000,       // 12h
+  'BALEEIRO': 72 * 60 * 60 * 1000        // 3 dias
+};
+
+const TRADE_TIMEOUT_EXTEND_POR_MODO_MS = {
+  'SNIPER':   15 * 60 * 1000,            // +15 min
+  'CAÇADOR':  45 * 60 * 1000,            // +45 min
+  'PESCADOR': 6 * 60 * 60 * 1000,        // +6h
+  'BALEEIRO': 48 * 60 * 60 * 1000        // +48h
+};
+
+const TRADE_TIMEOUT_MS_DEFAULT = 20 * 60 * 1000;
+const TRADE_TIMEOUT_EXTEND_MS_DEFAULT = 15 * 60 * 1000;
+
+function getTimeoutModo(mode) {
+  return TRADE_TIMEOUT_POR_MODO_MS[mode] || TRADE_TIMEOUT_MS_DEFAULT;
+}
+function getTimeoutExtendModo(mode) {
+  return TRADE_TIMEOUT_EXTEND_POR_MODO_MS[mode] || TRADE_TIMEOUT_EXTEND_MS_DEFAULT;
+}
+
 const PROGRESSO_MINIMO_EXTENSAO = 0.05;
 const EXTENSOES_MAX = 3;
 
@@ -437,17 +460,18 @@ async function loadStateFromFirestore() {
     const tradesSnap = await db.collection('open_trades').get();
     const agora = Date.now();
     let tradesRestaurados = 0, tradesExpirados = 0;
-    for (const doc of tradesSnap.docs) {
+     for (const doc of tradesSnap.docs) {
       const t = doc.data();
       const timestampTrade = t.timestamp || 0;
-      const timeoutAt = t.timeoutAt || (timestampTrade + TRADE_TIMEOUT_MS);
+      const timeoutModo = getTimeoutModo(t.mode);
+      const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
 
       if (agora > timeoutAt && !t.timeoutAt) {
         t.timeoutAt = agora + 60 * 1000;
       } else if (agora > timeoutAt) {
         t.timeoutAt = agora + 60 * 1000;
       }
-      if (!t.timeoutAt) t.timeoutAt = timestampTrade + TRADE_TIMEOUT_MS;
+      if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
       tradesAbertos.set(doc.id, t);
       tradesRestaurados++;
     }
@@ -764,7 +788,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const percentualPercorrido = distanciaTotal > 0 ? (distanciaPercorrida / distanciaTotal) : 0;
     const tempoDecorridoMin = Math.floor((agora - trade.timestamp) / 60000);
 
-    const timeoutAtual = trade.timeoutAt || (trade.timestamp + TRADE_TIMEOUT_MS);
+    const timeoutModo = getTimeoutModo(trade.mode);
+    const timeoutExtendModo = getTimeoutExtendModo(trade.mode);
+    const timeoutAtual = trade.timeoutAt || (trade.timestamp + timeoutModo);
     if (agora > timeoutAtual) {
       const extensoes = trade.extensoes || 0;
       const progressoAnterior = trade.percentualNoUltimoCheck || 0;
@@ -772,15 +798,15 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       const estaAvancando = progressoNovo >= PROGRESSO_MINIMO_EXTENSAO;
 
       if (estaAvancando && extensoes < EXTENSOES_MAX) {
-        trade.timeoutAt = agora + TRADE_TIMEOUT_EXTEND_MS;
+        trade.timeoutAt = agora + timeoutExtendModo;
         trade.extensoes = extensoes + 1;
         trade.percentualNoUltimoCheck = percentualPercorrido;
-        logger.info(`⏭️ Trade ${tradeKey} estendido (${trade.extensoes}/${EXTENSOES_MAX}) — progresso ${(percentualPercorrido*100).toFixed(1)}% (+${(progressoNovo*100).toFixed(1)}%)`);
+        logger.info(`⏭️ Trade ${tradeKey} [${trade.mode}] estendido (${trade.extensoes}/${EXTENSOES_MAX}) — progresso ${(percentualPercorrido*100).toFixed(1)}% (+${(progressoNovo*100).toFixed(1)}%)`);
         persistTradeUpdate(tradeKey, trade);
       } else {
         const motivo = extensoes >= EXTENSOES_MAX
           ? `limite de ${EXTENSOES_MAX} extensões atingido`
-          : `sem avanço suficiente nas últimas ${Math.floor(TRADE_TIMEOUT_EXTEND_MS/60000)}min`;
+          : `sem avanço suficiente nas últimas ${Math.floor(timeoutExtendModo/60000)}min`;
 
         await registrarEEnviarSinal(
           symbol, mode, 'TIMEOUT',
@@ -865,10 +891,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         avisoAceleracaoEnviado: false,
         avisoTempoEsgotadoEnviado: false,
         aviso5MinEnviado: false,
-        timeoutAt: agora + TRADE_TIMEOUT_MS,
+        timeoutAt: agora + getTimeoutModo(mode),
         extensoes: 0,
         percentualNoUltimoCheck: 0
       };
+     
       tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
 
