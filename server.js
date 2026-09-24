@@ -789,6 +789,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
   const dados = await buscarSinalAnalise(symbol, mode);
   if (!dados || !dados.success) return;
 
+  // ⭐ DEBUG — remover depois de diagnosticar
+  logger.info(`🔬 [RX] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} suggestion=${dados.suggestion?.action}`);
+
   const agora = Date.now();
   const currentPrice = dados.consolidated.price;
   const tradeKey = `${symbol}_${mode}`;
@@ -889,8 +892,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         logger.info(`⏭️ Anti-duplicado: sinal já emitido nos últimos 5min para ${symbol}/${mode} — a saltar`);
         return;
       }
-    } catch (err) {
-      logger.warn('Anti-duplicado indisponível (índice?):', err.message);
+       } catch (err) {
+      logger.warn(`Anti-duplicado indisponível (índice?): ${err.message}`);
     }
   }
 
@@ -1446,7 +1449,7 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
         .where('watchers', 'array-contains', req.user.tokenHash)
         .where('criadoEm', '>=', new Date(new Date().setHours(0, 0, 0, 0)))
         .count().get()).data().count;
-    } catch (err) { logger.error('Erro stats:', err.message); }
+    } catch (err) { logger.error(`Erro stats: ${err.message}`); }
   }
   res.json(stats);
 });
