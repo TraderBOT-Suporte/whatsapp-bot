@@ -578,7 +578,8 @@ function formatarMensagemSinal(dados, mode) {
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
   const dirLabel = consolidated.signal === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
   const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
-  const conf = (consolidated.confidence * 100).toFixed(1);
+  const confNum = Number(consolidated?.confidence);
+  const conf = (Number.isFinite(confNum) ? (confNum * 100).toFixed(1) : '0.0');
 
   return {
     titulo: `🚨 SINAL CONFIRMADO: ${cleanSymbolName(symbol)}`,
@@ -753,8 +754,9 @@ async function buscarSinalAnalise(symbol, mode) {
       headers: { 'x-admin-key': adminKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ symbol, mode })
     });
-    if (!response.ok) {
-      logger.error(`❌ Erro HTTP ${response.status} ao buscar ${symbol}:`, await response.text());
+        if (!response.ok) {
+      const texto = await response.text();
+      logger.error(`❌ Erro HTTP ${response.status} ao buscar ${symbol}: ${texto}`);
       return null;
     }
     return await response.json();
@@ -920,18 +922,27 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         percentualNoUltimoCheck: 0
       };
      
-      tradesAbertos.set(tradeKey, novoTrade);
+            tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
 
-          logger.info(`🚀 [ENTRAR AGORA] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | score ${dados.consolidated.score}`);
+      logger.info(`🚀 [ENTRAR AGORA] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | score ${dados.consolidated.score}`);
 
-      await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', formatarMensagemSinal(dados, mode), {
-        score: dados.consolidated.score,
-        confidence: dados.consolidated.confidence,
-        entry: dados.suggestion.entry,
-        takeProfit: dados.suggestion.takeProfit,
-        stopLoss: dados.suggestion.stopLoss
-      }, watchers);
+      try {
+        const msgSinal = formatarMensagemSinal(dados, mode);
+        logger.info(`🚀 [MSG OK] ${symbol} (${mode}) → titulo="${msgSinal.titulo}"`);
+
+        await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', msgSinal, {
+          score: dados.consolidated.score,
+          confidence: dados.consolidated.confidence,
+          entry: dados.suggestion.entry,
+          takeProfit: dados.suggestion.takeProfit,
+          stopLoss: dados.suggestion.stopLoss
+        }, watchers);
+
+        logger.info(`✅ [PUSH ENVIADO] ${symbol} (${mode}) → SINAL_CONFIRMADO`);
+      } catch (errSinal) {
+        logger.error(`❌ FALHA AO ENVIAR SINAL_CONFIRMADO ${symbol} (${mode}): ${errSinal.message}\n${errSinal.stack || ''}`);
+      }
 
       _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers);   // ⭐ NOVO — retry após 30s
 
@@ -1055,7 +1066,7 @@ cron.schedule('* * * * *', async () => {
       await new Promise(r => setTimeout(r, 1200));
     }
   } catch (err) {
-    logger.error('Erro no cron:', err.message);
+    logger.error(`Erro no cron: ${err.message}\n${err.stack || ''}`);
   } finally {
     cronEmExecucao = false;
   }
