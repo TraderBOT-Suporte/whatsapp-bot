@@ -764,6 +764,27 @@ async function buscarSinalAnalise(symbol, mode) {
   }
 }
 
+// ⭐ Reenvia o SINAL_CONFIRMADO 30s depois para garantir entrega em caso de hibernação
+async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers) {
+  setTimeout(async () => {
+    try {
+      const t = tradesAbertos.get(tradeKey);
+      if (!t) return;
+      if (Date.now() - t.timestamp > 2 * 60 * 1000) return;
+
+      await sendPushToWatchers(watchers, {
+        title: `🚨 Lembrete: ${cleanSymbolName(symbol)}`,
+        body: `Sinal ${t.signal} ainda ativo — entrada ${t.entry} · TP ${t.takeProfit} · SL ${t.stopLoss}\n⚡ Se não recebeste o sinal anterior, entra agora`,
+        tag: `${symbol}_${mode}_SINAL_CONFIRMADO_RETRY`,
+        data: { symbol, mode, tipo: 'SINAL_CONFIRMADO_RETRY', url: '/' }
+      });
+      logger.info(`🔁 [SINAL_CONFIRMADO_RETRY] ${symbol} (${mode}) reenviado após 30s`);
+    } catch (err) {
+      logger.error('Erro no retry do SINAL_CONFIRMADO:', err.message);
+    }
+  }, 30 * 1000);
+}
+
 async function analisarEEnviarSinais(symbol, mode, watchers = []) {
   const dados = await buscarSinalAnalise(symbol, mode);
   if (!dados || !dados.success) return;
@@ -899,6 +920,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
 
+          logger.info(`🚀 [ENTRAR AGORA] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | score ${dados.consolidated.score}`);
+
       await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', formatarMensagemSinal(dados, mode), {
         score: dados.consolidated.score,
         confidence: dados.consolidated.confidence,
@@ -906,6 +929,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         takeProfit: dados.suggestion.takeProfit,
         stopLoss: dados.suggestion.stopLoss
       }, watchers);
+
+      _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers);   // ⭐ NOVO — retry após 30s
+
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
