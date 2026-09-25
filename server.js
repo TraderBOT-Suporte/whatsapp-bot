@@ -1,6 +1,7 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
 // v2.9 — h4_timing incluído no fallback de direção (BALEEIRO)
+// v2.10 — diagnosticoProximidade reconhece bloqueio DeMarker extremo
 
 import express from 'express';
 import cors from 'cors';
@@ -567,9 +568,14 @@ function extrairDirecaoPrep(dados) {
   return null;
 }
 
+// ⭐ v2.10: reconhece bloqueio por DeMarker extremo (novo comportamento do motor)
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
   if (/ADX muito fraco/i.test(texto)) return { nivel: 'LONGE', detalhe: 'macro sem força' };
+  // ⭐ BLOQUEADO: DeMarker extremo em TF(s) → não está "perto", está bloqueado
+  if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
+  }
   if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(texto)) return { nivel: 'PERTO', detalhe: 'gatilho em ajuste' };
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
@@ -581,9 +587,16 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const score = dados.consolidated.score;
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
   let proximidade, detalhe;
-  if (/ADX muito fraco/i.test(reasons)) { proximidade = 'LONGE'; detalhe = 'tendência macro sem força'; }
-  else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(reasons)) { proximidade = 'PERTO'; detalhe = 'gatilho em ajuste'; }
-  else { proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento'; }
+  // ⭐ v2.10: mesma lógica do diagnosticoProximidade (bloqueio DeMarker extremo)
+  if (/ADX muito fraco/i.test(reasons)) {
+    proximidade = 'LONGE'; detalhe = 'tendência macro sem força';
+  } else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) {
+    proximidade = 'BLOQUEADO'; detalhe = 'mercado em extremo — aguarda normalizar';
+  } else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(reasons)) {
+    proximidade = 'PERTO'; detalhe = 'gatilho em ajuste';
+  } else {
+    proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento';
+  }
 
   return {
     titulo: `👀 Atenção: ${nomeAmigavel}`,
