@@ -1,8 +1,8 @@
 // Service Worker — corre em background, mesmo com a app/aba fechada.
-// v2.5 — compatível com iOS 16.4+ (data achatada + navigate no click).
+// v2.6 — abre direto no Painel de Sinais ao clicar + compatível com iOS 16.4+
 //        Badge ativo (silhueta branca do logo).
 
-const CACHE_NAME = 'painel-sinais-v10';
+const CACHE_NAME = 'painel-sinais-v11';
 const APP_SHELL = ['/', '/index.html', '/manifest.json'];
 
 self.addEventListener('install', (event) => {
@@ -47,17 +47,23 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetUrl = (event.notification.data && event.notification.data.url) || '/';
+  const targetUrl = (event.notification.data && event.notification.data.url) || '/?open=signals';
 
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientsArr) => {
       const existing = clientsArr.find((c) => c.url.includes(self.location.origin));
       if (existing) {
-        return existing.focus().then((c) => {
-          if (c && typeof c.navigate === 'function') return c.navigate(targetUrl);
+        // ⭐ Tenta enviar mensagem primeiro (sem recarregar a página)
+        try {
+          existing.postMessage({ action: 'openSignals' });
+        } catch (e) {}
+        // ⭐ Foca a janela existente
+        return existing.focus().catch(() => {
+          if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
         });
       }
-      return self.clients.openWindow(targetUrl);
+      // Se não há janela aberta, abre nova com ?open=signals
+      if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
     })
   );
 });
