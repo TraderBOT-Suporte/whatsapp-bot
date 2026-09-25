@@ -1,6 +1,6 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
-// v2.7 — cooldown global por símbolo + limpar histórico + timeout inteligente
+// v2.8 — nomes amigáveis em todos os sinais/push/histórico
 
 import express from 'express';
 import cors from 'cors';
@@ -147,6 +147,63 @@ async function sendPushToWatchers(watchers, payload) {
   }
 }
 
+// ========== MAPEAMENTO DE ATIVOS (nomes amigáveis) ==========
+// ⭐ Movido para cima para estar disponível em cleanSymbolName
+const assetGroups = {
+  'Cestas de Moedas': ['WLDAUD', 'WLDEUR', 'WLDGBP', 'WLDXAU', 'WLDUSD'],
+  'Forex': ['frxAUDCAD', 'frxAUDCHF', 'frxAUDJPY', 'frxAUDNZD', 'frxAUDUSD', 'frxEURCAD', 'frxEURCHF', 'frxEURAUD', 'frxEURGBP', 'frxEURJPY', 'frxEURNZD', 'frxEURUSD', 'frxGBPAUD', 'frxGBPCAD', 'frxGBPCHF', 'frxGBPJPY', 'frxGBPNOK', 'frxGBPNZD', 'frxGBPUSD', 'frxNZDJPY', 'frxNZDUSD', 'frxUSDCAD', 'frxUSDCHF', 'frxUSDJPY', 'frxUSDMXN', 'frxUSDNOK', 'frxUSDPLN', 'frxUSDSEK', 'frxGBPPLN'],
+  'Metais': ['frxXAUUSD', 'frxXAGUSD', 'frxXPDUSD', 'frxXPTUSD'],
+  'Índices Sintéticos': ['RDBEAR', 'RDBULL', 'RB100', 'RB200', 'stpRNG', 'stpRNG2', 'stpRNG3', 'stpRNG4', 'stpRNG5', 'R_10', 'R_25', 'R_50', 'R_75', 'R_90', 'R_100', '1HZ10V', '1HZ15V', '1HZ25V', '1HZ30V', '1HZ50V', '1HZ75V', '1HZ90V', '1HZ100V', '1HZ150V', '1HZ250V'],
+  'Índices OTC': ['OTC_AS51', 'OTC_SX5E', 'OTC_FCHI', 'OTC_GDAXI', 'OTC_AEX', 'OTC_FTSE', 'OTC_SPC', 'OTC_NDX', 'OTC_DJI', 'OTC_HSI', 'OTC_N225', 'OTC_SSMI'],
+  'Criptomoedas': ['cryBTCUSD', 'cryETHUSD', 'cryLTCUSD', 'cryBCHUSD', 'cryBNBUSD', 'cryDSHUSD', 'cryIOTUSD', 'cryNEOUSD', 'cryTRXUSD', 'cryXLMUSD', 'cryXMRUSD', 'cryXRPUSD', 'cryZECUSD', 'cryBTCETH', 'cryBTCLTC']
+};
+
+const fullAssets = {
+  // Cestas
+  WLDAUD: 'AUD Basket', WLDEUR: 'EUR Basket', WLDGBP: 'GBP Basket', WLDXAU: 'Gold Basket', WLDUSD: 'USD Basket',
+  // Forex
+  frxAUDCAD: 'AUD/CAD', frxAUDCHF: 'AUD/CHF', frxAUDJPY: 'AUD/JPY', frxAUDNZD: 'AUD/NZD', frxAUDUSD: 'AUD/USD',
+  frxEURCAD: 'EUR/CAD', frxEURCHF: 'EUR/CHF', frxEURAUD: 'EUR/AUD', frxEURGBP: 'EUR/GBP', frxEURJPY: 'EUR/JPY',
+  frxEURNZD: 'EUR/NZD', frxEURUSD: 'EUR/USD', frxGBPAUD: 'GBP/AUD', frxGBPCAD: 'GBP/CAD', frxGBPCHF: 'GBP/CHF',
+  frxGBPJPY: 'GBP/JPY', frxGBPNOK: 'GBP/NOK', frxGBPNZD: 'GBP/NZD', frxGBPUSD: 'GBP/USD', frxNZDJPY: 'NZD/JPY',
+  frxNZDUSD: 'NZD/USD', frxUSDCAD: 'USD/CAD', frxUSDCHF: 'USD/CHF', frxUSDJPY: 'USD/JPY', frxUSDMXN: 'USD/MXN',
+  frxUSDNOK: 'USD/NOK', frxUSDPLN: 'USD/PLN', frxUSDSEK: 'USD/SEK', frxGBPPLN: 'GBP/PLN',
+  // Metais (nomes bonitos)
+  frxXAUUSD: 'Gold/USD', frxXAGUSD: 'Silver/USD', frxXPDUSD: 'Palladium/USD', frxXPTUSD: 'Platinum/USD',
+  // Índices Sintéticos
+  RDBEAR: 'Bear Market Index', RDBULL: 'Bull Market Index', RB100: 'Range Break 100', RB200: 'Range Break 200',
+  stpRNG: 'Step Index', stpRNG2: 'Step 200', stpRNG3: 'Step 300', stpRNG4: 'Step 400', stpRNG5: 'Step 500',
+  R_10: 'Volatility 10', R_25: 'Volatility 25', R_50: 'Volatility 50', R_75: 'Volatility 75', R_90: 'Volatility 90', R_100: 'Volatility 100',
+  '1HZ10V': 'Volatility 10 (1s)', '1HZ15V': 'Volatility 15 (1s)', '1HZ25V': 'Volatility 25 (1s)', '1HZ30V': 'Volatility 30 (1s)',
+  '1HZ50V': 'Volatility 50 (1s)', '1HZ75V': 'Volatility 75 (1s)', '1HZ90V': 'Volatility 90 (1s)', '1HZ100V': 'Volatility 100 (1s)',
+  '1HZ150V': 'Volatility 150 (1s)', '1HZ250V': 'Volatility 250 (1s)',
+  // Índices OTC
+  OTC_AS51: 'Australia 200', OTC_SX5E: 'Euro 50', OTC_FCHI: 'France 40', OTC_GDAXI: 'Germany 40',
+  OTC_AEX: 'Netherlands 25', OTC_FTSE: 'UK 100', OTC_SPC: 'US 500', OTC_NDX: 'US Tech 100',
+  OTC_DJI: 'Wall Street 30', OTC_HSI: 'Hong Kong 50', OTC_N225: 'Japan 225', OTC_SSMI: 'Swiss 20',
+  // Criptomoedas
+  cryBTCUSD: 'Bitcoin/USD', cryETHUSD: 'Ethereum/USD', cryLTCUSD: 'Litecoin/USD', cryBCHUSD: 'Bitcoin Cash/USD',
+  cryBNBUSD: 'Binance Coin/USD', cryDSHUSD: 'Dash/USD', cryIOTUSD: 'IOTA/USD', cryNEOUSD: 'Neo/USD',
+  cryTRXUSD: 'TRON/USD', cryXLMUSD: 'Stellar/USD', cryXMRUSD: 'Monero/USD', cryXRPUSD: 'Ripple/USD',
+  cryZECUSD: 'Zcash/USD', cryBTCETH: 'BTC/ETH', cryBTCLTC: 'BTC/LTC'
+};
+
+// ⭐ NOVO — sempre devolve o nome amigável se existir
+function cleanSymbolName(symbol) {
+  if (!symbol || typeof symbol !== 'string') return '?';
+  if (fullAssets[symbol]) return fullAssets[symbol];
+  // Fallback: limpar prefixos técnicos
+  let nome = symbol.replace('frx', '').replace('cry', '').replace('OTC_', '');
+  if (nome.length === 6) nome = nome.slice(0, 3) + '/' + nome.slice(3);
+  return nome;
+}
+
+// Helper: sempre prefere o nome bonito do fullAssets
+function getFriendlyName(symbol) {
+  if (!symbol) return '?';
+  return fullAssets[symbol] || cleanSymbolName(symbol);
+}
+
 // ========== PLANOS ==========
 const PLANOS = {
   7:    { nome: '7 Dias',  maxAtivosPorModo: 3,  prioridade: false },
@@ -272,22 +329,22 @@ function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
 }
 
-// ⭐ NOVO — Cooldown GLOBAL por símbolo (evita spam do mesmo ativo em vários modos)
+// ⭐ Cooldown GLOBAL por símbolo (evita spam do mesmo ativo em vários modos)
 const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000; // 10 min
 
-// ⭐ Timeout variável por modo — alinhado com a duração real de cada estratégia
+// ⭐ Timeout variável por modo
 const TRADE_TIMEOUT_POR_MODO_MS = {
-  'SNIPER':   20 * 60 * 1000,            // 20 min
-  'CAÇADOR':  90 * 60 * 1000,            // 1h30
-  'PESCADOR': 12 * 60 * 60 * 1000,       // 12h
-  'BALEEIRO': 72 * 60 * 60 * 1000        // 3 dias
+  'SNIPER':   20 * 60 * 1000,
+  'CAÇADOR':  90 * 60 * 1000,
+  'PESCADOR': 12 * 60 * 60 * 1000,
+  'BALEEIRO': 72 * 60 * 60 * 1000
 };
 
 const TRADE_TIMEOUT_EXTEND_POR_MODO_MS = {
-  'SNIPER':   15 * 60 * 1000,            // +15 min
-  'CAÇADOR':  45 * 60 * 1000,            // +45 min
-  'PESCADOR': 6 * 60 * 60 * 1000,        // +6h
-  'BALEEIRO': 48 * 60 * 60 * 1000        // +48h
+  'SNIPER':   15 * 60 * 1000,
+  'CAÇADOR':  45 * 60 * 1000,
+  'PESCADOR': 6 * 60 * 60 * 1000,
+  'BALEEIRO': 48 * 60 * 60 * 1000
 };
 
 const TRADE_TIMEOUT_MS_DEFAULT = 20 * 60 * 1000;
@@ -361,7 +418,6 @@ const COOLDOWN_POS_TRADE_MS = 10 * 60 * 1000;
 
 const prontidaoUltimoEnvio = new Map();
 const arrefecimentoUltimoEnvio = new Map();
-// ⭐ NOVO — Última PRONTIDAO enviada por SÍMBOLO (independente do modo)
 const prontidaoGlobalPorSymbol = new Map();
 
 setInterval(() => {
@@ -377,7 +433,6 @@ setInterval(() => {
       arrefecimentoUltimoEnvio.delete(key);
     }
   }
-  // ⭐ NOVO — Limpa o cooldown global de PRONTIDAO
   for (const [sym, ts] of prontidaoGlobalPorSymbol.entries()) {
     if (agora - ts > 30 * 60 * 1000) prontidaoGlobalPorSymbol.delete(sym);
   }
@@ -460,7 +515,7 @@ async function loadStateFromFirestore() {
     const tradesSnap = await db.collection('open_trades').get();
     const agora = Date.now();
     let tradesRestaurados = 0, tradesExpirados = 0;
-     for (const doc of tradesSnap.docs) {
+    for (const doc of tradesSnap.docs) {
       const t = doc.data();
       const timestampTrade = t.timestamp || 0;
       const timeoutModo = getTimeoutModo(t.mode);
@@ -499,15 +554,6 @@ async function loadStateFromFirestore() {
   }
 }
 
-function cleanSymbolName(symbol) {
-  if (!symbol || typeof symbol !== 'string') return '?';
-  let nome = symbol.replace('frx', '').replace('cry', '').replace('OTC_', '');
-  if (nome.length === 6) nome = nome.slice(0, 3) + '/' + nome.slice(3);
-  if (symbol.includes('XAU')) nome = 'XAU/USD';
-  if (symbol.includes('XAG')) nome = 'XAG/USD';
-  return nome;
-}
-
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
@@ -538,9 +584,9 @@ function diagnosticoProximidade(reasons) {
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
-// ========== FORMATAÇÃO DE MENSAGENS ==========
+// ========== FORMATAÇÃO DE MENSAGENS (títulos com nomes amigáveis) ==========
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
-  const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
+  const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
   const score = dados.consolidated.score;
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
@@ -550,7 +596,7 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   else { proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento'; }
 
   return {
-    titulo: `👀 Atenção: ${cleanSymbolName(symbol)}`,
+    titulo: `👀 Atenção: ${nomeAmigavel}`,
     corpo: `${dirLabel} · ${nomeAmigavel}\n⚡ Score ${score}/100 · Zona B · ${proximidade}\n💡 ${detalhe}`,
     detalhes: {
       tipo: 'PRONTIDAO', nomeAmigavel, direcao, modo: extras.mode || null,
@@ -562,9 +608,9 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
 }
 
 function formatarMensagemArrefecimento(symbol, score, dados) {
-  const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
+  const nomeAmigavel = getFriendlyName(symbol);
   return {
-    titulo: `😴 Prontidão encerrada: ${cleanSymbolName(symbol)}`,
+    titulo: `😴 Prontidão encerrada: ${nomeAmigavel}`,
     corpo: `${nomeAmigavel}\n📉 Score atual ${score}/100 · saiu da Zona B\n✅ A espera anterior foi cancelada`,
     detalhes: {
       tipo: 'ARREFECIMENTO', nomeAmigavel, score,
@@ -578,12 +624,12 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
   const dirLabel = consolidated.signal === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
-  const nomeAmigavel = fullAssets[symbol] || cleanSymbolName(symbol);
+  const nomeAmigavel = getFriendlyName(symbol);
   const confNum = Number(consolidated?.confidence);
   const conf = (Number.isFinite(confNum) ? (confNum * 100).toFixed(1) : '0.0');
 
   return {
-    titulo: `🚨 SINAL CONFIRMADO: ${cleanSymbolName(symbol)}`,
+    titulo: `🚨 SINAL CONFIRMADO: ${nomeAmigavel}`,
     corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}%`,
     detalhes: {
       tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
@@ -596,9 +642,9 @@ function formatarMensagemSinal(symbol, dados, mode) {
 }
 
 function formatarMensagem5Min(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   return {
-    titulo: `⏱️ Atualização (5min): ${cleanSymbolName(trade.symbol)}`,
+    titulo: `⏱️ Atualização (5min): ${nome}`,
     corpo: `${nome} · ${trade.signal}\n💵 Preço atual ${trade.currentPrice} (entrada ${trade.entry})\n📈 Mantém a posição — trade em curso`,
     detalhes: {
       tipo: '5MIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -609,9 +655,9 @@ function formatarMensagem5Min(trade) {
 }
 
 function formatarMensagemAceleracao(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   return {
-    titulo: `🚀 Mercado acelerando: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `🚀 Mercado acelerando: ${nome}`,
     corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} — movimento forte\n🎯 Deixe correr até o TP ${trade.takeProfit}`,
     detalhes: {
       tipo: 'ACELERACAO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -621,9 +667,9 @@ function formatarMensagemAceleracao(trade) {
 }
 
 function formatarMensagemSeguindo(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   return {
-    titulo: `✅ Seguindo o sinal: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `✅ Seguindo o sinal: ${nome}`,
     corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · tendência confirmada\n📊 +30% do alvo percorrido`,
     detalhes: {
       tipo: 'SEGUINDO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -633,9 +679,9 @@ function formatarMensagemSeguindo(trade) {
 }
 
 function formatarMensagemZeroRisco(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   return {
-    titulo: `🛡️ Zero Risco: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `🛡️ Zero Risco: ${nome}`,
     corpo: `${nome} · ${trade.signal}\n✅ +50% do alvo — move SL para a entrada\n🎯 Entrada ${trade.entry} (proteção ativa)`,
     detalhes: {
       tipo: 'ZERO_RISCO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -645,9 +691,9 @@ function formatarMensagemZeroRisco(trade) {
 }
 
 function formatarMensagemQuaseLa(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   return {
-    titulo: `⏳ Quase no alvo: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `⏳ Quase no alvo: ${nome}`,
     corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · 🎯 Alvo ${trade.takeProfit}\n📊 +80% percorrido — atenção máxima`,
     detalhes: {
       tipo: 'QUASE_LA', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -657,10 +703,10 @@ function formatarMensagemQuaseLa(trade) {
 }
 
 function formatarMensagemWin(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
   return {
-    titulo: `🎯 WIN: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `🎯 WIN: ${nome}`,
     corpo: `${nome} · ${trade.signal} ✅\n💰 Alvo ${trade.takeProfit} atingido!\n⏱️ Duração: ${duracao}min · fecha a posição`,
     detalhes: {
       tipo: 'WIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -671,10 +717,10 @@ function formatarMensagemWin(trade) {
 }
 
 function formatarMensagemStop(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
   return {
-    titulo: `🛑 Stop Loss: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `🛑 Stop Loss: ${nome}`,
     corpo: `${nome} · ${trade.signal}\n📉 Preço ${trade.currentPrice} bateu SL ${trade.stopLoss}\n⏱️ Duração: ${duracao}min · fecha a posição`,
     detalhes: {
       tipo: 'STOP', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -685,10 +731,10 @@ function formatarMensagemStop(trade) {
 }
 
 function formatarMensagemTempoEsgotado(trade) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
   return {
-    titulo: `⏱️ Tempo esgotado: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `⏱️ Tempo esgotado: ${nome}`,
     corpo: `${nome} · ${trade.signal}\n💵 Preço perto da entrada (${trade.currentPrice})\n✅ Considera fechar no breakeven`,
     detalhes: {
       tipo: 'TEMPO_ESGOTADO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -699,13 +745,13 @@ function formatarMensagemTempoEsgotado(trade) {
 }
 
 function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo) {
-  const nome = fullAssets[trade.symbol] || cleanSymbolName(trade.symbol);
+  const nome = getFriendlyName(trade.symbol);
   const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
   const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
   const pct = distanciaTotal > 0 ? ((distanciaPercorrida / distanciaTotal) * 100).toFixed(1) : '0.0';
 
   return {
-    titulo: `🕐 Encerrado por timeout: ${cleanSymbolName(trade.symbol)}`,
+    titulo: `🕐 Encerrado por timeout: ${nome}`,
     corpo: `${nome} · ${trade.signal}\n⏱️ ${tempoDecorridoMin}min sem avanço suficiente (${pct}% do alvo)\n❌ Motivo: ${motivo} · fecha a posição`,
     detalhes: {
       tipo: 'TIMEOUT', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
@@ -733,7 +779,7 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
       });
     } catch (err) { logger.error('Erro ao gravar sinal:', err.message); }
   }
-  
+
   const _openUrl = (tipo === 'SINAL_CONFIRMADO' || tipo === 'PRONTIDAO' || tipo === 'ARREFECIMENTO')
     ? '/?open=signals'
     : '/';
@@ -759,7 +805,7 @@ async function buscarSinalAnalise(symbol, mode) {
       headers: { 'x-admin-key': adminKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ symbol, mode })
     });
-        if (!response.ok) {
+    if (!response.ok) {
       const texto = await response.text();
       logger.error(`❌ Erro HTTP ${response.status} ao buscar ${symbol}: ${texto}`);
       return null;
@@ -779,8 +825,9 @@ async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers) {
       if (!t) return;
       if (Date.now() - t.timestamp > 2 * 60 * 1000) return;
 
+      const nomeAmigavel = getFriendlyName(symbol);
       await sendPushToWatchers(watchers, {
-        title: `🚨 Lembrete: ${cleanSymbolName(symbol)}`,
+        title: `🚨 Lembrete: ${nomeAmigavel}`,
         body: `Sinal ${t.signal} ainda ativo — entrada ${t.entry} · TP ${t.takeProfit} · SL ${t.stopLoss}\n⚡ Se não recebeste o sinal anterior, entra agora`,
         tag: `${symbol}_${mode}_SINAL_CONFIRMADO_RETRY`,
         data: { symbol, mode, tipo: 'SINAL_CONFIRMADO_RETRY', url: '/' }
@@ -796,7 +843,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
   const dados = await buscarSinalAnalise(symbol, mode);
   if (!dados || !dados.success) return;
 
-  // ⭐ DEBUG — remover depois de diagnosticar
   logger.info(`🔬 [RX] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} suggestion=${dados.suggestion?.action}`);
 
   const agora = Date.now();
@@ -899,7 +945,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         logger.info(`⏭️ Anti-duplicado: sinal já emitido nos últimos 5min para ${symbol}/${mode} — a saltar`);
         return;
       }
-       } catch (err) {
+    } catch (err) {
       logger.warn(`Anti-duplicado indisponível (índice?): ${err.message}`);
     }
   }
@@ -926,8 +972,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         extensoes: 0,
         percentualNoUltimoCheck: 0
       };
-     
-            tradesAbertos.set(tradeKey, novoTrade);
+
+      tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
 
       logger.info(`🚀 [ENTRAR AGORA] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | score ${dados.consolidated.score}`);
@@ -949,7 +995,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         logger.error(`❌ FALHA AO ENVIAR SINAL_CONFIRMADO ${symbol} (${mode}): ${errSinal.message}\n${errSinal.stack || ''}`);
       }
 
-      _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers);   // ⭐ NOVO — retry após 30s
+      _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers);
 
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
@@ -971,12 +1017,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const ultimoEnvio = prontidaoUltimoEnvio.get(tradeKey) || 0;
     const podeEnviarAgora = (agora - ultimoEnvio) >= cfg.cooldownMs;
 
-    // ⭐ NOVO — Verifica cooldown GLOBAL (mesmo símbolo noutros modos)
     const ultimoGlobal = prontidaoGlobalPorSymbol.get(symbol) || 0;
     const podeEnviarGlobal = (agora - ultimoGlobal) >= PRONTIDAO_GLOBAL_COOLDOWN_MS;
 
-    // Só envia PRONTIDAO se: (a) nunca foi enviado OU (b) já passou o cooldown do modo
-    // E também (c) já passou o cooldown global do símbolo
     if ((!prontidaoAtiva.has(tradeKey) || podeEnviarAgora) && podeEnviarGlobal) {
       const direcaoPrep = extrairDirecaoPrep(dados);
       if (direcaoPrep) {
@@ -989,7 +1032,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         );
         prontidaoAtiva.add(tradeKey);
         prontidaoUltimoEnvio.set(tradeKey, agora);
-        prontidaoGlobalPorSymbol.set(symbol, agora);   // ⭐ NOVO
+        prontidaoGlobalPorSymbol.set(symbol, agora);
         prontidaoForaContagem.set(tradeKey, 0);
         persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
       }
@@ -1076,24 +1119,6 @@ cron.schedule('* * * * *', async () => {
     cronEmExecucao = false;
   }
 }, { timezone: 'America/Sao_Paulo' });
-
-// ========== MAPEAMENTO DE ATIVOS ==========
-const assetGroups = {
-  'Cestas de Moedas': ['WLDAUD', 'WLDEUR', 'WLDGBP', 'WLDXAU', 'WLDUSD'],
-  'Forex': ['frxAUDCAD', 'frxAUDCHF', 'frxAUDJPY', 'frxAUDNZD', 'frxAUDUSD', 'frxEURCAD', 'frxEURCHF', 'frxEURAUD', 'frxEURGBP', 'frxEURJPY', 'frxEURNZD', 'frxEURUSD', 'frxGBPAUD', 'frxGBPCAD', 'frxGBPCHF', 'frxGBPJPY', 'frxGBPNOK', 'frxGBPNZD', 'frxGBPUSD', 'frxNZDJPY', 'frxNZDUSD', 'frxUSDCAD', 'frxUSDCHF', 'frxUSDJPY', 'frxUSDMXN', 'frxUSDNOK', 'frxUSDPLN', 'frxUSDSEK', 'frxGBPPLN'],
-  'Metais': ['frxXAUUSD', 'frxXAGUSD', 'frxXPDUSD', 'frxXPTUSD'],
-  'Índices Sintéticos': ['RDBEAR', 'RDBULL', 'RB100', 'RB200', 'stpRNG', 'stpRNG2', 'stpRNG3', 'stpRNG4', 'stpRNG5', 'R_10', 'R_25', 'R_50', 'R_75', 'R_90', 'R_100', '1HZ10V', '1HZ15V', '1HZ25V', '1HZ30V', '1HZ50V', '1HZ75V', '1HZ90V', '1HZ100V', '1HZ150V', '1HZ250V'],
-  'Índices OTC': ['OTC_AS51', 'OTC_SX5E', 'OTC_FCHI', 'OTC_GDAXI', 'OTC_AEX', 'OTC_FTSE', 'OTC_SPC', 'OTC_NDX', 'OTC_DJI', 'OTC_HSI', 'OTC_N225', 'OTC_SSMI'],
-  'Criptomoedas': ['cryBTCUSD', 'cryETHUSD', 'cryLTCUSD', 'cryBCHUSD', 'cryBNBUSD', 'cryDSHUSD', 'cryIOTUSD', 'cryNEOUSD', 'cryTRXUSD', 'cryXLMUSD', 'cryXMRUSD', 'cryXRPUSD', 'cryZECUSD', 'cryBTCETH', 'cryBTCLTC']
-};
-const fullAssets = {
-  WLDAUD: 'Dólar Australiano (Cesta)', WLDEUR: 'Euro (Cesta)', WLDGBP: 'Libra Esterlina (Cesta)', WLDXAU: 'Ouro (Cesta)', WLDUSD: 'Dólar Americano (Cesta)',
-  frxAUDCAD: 'AUD/CAD', frxAUDCHF: 'AUD/CHF', frxAUDJPY: 'AUD/JPY', frxAUDNZD: 'AUD/NZD', frxAUDUSD: 'AUD/USD', frxEURCAD: 'EUR/CAD', frxEURCHF: 'EUR/CHF', frxEURAUD: 'EUR/AUD', frxEURGBP: 'EUR/GBP', frxEURJPY: 'EUR/JPY', frxEURNZD: 'EUR/NZD', frxEURUSD: 'EUR/USD', frxGBPAUD: 'GBP/AUD', frxGBPCAD: 'GBP/CAD', frxGBPCHF: 'GBP/CHF', frxGBPJPY: 'GBP/JPY', frxGBPNOK: 'GBP/NOK', frxGBPNZD: 'GBP/NZD', frxGBPUSD: 'GBP/USD', frxNZDJPY: 'NZD/JPY', frxNZDUSD: 'NZD/USD', frxUSDCAD: 'USD/CAD', frxUSDCHF: 'USD/CHF', frxUSDJPY: 'USD/JPY', frxUSDMXN: 'USD/MXN', frxUSDNOK: 'USD/NOK', frxUSDPLN: 'USD/PLN', frxUSDSEK: 'USD/SEK', frxGBPPLN: 'GBP/PLN',
-  frxXAUUSD: 'XAU/USD', frxXAGUSD: 'XAG/USD', frxXPDUSD: 'XPD/USD', frxXPTUSD: 'XPT/USD',
-  RDBEAR: 'RD Bear', RDBULL: 'RD Bull', RB100: 'RB 100', RB200: 'RB 200', stpRNG: 'STP RNG', stpRNG2: 'STP RNG 2', stpRNG3: 'STP RNG 3', stpRNG4: 'STP RNG 4', stpRNG5: 'STP RNG 5', R_10: 'R_10', R_25: 'R_25', R_50: 'R_50', R_75: 'R_75', R_90: 'R_90', R_100: 'R_100', '1HZ10V': '1HZ 10V', '1HZ15V': '1HZ 15V', '1HZ25V': '1HZ 25V', '1HZ30V': '1HZ 30V', '1HZ50V': '1HZ 50V', '1HZ75V': '1HZ 75V', '1HZ90V': '1HZ 90V', '1HZ100V': '1HZ 100V', '1HZ150V': '1HZ 150V', '1HZ250V': '1HZ 250V',
-  OTC_AS51: 'OTC AS51', OTC_SX5E: 'OTC SX5E', OTC_FCHI: 'OTC FCHI', OTC_GDAXI: 'OTC GDAXI', OTC_AEX: 'OTC AEX', OTC_FTSE: 'OTC FTSE', OTC_SPC: 'OTC SPC', OTC_NDX: 'OTC NDX', OTC_DJI: 'OTC DJI', OTC_HSI: 'OTC HSI', OTC_N225: 'OTC N225', OTC_SSMI: 'OTC SSMI',
-  cryBTCUSD: 'BTC/USD', cryETHUSD: 'ETH/USD', cryLTCUSD: 'LTC/USD', cryBCHUSD: 'BCH/USD', cryBNBUSD: 'BNB/USD', cryDSHUSD: 'DSH/USD', cryIOTUSD: 'IOT/USD', cryNEOUSD: 'NEO/USD', cryTRXUSD: 'TRX/USD', cryXLMUSD: 'XLM/USD', cryXMRUSD: 'XMR/USD', cryXRPUSD: 'XRP/USD', cryZECUSD: 'ZEC/USD', cryBTCETH: 'BTC/ETH', cryBTCLTC: 'BTC/LTC'
-};
 
 // ========== API ENDPOINTS ==========
 
@@ -1280,12 +1305,12 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
       const batchResults = await Promise.allSettled(batch.map(async (symbol) => {
         const data = await buscarSinalAnalise(symbol, mode);
         if (!data || !data.success) {
-          return { symbol, name: fullAssets[symbol] || symbol, signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
+          return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
         }
         const consolidated = data.consolidated || {};
         return {
           symbol,
-          name: fullAssets[symbol] || symbol,
+          name: getFriendlyName(symbol),
           signal: consolidated.signal || 'HOLD',
           zona: consolidated.zona || '?',
           score: consolidated.score || 0,
@@ -1327,12 +1352,12 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
     }));
     res.json({ signals });
   } catch (err) {
-  logger.error(`Erro ao buscar sinais: ${err.message}`);
-  res.status(500).json({ error: err.message });
-}
+    logger.error(`Erro ao buscar sinais: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// ⭐ NOVO — Limpar histórico de sinais do utilizador (remove tokenHash dos watchers)
+// ⭐ Limpar histórico de sinais do utilizador (remove tokenHash dos watchers)
 app.delete('/api/signals', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   const mode = req.query.mode || null;
