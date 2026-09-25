@@ -283,6 +283,17 @@ window.doLogout=async function(){
 };
 function initDashboard(token){
   if(token)localStorage.setItem('authToken',token);
+
+  // ⭐ Abre direto no Painel de Sinais se vier de uma notificação
+  try {
+    var _params = new URLSearchParams(window.location.search);
+    if (_params.get('open') === 'signals') {
+      setTimeout(function() {
+        if (typeof window.openSignalsModal === 'function') window.openSignalsModal();
+        if (history.replaceState) history.replaceState({}, '', '/');
+      }, 500);
+    }
+  } catch(e) {}
   if(isTWA()){var sec=document.getElementById('install-section');if(sec)sec.style.display='none';}
   showDashboard();registerServiceWorker().then(updatePushButtonState);if(isStandalonePWA()){setTimeout(async function(){try{var r=await navigator.serviceWorker.ready;var sub=await r.pushManager.getSubscription();if(sub){await apiMain('/api/push/subscribe',{method:'POST',body:JSON.stringify({subscription:sub})}).catch(function(){});}}catch(e){}},2500);}initScanSelects();loadUserPlan();refreshScanPlanInfo();setTimeout(function(){refreshStats();},400);if(statusRefreshInterval)clearInterval(statusRefreshInterval);statusRefreshInterval=setInterval(function(){refreshStats();},15000);}
 async function validateTokenOnStartup(tk){if(!tk||typeof tk!=='string'||tk.length<4)return false;if(isTokenExpired(tk))return false;try{var r=await fetch('/api/user-me',{headers:{'Authorization':'Bearer '+tk}});return r.ok;}catch(e){return true;}}
@@ -522,8 +533,63 @@ window.installApp=async function(){
     showToast('Use o menu do navegador → "Instalar app"','info');
   }
 };
-class SplashController{constructor(){this.ls=document.getElementById('logo-screen');this.ss=document.getElementById('splash-screen');this.lm=document.getElementById('loadingMessage');this.msgs=['Inicializando criptografia...','Conectando ao servidor seguro...','Carregando sistema de validação...','Sistema de login pronto!'];this.i=0;}next(){if(this.i<this.msgs.length){if(this.lm)this.lm.textContent=this.msgs[this.i];this.i++;setTimeout(()=>this.next(),800);}}start(){var self=this;setTimeout(function(){if(self.ls)self.ls.style.opacity='0';setTimeout(function(){if(self.ls)self.ls.style.display='none';if(self.ss)self.ss.style.opacity='1';setTimeout(()=>self.next(),500);setTimeout(function(){if(self.ss)self.ss.style.opacity='0';setTimeout(function(){if(self.ss)self.ss.style.display='none';var tk=localStorage.getItem('authToken');console.log('[TraderBOT] authToken em storage:',tk?(tk.slice(0,8)+'... ('+tk.length+' chars)'):'NULO');if(tk){validateTokenOnStartup(tk).then(function(ok){if(ok){initDashboard(tk);}else{localStorage.removeItem('authToken');showLoginScreen();}});}else{showLoginScreen();}},800);},4500);},1800);},6500);}}
-document.addEventListener('DOMContentLoaded',function(){
+class SplashController {
+  constructor() {
+    this.ls = document.getElementById('logo-screen');
+    this.ss = document.getElementById('splash-screen');
+    this.lm = document.getElementById('loadingMessage');
+    this.msgs = ['Inicializando...', 'Conectando...', 'Pronto!'];
+    this.i = 0;
+  }
+  next() {
+    if (this.i < this.msgs.length) {
+      if (this.lm) this.lm.textContent = this.msgs[this.i];
+      this.i++;
+      setTimeout(() => this.next(), 400);
+    }
+  }
+  _finalizar() {
+    var tk = localStorage.getItem('authToken');
+    if (tk) {
+      validateTokenOnStartup(tk).then(function(ok){
+        if (ok) { initDashboard(tk); }
+        else { localStorage.removeItem('authToken'); showLoginScreen(); }
+      });
+    } else {
+      showLoginScreen();
+    }
+  }
+  start() {
+    var self = this;
+
+    // ⭐ Se já viu o splash nesta sessão, salta tudo
+    if (sessionStorage.getItem('splash_shown')) {
+      if (this.ls) this.ls.style.display = 'none';
+      if (this.ss) this.ss.style.display = 'none';
+      this._finalizar();
+      return;
+    }
+    sessionStorage.setItem('splash_shown', '1');
+
+    // ⭐ Splash reduzido — ~3 segundos total
+    setTimeout(function() {
+      if (self.ls) self.ls.style.opacity = '0';
+      setTimeout(function() {
+        if (self.ls) self.ls.style.display = 'none';
+        if (self.ss) self.ss.style.opacity = '1';
+        setTimeout(() => self.next(), 200);
+        setTimeout(function() {
+          if (self.ss) self.ss.style.opacity = '0';
+          setTimeout(function() {
+            if (self.ss) self.ss.style.display = 'none';
+            self._finalizar();
+          }, 400);
+        }, 1200);
+      }, 500);
+    }, 800);
+  }
+}
+    document.addEventListener('DOMContentLoaded',function(){
 document.querySelectorAll('a,button,label,.social-link,.manual-btn,.menu-action-btn').forEach(function(el){el.addEventListener('touchstart',function(){},{passive:true});});
 document.addEventListener('contextmenu',function(e){
   var t=e.target;
@@ -589,5 +655,14 @@ try{if(screen.orientation&&screen.orientation.lock){screen.orientation.lock('por
 }});
 });
 window.logout=logout;window.openSideMenu=openSideMenu;window.closeSideMenu=closeSideMenu;window.openManual=openManual;window.closeManual=closeManual;
+// ⭐ Escuta mensagens do service worker para abrir o painel de sinais
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', function(e) {
+    if (e.data && e.data.action === 'openSignals') {
+      if (typeof window.openSignalsModal === 'function') window.openSignalsModal();
+    }
+  });
+}
+    
 })();
 </script></body></html>
