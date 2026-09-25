@@ -1,6 +1,6 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
-// v2.8 — nomes amigáveis em todos os sinais/push/histórico
+// v2.9 — h4_timing incluído no fallback de direção (BALEEIRO)
 
 import express from 'express';
 import cors from 'cors';
@@ -148,7 +148,6 @@ async function sendPushToWatchers(watchers, payload) {
 }
 
 // ========== MAPEAMENTO DE ATIVOS (nomes amigáveis) ==========
-// ⭐ Movido para cima para estar disponível em cleanSymbolName
 const assetGroups = {
   'Cestas de Moedas': ['WLDAUD', 'WLDEUR', 'WLDGBP', 'WLDXAU', 'WLDUSD'],
   'Forex': ['frxAUDCAD', 'frxAUDCHF', 'frxAUDJPY', 'frxAUDNZD', 'frxAUDUSD', 'frxEURCAD', 'frxEURCHF', 'frxEURAUD', 'frxEURGBP', 'frxEURJPY', 'frxEURNZD', 'frxEURUSD', 'frxGBPAUD', 'frxGBPCAD', 'frxGBPCHF', 'frxGBPJPY', 'frxGBPNOK', 'frxGBPNZD', 'frxGBPUSD', 'frxNZDJPY', 'frxNZDUSD', 'frxUSDCAD', 'frxUSDCHF', 'frxUSDJPY', 'frxUSDMXN', 'frxUSDNOK', 'frxUSDPLN', 'frxUSDSEK', 'frxGBPPLN'],
@@ -159,46 +158,37 @@ const assetGroups = {
 };
 
 const fullAssets = {
-  // Cestas
   WLDAUD: 'AUD Basket', WLDEUR: 'EUR Basket', WLDGBP: 'GBP Basket', WLDXAU: 'Gold Basket', WLDUSD: 'USD Basket',
-  // Forex
   frxAUDCAD: 'AUD/CAD', frxAUDCHF: 'AUD/CHF', frxAUDJPY: 'AUD/JPY', frxAUDNZD: 'AUD/NZD', frxAUDUSD: 'AUD/USD',
   frxEURCAD: 'EUR/CAD', frxEURCHF: 'EUR/CHF', frxEURAUD: 'EUR/AUD', frxEURGBP: 'EUR/GBP', frxEURJPY: 'EUR/JPY',
   frxEURNZD: 'EUR/NZD', frxEURUSD: 'EUR/USD', frxGBPAUD: 'GBP/AUD', frxGBPCAD: 'GBP/CAD', frxGBPCHF: 'GBP/CHF',
   frxGBPJPY: 'GBP/JPY', frxGBPNOK: 'GBP/NOK', frxGBPNZD: 'GBP/NZD', frxGBPUSD: 'GBP/USD', frxNZDJPY: 'NZD/JPY',
   frxNZDUSD: 'NZD/USD', frxUSDCAD: 'USD/CAD', frxUSDCHF: 'USD/CHF', frxUSDJPY: 'USD/JPY', frxUSDMXN: 'USD/MXN',
   frxUSDNOK: 'USD/NOK', frxUSDPLN: 'USD/PLN', frxUSDSEK: 'USD/SEK', frxGBPPLN: 'GBP/PLN',
-  // Metais (nomes bonitos)
   frxXAUUSD: 'Gold/USD', frxXAGUSD: 'Silver/USD', frxXPDUSD: 'Palladium/USD', frxXPTUSD: 'Platinum/USD',
-  // Índices Sintéticos
   RDBEAR: 'Bear Market Index', RDBULL: 'Bull Market Index', RB100: 'Range Break 100', RB200: 'Range Break 200',
   stpRNG: 'Step Index', stpRNG2: 'Step 200', stpRNG3: 'Step 300', stpRNG4: 'Step 400', stpRNG5: 'Step 500',
   R_10: 'Volatility 10', R_25: 'Volatility 25', R_50: 'Volatility 50', R_75: 'Volatility 75', R_90: 'Volatility 90', R_100: 'Volatility 100',
   '1HZ10V': 'Volatility 10 (1s)', '1HZ15V': 'Volatility 15 (1s)', '1HZ25V': 'Volatility 25 (1s)', '1HZ30V': 'Volatility 30 (1s)',
   '1HZ50V': 'Volatility 50 (1s)', '1HZ75V': 'Volatility 75 (1s)', '1HZ90V': 'Volatility 90 (1s)', '1HZ100V': 'Volatility 100 (1s)',
   '1HZ150V': 'Volatility 150 (1s)', '1HZ250V': 'Volatility 250 (1s)',
-  // Índices OTC
   OTC_AS51: 'Australia 200', OTC_SX5E: 'Euro 50', OTC_FCHI: 'France 40', OTC_GDAXI: 'Germany 40',
   OTC_AEX: 'Netherlands 25', OTC_FTSE: 'UK 100', OTC_SPC: 'US 500', OTC_NDX: 'US Tech 100',
   OTC_DJI: 'Wall Street 30', OTC_HSI: 'Hong Kong 50', OTC_N225: 'Japan 225', OTC_SSMI: 'Swiss 20',
-  // Criptomoedas
   cryBTCUSD: 'Bitcoin/USD', cryETHUSD: 'Ethereum/USD', cryLTCUSD: 'Litecoin/USD', cryBCHUSD: 'Bitcoin Cash/USD',
   cryBNBUSD: 'Binance Coin/USD', cryDSHUSD: 'Dash/USD', cryIOTUSD: 'IOTA/USD', cryNEOUSD: 'Neo/USD',
   cryTRXUSD: 'TRON/USD', cryXLMUSD: 'Stellar/USD', cryXMRUSD: 'Monero/USD', cryXRPUSD: 'Ripple/USD',
   cryZECUSD: 'Zcash/USD', cryBTCETH: 'BTC/ETH', cryBTCLTC: 'BTC/LTC'
 };
 
-// ⭐ NOVO — sempre devolve o nome amigável se existir
 function cleanSymbolName(symbol) {
   if (!symbol || typeof symbol !== 'string') return '?';
   if (fullAssets[symbol]) return fullAssets[symbol];
-  // Fallback: limpar prefixos técnicos
   let nome = symbol.replace('frx', '').replace('cry', '').replace('OTC_', '');
   if (nome.length === 6) nome = nome.slice(0, 3) + '/' + nome.slice(3);
   return nome;
 }
 
-// Helper: sempre prefere o nome bonito do fullAssets
 function getFriendlyName(symbol) {
   if (!symbol) return '?';
   return fullAssets[symbol] || cleanSymbolName(symbol);
@@ -329,10 +319,8 @@ function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
 }
 
-// ⭐ Cooldown GLOBAL por símbolo (evita spam do mesmo ativo em vários modos)
-const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000; // 10 min
+const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000;
 
-// ⭐ Timeout variável por modo
 const TRADE_TIMEOUT_POR_MODO_MS = {
   'SNIPER':   20 * 60 * 1000,
   'CAÇADOR':  90 * 60 * 1000,
@@ -554,6 +542,7 @@ async function loadStateFromFirestore() {
   }
 }
 
+// 🔴 ALTERAÇÃO v2.9: adicionado h4_timing ao fallback (trigger do BALEEIRO)
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
@@ -565,8 +554,9 @@ function extrairDirecaoPrep(dados) {
     if (/Tendência de fundo:\s*BAIXA|Tendência assumida:\s*(DOWN|BAIXA)|reversão para DOWN/i.test(razaoTrend)) return 'PUT';
   }
 
+  // 🔴 v2.9: h4_timing incluído — é o triggerTF do BALEEIRO
   const sinais = [];
-  for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing']) {
+  for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing', 'h4_timing']) {
     const s = dados.consolidated[tf]?.sinal;
     if (s === 'PUT' || s === 'CALL') sinais.push(s);
   }
@@ -584,7 +574,7 @@ function diagnosticoProximidade(reasons) {
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
-// ========== FORMATAÇÃO DE MENSAGENS (títulos com nomes amigáveis) ==========
+// ========== FORMATAÇÃO DE MENSAGENS ==========
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
@@ -817,7 +807,6 @@ async function buscarSinalAnalise(symbol, mode) {
   }
 }
 
-// ⭐ Reenvia o SINAL_CONFIRMADO 30s depois para garantir entrega em caso de hibernação
 async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers) {
   setTimeout(async () => {
     try {
@@ -1357,7 +1346,6 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
   }
 });
 
-// ⭐ Limpar histórico de sinais do utilizador (remove tokenHash dos watchers)
 app.delete('/api/signals', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   const mode = req.query.mode || null;
