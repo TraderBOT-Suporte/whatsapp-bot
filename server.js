@@ -733,11 +733,15 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
       });
     } catch (err) { logger.error('Erro ao gravar sinal:', err.message); }
   }
+  
+  const _openUrl = (tipo === 'SINAL_CONFIRMADO' || tipo === 'PRONTIDAO' || tipo === 'ARREFECIMENTO')
+    ? '/?open=signals'
+    : '/';
   await sendPushToWatchers(watchers, {
     title: titulo,
     body: corpo,
     tag: `${symbol}_${mode}_${tipo}`,
-    data: { symbol, mode, tipo, url: '/' }
+    data: { symbol, mode, tipo, url: _openUrl }
   });
 }
 
