@@ -6,6 +6,10 @@
 //         com níveis EARLY (formação) e MATURE (perto de entrar)
 // v2.12 — Limiares de Score configuráveis por utilizador (por modo)
 //         (endpoints /api/user-preferences + filtro individual por watcher)
+// v2.13 — diagnosticoProximidade e formatarMensagemPrep reconhecem
+//         bloqueios de micro timing (FIX #47) e micro contra tendência
+// v2.14 — FILTRO EXTREMO: ignora PRONTIDAO e SINAL_CONFIRMADO quando
+//         DeMarker/RSI estão em zona de perigo (mercado esticado)
 
 import express from 'express';
 import cors from 'cors';
@@ -325,7 +329,6 @@ function getProntidaoConfig(mode) {
 }
 
 // ⭐ NOVO v2.11 — score mínimo para disparar PRONTIDAO por modo
-// (permite avisar ANTES de chegar à Zona B)
 const SCORE_PRONTIDAO_MIN = {
   SNIPER:   25,
   'CAÇADOR': 28,
@@ -356,7 +359,7 @@ const DEFAULT_PREFS = {
   BALEEIRO:  { scoreEarly: 35, scoreMature: 48 }
 };
 
-const prefsCache = new Map(); // tokenHash -> { prefs, expiresAt }
+const prefsCache = new Map();
 const PREFS_CACHE_TTL = 5 * 60 * 1000;
 
 function sanitizePrefs(raw) {
@@ -644,14 +647,68 @@ function extrairDirecaoPrep(dados) {
   return null;
 }
 
+// ⭐ v2.13 — reconhece bloqueio de micro timing e micro contra tendência
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
-  if (/ADX muito fraco/i.test(texto)) return { nivel: 'LONGE', detalhe: 'macro sem força' };
+
+  // ⛔ 1) DeMarker extremo global (multi-TF / anulação)
   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
   }
-  if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(texto)) return { nivel: 'PERTO', detalhe: 'gatilho em ajuste' };
+
+  // ⛔ 2) Micro timing bloqueou (FIX #47 / FIX #41 / FIX #44)
+  if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'micro timing contra — aguarda alinhar' };
+  }
+
+  // ⛔ 3) Micro timing explicitamente contra tendência
+  if (/\(micro timing\) está contra a tendência/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'micro timing contra a tendência' };
+  }
+
+  // 💤 4) Macro fraca
+  if (/ADX muito fraco/i.test(texto)) {
+    return { nivel: 'LONGE', detalhe: 'macro sem força' };
+  }
+
+  // ⏳ 5) Em ajuste — ainda NÃO bloqueado, mas ainda não entrou
+  if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'gatilho em ajuste' };
+  }
+
+  // 📊 6) Neutro
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
+}
+
+// ⭐ v2.14 — FILTRO EXTREMO: deteta mercado esticado (DeM/RSI em perigo)
+function avaliarEsticamento(reasons) {
+  const texto = (reasons || []).join(' ');
+  const alertas = [];
+
+  // DeMarker extremo — sobrecompra / sobrevenda
+  if (/DeMarker\s+0\.[7-9]\d/i.test(texto) || /DeMarker.*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
+  if (/DeMarker\s+0\.[0-2]\d/i.test(texto) || /DeMarker.*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
+
+  // RSI extremo (>=75 CALL / <=25 PUT)
+  if (/RSI\s+(7[5-9]|8\d|9\d)\b/i.test(texto)) alertas.push('RSI extremo alto');
+  if (/RSI\s+([0-9]|1\d|2[0-5])\b/i.test(texto)) alertas.push('RSI extremo baixo');
+
+  // RSI zona alta/baixa (menos grave, mas ajuda)
+  if (/RSI.*zona alta/i.test(texto)) alertas.push('RSI zona alta');
+  if (/RSI.*zona baixa/i.test(texto)) alertas.push('RSI zona baixa');
+
+  // DeMarker em zona perigosa
+  if (/DeMarker\s+0\.6[5-9]/i.test(texto)) alertas.push('DeM a esticar');
+  if (/DeMarker\s+0\.3[0-5]/i.test(texto)) alertas.push('DeM a esticar (baixo)');
+
+  // Nível de esticamento
+  if (alertas.length >= 2) {
+    return { esticado: true, nivel: 'ALTO', motivo: alertas.slice(0, 3).join(' · ') };
+  }
+  if (alertas.length === 1) {
+    return { esticado: true, nivel: 'MÉDIO', motivo: alertas[0] };
+  }
+  return { esticado: false, nivel: 'BAIXO', motivo: 'mercado saudável' };
 }
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
@@ -670,15 +727,25 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
     emoji = '🔥';
     proximidade = 'PERTO DE ENTRAR';
     detalhe = 'setup quase confirmado — prepara a entrada';
-  } else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) {
+  }
+  else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) {
     emoji = '⛔';
     proximidade = 'BLOQUEADO';
     detalhe = 'mercado em extremo — aguarda normalizar';
-  } else if (/ADX muito fraco/i.test(reasons)) {
+  } else if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(reasons)) {
+    emoji = '🚫';
+    proximidade = 'BLOQUEADO';
+    detalhe = 'micro timing contra — aguarda alinhar';
+  } else if (/\(micro timing\) está contra a tendência/i.test(reasons)) {
+    emoji = '🚫';
+    proximidade = 'BLOQUEADO';
+    detalhe = 'micro timing contra a tendência';
+  }
+  else if (/ADX muito fraco/i.test(reasons)) {
     emoji = '💤';
     proximidade = 'LONGE';
     detalhe = 'tendência macro sem força';
-  } else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(reasons)) {
+  } else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(reasons)) {
     emoji = '👀';
     proximidade = 'EM FORMAÇÃO';
     detalhe = 'gatilho em ajuste — prepara-te';
@@ -1053,6 +1120,17 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
   if (dados.consolidated.signal !== 'HOLD' && dados.consolidated.zona === 'A') {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
+
+      // ⭐ v2.14 — FILTRO EXTREMO: não envia SINAL_CONFIRMADO se mercado está esticado
+      const esticSinal = avaliarEsticamento(dados.consolidated.score_reasons);
+      if (esticSinal.esticado && esticSinal.nivel === 'ALTO') {
+        logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) SINAL_CONFIRMADO ignorado — ${esticSinal.motivo}`);
+        prontidaoAtiva.delete(tradeKey);
+        prontidaoHistorico.delete(tradeKey);
+        prontidaoForaContagem.delete(tradeKey);
+        return;
+      }
+
       const novoTrade = {
         symbol,
         mode,
@@ -1105,11 +1183,19 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       removePersistedProntidao(tradeKey);
     }
   }
-  // ⭐ v2.11 + v2.12: PRONTIDAO com limiares configuráveis por utilizador
+  // ⭐ v2.11 + v2.12 + v2.14: PRONTIDAO com limiares configuráveis e filtro extremo
   else if (dados.consolidated.signal === 'HOLD'
         && (dados.consolidated.zona === 'B'
          || dados.consolidated.zona === 'C')) {
     const scoreAtual = dados.consolidated.score || 0;
+
+    // ⭐ v2.14 — FILTRO EXTREMO: não avisa prontidão se mercado está esticado
+    const estic = avaliarEsticamento(dados.consolidated.score_reasons);
+    if (estic.esticado && estic.nivel === 'ALTO') {
+      logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) PRONTIDAO ignorada — ${estic.motivo}`);
+      prontidaoForaContagem.delete(tradeKey);
+      return;
+    }
 
     // ⭐ v2.12: carregar preferências de cada watcher (com cache)
     const prefsPorWatcher = new Map();
@@ -1153,7 +1239,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         const matureTks = [];
         for (const tk of watchers) {
           const p = prefsPorWatcher.get(tk) || DEFAULT_PREFS[mode];
-          if (scoreAtual < p.scoreEarly) continue; // ainda não quer aviso
+          if (scoreAtual < p.scoreEarly) continue;
           if (scoreAtual >= p.scoreMature) matureTks.push(tk);
           else earlyTks.push(tk);
         }
@@ -1496,6 +1582,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           zona: consolidated.zona || '?',
           score: consolidated.score || 0,
           proximidade: diagnosticoProximidade(consolidated.score_reasons),
+          esticamento: avaliarEsticamento(consolidated.score_reasons),
           reasons: (consolidated.score_reasons || []).slice(0, 3)
         };
       }));
@@ -1684,7 +1771,8 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`🚀 Servidor rodando na porta ${PORT}`);
   logger.info(`Firebase: ${firebaseInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
-  logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis`);
+  logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
+  logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
   await loadStateFromFirestore();
 });
 
