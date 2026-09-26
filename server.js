@@ -1,7 +1,11 @@
 // ===================== server.js (Painel de Sinais) =====================
 // Motor de análise + Web Push + histórico de sinais no Firestore.
-// v2.9 — h4_timing incluído no fallback de direção (BALEEIRO)
+// v2.9  — h4_timing incluído no fallback de direção (BALEEIRO)
 // v2.10 — diagnosticoProximidade reconhece bloqueio DeMarker extremo
+// v2.11 — PRONTIDAO agora dispara em Zona B E Zona C (aviso antecipado)
+//         com níveis EARLY (formação) e MATURE (perto de entrar)
+// v2.12 — Limiares de Score configuráveis por utilizador (por modo)
+//         (endpoints /api/user-preferences + filtro individual por watcher)
 
 import express from 'express';
 import cors from 'cors';
@@ -320,6 +324,80 @@ function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
 }
 
+// ⭐ NOVO v2.11 — score mínimo para disparar PRONTIDAO por modo
+// (permite avisar ANTES de chegar à Zona B)
+const SCORE_PRONTIDAO_MIN = {
+  SNIPER:   25,
+  'CAÇADOR': 28,
+  PESCADOR: 30,
+  BALEEIRO: 35
+};
+
+// ⭐ NOVO v2.11 — score a partir do qual já consideramos "PERTO DE ENTRAR"
+const SCORE_QUASE_ENTRADA = {
+  SNIPER:   40,
+  'CAÇADOR': 42,
+  PESCADOR: 45,
+  BALEEIRO: 48
+};
+
+function getScoreProntidaoMin(mode) {
+  return SCORE_PRONTIDAO_MIN[mode] || 30;
+}
+function getScoreQuaseEntrada(mode) {
+  return SCORE_QUASE_ENTRADA[mode] || 40;
+}
+
+// ⭐ NOVO v2.12 — Preferências por utilizador (limiares configuráveis)
+const DEFAULT_PREFS = {
+  SNIPER:    { scoreEarly: 25, scoreMature: 40 },
+  'CAÇADOR': { scoreEarly: 28, scoreMature: 42 },
+  PESCADOR:  { scoreEarly: 30, scoreMature: 45 },
+  BALEEIRO:  { scoreEarly: 35, scoreMature: 48 }
+};
+
+const prefsCache = new Map(); // tokenHash -> { prefs, expiresAt }
+const PREFS_CACHE_TTL = 5 * 60 * 1000;
+
+function sanitizePrefs(raw) {
+  const out = {};
+  for (const mode of MODOS_OK) {
+    const d = DEFAULT_PREFS[mode];
+    const p = raw?.[mode] || {};
+    const se = Math.max(0, Math.min(60, parseInt(p.scoreEarly, 10) || d.scoreEarly));
+    const sm = Math.max(se + 5, Math.min(95, parseInt(p.scoreMature, 10) || d.scoreMature));
+    out[mode] = { scoreEarly: se, scoreMature: sm };
+  }
+  return out;
+}
+
+async function getUserPreferences(tokenHash) {
+  if (!tokenHash) return sanitizePrefs({});
+  if (!firebaseInitialized) return sanitizePrefs({});
+  const cached = prefsCache.get(tokenHash);
+  if (cached && cached.expiresAt > Date.now()) return cached.prefs;
+  try {
+    const doc = await db.collection('user_preferences').doc(tokenHash).get();
+    const prefs = sanitizePrefs(doc.exists ? doc.data() : {});
+    prefsCache.set(tokenHash, { prefs, expiresAt: Date.now() + PREFS_CACHE_TTL });
+    return prefs;
+  } catch (err) {
+    logger.error('Erro getUserPreferences:', err.message);
+    return sanitizePrefs({});
+  }
+}
+
+async function saveUserPreferences(tokenHash, raw) {
+  if (!firebaseInitialized) throw new Error('Firestore indisponível');
+  const sanitized = sanitizePrefs(raw);
+  await db.collection('user_preferences').doc(tokenHash).set({
+    ...sanitized,
+    atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
+  }, { merge: true });
+  prefsCache.delete(tokenHash);
+  return sanitized;
+}
+
 const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000;
 
 const TRADE_TIMEOUT_POR_MODO_MS = {
@@ -543,7 +621,6 @@ async function loadStateFromFirestore() {
   }
 }
 
-// 🔴 ALTERAÇÃO v2.9: adicionado h4_timing ao fallback (trigger do BALEEIRO)
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
@@ -555,7 +632,6 @@ function extrairDirecaoPrep(dados) {
     if (/Tendência de fundo:\s*BAIXA|Tendência assumida:\s*(DOWN|BAIXA)|reversão para DOWN/i.test(razaoTrend)) return 'PUT';
   }
 
-  // 🔴 v2.9: h4_timing incluído — é o triggerTF do BALEEIRO
   const sinais = [];
   for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing', 'h4_timing']) {
     const s = dados.consolidated[tf]?.sinal;
@@ -568,11 +644,9 @@ function extrairDirecaoPrep(dados) {
   return null;
 }
 
-// ⭐ v2.10: reconhece bloqueio por DeMarker extremo (novo comportamento do motor)
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
   if (/ADX muito fraco/i.test(texto)) return { nivel: 'LONGE', detalhe: 'macro sem força' };
-  // ⭐ BLOQUEADO: DeMarker extremo em TF(s) → não está "perto", está bloqueado
   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
   }
@@ -581,29 +655,53 @@ function diagnosticoProximidade(reasons) {
 }
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
+
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
-  const score = dados.consolidated.score;
+  const score = extras.scoreAtual ?? dados.consolidated.score;
+  const scoreQuase = extras.scoreQuase ?? 40;
+  const nivel = extras.nivelProntidao || 'EARLY';
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
-  let proximidade, detalhe;
-  // ⭐ v2.10: mesma lógica do diagnosticoProximidade (bloqueio DeMarker extremo)
-  if (/ADX muito fraco/i.test(reasons)) {
-    proximidade = 'LONGE'; detalhe = 'tendência macro sem força';
+
+  let proximidade, detalhe, emoji;
+
+  if (nivel === 'MATURE') {
+    emoji = '🔥';
+    proximidade = 'PERTO DE ENTRAR';
+    detalhe = 'setup quase confirmado — prepara a entrada';
   } else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) {
-    proximidade = 'BLOQUEADO'; detalhe = 'mercado em extremo — aguarda normalizar';
+    emoji = '⛔';
+    proximidade = 'BLOQUEADO';
+    detalhe = 'mercado em extremo — aguarda normalizar';
+  } else if (/ADX muito fraco/i.test(reasons)) {
+    emoji = '💤';
+    proximidade = 'LONGE';
+    detalhe = 'tendência macro sem força';
   } else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento/i.test(reasons)) {
-    proximidade = 'PERTO'; detalhe = 'gatilho em ajuste';
+    emoji = '👀';
+    proximidade = 'EM FORMAÇÃO';
+    detalhe = 'gatilho em ajuste — prepara-te';
   } else {
-    proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento';
+    emoji = '📊';
+    proximidade = 'EM FORMAÇÃO';
+    detalhe = 'aguardando alinhamento';
   }
 
+  const prefixoTitulo = nivel === 'MATURE'
+    ? `🔥 Perto de entrar: ${nomeAmigavel}`
+    : `👀 Em formação: ${nomeAmigavel}`;
+
   return {
-    titulo: `👀 Atenção: ${nomeAmigavel}`,
-    corpo: `${dirLabel} · ${nomeAmigavel}\n⚡ Score ${score}/100 · Zona B · ${proximidade}\n💡 ${detalhe}`,
+    titulo: prefixoTitulo,
+    corpo: `${dirLabel} · ${nomeAmigavel}\n⚡ Score ${score}/100 · ${proximidade}\n💡 ${detalhe}`,
     detalhes: {
-      tipo: 'PRONTIDAO', nomeAmigavel, direcao, modo: extras.mode || null,
-      score, zona: 'B', proximidade, detalhe,
+      tipo: 'PRONTIDAO',
+      nomeAmigavel, direcao, modo: extras.mode || null,
+      score, zona: dados.consolidated.zona,
+      proximidade, detalhe,
+      nivelProntidao: nivel,
+      scoreQuase,
       reasons: (dados.consolidated.score_reasons || []).slice(0, 8),
       price: dados.consolidated.price
     }
@@ -1007,10 +1105,33 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       removePersistedProntidao(tradeKey);
     }
   }
-  else if (dados.consolidated.signal === 'HOLD' && dados.consolidated.zona === 'B') {
+  // ⭐ v2.11 + v2.12: PRONTIDAO com limiares configuráveis por utilizador
+  else if (dados.consolidated.signal === 'HOLD'
+        && (dados.consolidated.zona === 'B'
+         || dados.consolidated.zona === 'C')) {
+    const scoreAtual = dados.consolidated.score || 0;
+
+    // ⭐ v2.12: carregar preferências de cada watcher (com cache)
+    const prefsPorWatcher = new Map();
+    for (const tk of watchers) {
+      const prefs = await getUserPreferences(tk);
+      prefsPorWatcher.set(tk, prefs[mode] || DEFAULT_PREFS[mode]);
+    }
+
+    // Se não há watchers com prefs, usa fallback global
+    const scoreGlobalMin = prefsPorWatcher.size > 0
+      ? Math.min(...Array.from(prefsPorWatcher.values()).map(p => p.scoreEarly))
+      : getScoreProntidaoMin(mode);
+
+    // Zona C só entra se pelo menos 1 watcher quer (score >= seu mínimo)
+    if (dados.consolidated.zona === 'C' && scoreAtual < scoreGlobalMin) {
+      prontidaoForaContagem.delete(tradeKey);
+      return;
+    }
+
     prontidaoForaContagem.delete(tradeKey);
     const historico = prontidaoHistorico.get(tradeKey) || [];
-    historico.push({ score: dados.consolidated.score, t: agora });
+    historico.push({ score: scoreAtual, t: agora });
     if (historico.length > 5) historico.shift();
     prontidaoHistorico.set(tradeKey, historico);
     persistProntidao(tradeKey, historico, prontidaoAtiva.has(tradeKey));
@@ -1026,17 +1147,52 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       const direcaoPrep = extrairDirecaoPrep(dados);
       if (direcaoPrep) {
         const subindo = historico.length >= 3 && historico[historico.length - 1].score > historico[0].score;
-        await registrarEEnviarSinal(
-          symbol, mode, 'PRONTIDAO',
-          formatarMensagemPrep(symbol, direcaoPrep, dados, { subindo, historico, mode }),
-          { score: dados.consolidated.score },
-          watchers
-        );
-        prontidaoAtiva.add(tradeKey);
-        prontidaoUltimoEnvio.set(tradeKey, agora);
-        prontidaoGlobalPorSymbol.set(symbol, agora);
-        prontidaoForaContagem.set(tradeKey, 0);
-        persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
+
+        // ⭐ v2.12: separar watchers por nível (EARLY / MATURE)
+        const earlyTks = [];
+        const matureTks = [];
+        for (const tk of watchers) {
+          const p = prefsPorWatcher.get(tk) || DEFAULT_PREFS[mode];
+          if (scoreAtual < p.scoreEarly) continue; // ainda não quer aviso
+          if (scoreAtual >= p.scoreMature) matureTks.push(tk);
+          else earlyTks.push(tk);
+        }
+
+        // Enviar MATURE primeiro (mais relevante)
+        if (matureTks.length > 0) {
+          await registrarEEnviarSinal(
+            symbol, mode, 'PRONTIDAO',
+            formatarMensagemPrep(symbol, direcaoPrep, dados, {
+              subindo, historico, mode,
+              nivelProntidao: 'MATURE',
+              scoreAtual,
+              scoreQuase: scoreAtual
+            }),
+            { score: scoreAtual, nivelProntidao: 'MATURE' },
+            matureTks
+          );
+        }
+        if (earlyTks.length > 0) {
+          await registrarEEnviarSinal(
+            symbol, mode, 'PRONTIDAO',
+            formatarMensagemPrep(symbol, direcaoPrep, dados, {
+              subindo, historico, mode,
+              nivelProntidao: 'EARLY',
+              scoreAtual,
+              scoreQuase: 999
+            }),
+            { score: scoreAtual, nivelProntidao: 'EARLY' },
+            earlyTks
+          );
+        }
+
+        if (matureTks.length > 0 || earlyTks.length > 0) {
+          prontidaoAtiva.add(tradeKey);
+          prontidaoUltimoEnvio.set(tradeKey, agora);
+          prontidaoGlobalPorSymbol.set(symbol, agora);
+          prontidaoForaContagem.set(tradeKey, 0);
+          persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
+        }
       }
     }
   }
@@ -1171,6 +1327,29 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
     tag: 'teste_' + Date.now()
   });
   res.json({ success: true });
+});
+
+// ⭐ NOVO v2.12 — Endpoints de preferências de limiares
+app.get('/api/user-preferences', authMiddleware, async (req, res) => {
+  try {
+    const preferences = await getUserPreferences(req.user.tokenHash);
+    res.json({ success: true, preferences, defaults: DEFAULT_PREFS });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/user-preferences', authMiddleware, async (req, res) => {
+  try {
+    const { preferences } = req.body || {};
+    if (!preferences || typeof preferences !== 'object') {
+      return res.status(400).json({ error: 'preferences obrigatório' });
+    }
+    const saved = await saveUserPreferences(req.user.tokenHash, preferences);
+    res.json({ success: true, preferences: saved });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/user-me', authMiddleware, (req, res) => {
@@ -1505,6 +1684,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`🚀 Servidor rodando na porta ${PORT}`);
   logger.info(`Firebase: ${firebaseInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
+  logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis`);
   await loadStateFromFirestore();
 });
 
