@@ -232,17 +232,27 @@ async function loadSignals(){
     c.innerHTML='<div style="text-align:center;padding:30px;color:var(--rose);font-size:13px">'+escapeHtml(err.message)+'</div>';
   }
 }
+/* ⭐ v2.8 — Mostra TODOS os tipos de sinal no filtro (mesmo os com 0) */
 function buildTypeFilterOptions(signals){
   if(!signalsTypeFilter)return;
   var counts={};
   signals.forEach(function(s){var t=(s.tipo||'OUTRO');counts[t]=(counts[t]||0)+1;});
   var opts=[{value:'',label:'📊 Todos ('+signals.length+')'}];
-  Object.keys(counts).sort(function(a,b){return counts[b]-counts[a];}).forEach(function(t){
+  var todosTipos=Object.keys(SIGNAL_TYPE_LABELS);
+  Object.keys(counts).forEach(function(t){
+    if(todosTipos.indexOf(t)===-1)todosTipos.push(t);
+  });
+  todosTipos.sort(function(a,b){
+    var ca=counts[a]||0,cb=counts[b]||0;
+    if(cb!==ca)return cb-ca;
+    return a.localeCompare(b);
+  });
+  todosTipos.forEach(function(t){
     var lab=SIGNAL_TYPE_LABELS[t]||t.replace(/_/g,' ');
-    opts.push({value:t,label:lab+' ('+counts[t]+')'});
+    var qtd=counts[t]||0;
+    opts.push({value:t,label:lab+' ('+qtd+')'});
   });
   var current=signalsTypeFilter.getValue()||'';
-  if(current&&!counts[current])current='';
   signalsTypeFilter.setOptions(opts,current);
 }
 function renderSignalsList(){
