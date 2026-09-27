@@ -1,13 +1,28 @@
 {
   "name": "painel-sinais",
-  "version": "1.0.0",
+  "version": "2.14.0",
+  "private": true,
   "type": "module",
-  "description": "Painel web de análise de ativos e notificações push de sinais (sem WhatsApp)",
+  "description": "Painel web de análise de ativos, motor de sinais e notificações push em tempo real (PWA)",
   "main": "server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "start": "node server.js",
+    "dev": "node --watch server.js",
     "generate-vapid-keys": "web-push generate-vapid-keys"
   },
+  "keywords": [
+    "trading",
+    "sinais",
+    "pwa",
+    "web-push",
+    "firebase",
+    "analysis"
+  ],
+  "author": "Trader BOT Technologies",
+  "license": "UNLICENSED",
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
