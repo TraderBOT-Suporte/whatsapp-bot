@@ -216,7 +216,7 @@ window.clearModeWatchlist=async function(mode){if(!await window.appConfirm('Remo
 var signalsModeFilter=null;
 var signalsTypeFilter=null;
 var _allSignals=[];
-var SIGNAL_TYPE_LABELS={'SINAL_CONFIRMADO':'🚨 Sinal Confirmado','PRONTIDAO':'👀 Prontidão','WIN':'🎯 WIN','STOP':'🛑 STOP','TIMEOUT':'🕐 Timeout','TEMPO_ESGOTADO':'⏱️ Tempo Esgotado','ARREFECIMENTO':'😴 Arrefecimento','SEGUINDO':'✅ Seguindo','ZERO_RISCO':'🛡️ Zero Risco','QUASE_LA':'⏳ Quase Lá','ACELERACAO':'🚀 Aceleração','5MIN':'⏱️ 5min','SINAL_CONFIRMADO_RETRY':'🔁 Lembrete'};
+var SIGNAL_TYPE_LABELS={'SINAL_CONFIRMADO':'🚨 Sinal Confirmado','PRONTIDAO':'👀 Prontidão','WIN':'🎯 WIN','STOP':'🛑 STOP','TIMEOUT':'🕐 Timeout','TEMPO_ESGOTADO':'⏱️ Tempo Esgotado','ARREFECIMENTO':'😴 Arrefecimento','SEGUINDO':'✅ Seguindo','ZERO_RISCO':'🛡️ Zero Risco','QUASE_LA':'⏳ Quase Lá','ACELERACAO':'🚀 Aceleração','5MIN':'⏱️ 5min','SINAL_CONFIRMADO_RETRY':'🔁 Lembrete','EXAUSTAO':'⚠️ Exaustão'};
 function initSignalsFilter(){
   if(signalsModeFilter)return;
   signalsModeFilter=new CustomSelect({wrapperId:'signals-mode-filter-wrapper',placeholder:'Todos os modos',onChange:function(){loadSignals();}});
