@@ -13,6 +13,12 @@
 // v2.15 — Reconhece no diagnóstico os bloqueios do servidor de análise:
 //         FIX #40b (hist a desacelerar), FIX #50/#52 (Zona A rebaixada),
 //         FIX #51 (structure esticada). avaliarEsticamento aceita "DeM".
+// v2.16 — FIX #56: alerta de EXAUSTÃO durante trade aberto
+//         (avisa para fechar antes do SL quando DeM/RSI ficam extremos
+//         contra a direcção do trade, entre 10% e 50% do alvo).
+//         FIX #57: cooldown dinâmico pós-trade — reduz para 3-5min
+//         quando mercado está pronto (zona A + mercado saudável),
+//         aumenta para 15min quando esticado.
 
 import express from 'express';
 import cors from 'cors';
@@ -533,6 +539,8 @@ async function persistTradeUpdate(tradeKey, trade) {
       avisoAceleracaoEnviado: trade.avisoAceleracaoEnviado,
       avisoTempoEsgotadoEnviado: trade.avisoTempoEsgotadoEnviado,
       aviso5MinEnviado: trade.aviso5MinEnviado,
+      // ⭐ FIX #56: persistir flag de exaustão
+      avisoExaustaoEnviado: trade.avisoExaustaoEnviado,
       timeoutAt: trade.timeoutAt,
       extensoes: trade.extensoes,
       percentualNoUltimoCheck: trade.percentualNoUltimoCheck,
@@ -729,6 +737,35 @@ function avaliarEsticamento(reasons) {
     return { esticado: true, nivel: 'MÉDIO', motivo: alertas[0] };
   }
   return { esticado: false, nivel: 'BAIXO', motivo: 'mercado saudável' };
+}
+
+// ⭐ FIX #57 (v2.16) — calcular cooldown dinâmico pós-trade
+// Regras:
+//   WIN + zona A + score >=60 + mercado saudável    → 3min (reentrada rápida)
+//   STOP + zona A + score >=55 + mercado saudável   → 5min
+//   TIMEOUT em pullback ativo                       → 4min
+//   Mercado esticado (nível ALTO)                   → 15min (proteção)
+//   Caso contrário                                  → 10min (default)
+function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
+  const COOLDOWN_DEFAULT = COOLDOWN_POS_TRADE_MS;
+  const zona = dados?.consolidated?.zona || 'C';
+  const score = dados?.consolidated?.score || 0;
+  const reasons = (dados?.consolidated?.score_reasons || []).join(' ');
+  const estic = esticPreCalculado || avaliarEsticamento(dados?.consolidated?.score_reasons);
+
+  if (estic.esticado && estic.nivel === 'ALTO') {
+    return 15 * 60 * 1000;
+  }
+  if (tipoFecho === 'WIN' && zona === 'A' && score >= 60 && !estic.esticado) {
+    return 3 * 60 * 1000;
+  }
+  if (tipoFecho === 'STOP' && zona === 'A' && score >= 55 && !estic.esticado) {
+    return 5 * 60 * 1000;
+  }
+  if (tipoFecho === 'TIMEOUT' && /pullback/i.test(reasons)) {
+    return 4 * 60 * 1000;
+  }
+  return COOLDOWN_DEFAULT;
 }
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
@@ -948,6 +985,29 @@ function formatarMensagemTempoEsgotado(trade) {
   };
 }
 
+// ⭐ FIX #56 (v2.16) — alerta de exaustão durante trade aberto
+function formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, motivo) {
+  const nome = getFriendlyName(trade.symbol);
+  const pct = (percentualPercorrido * 100).toFixed(1);
+  return {
+    titulo: `⚠️ Exaustão detetada: ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n📉 Tendência a perder força — ${motivo}\n💡 Considera fechar ANTES do SL tocar (${pct}% do alvo · ${tempoDecorridoMin}min)`,
+    detalhes: {
+      tipo: 'EXAUSTAO',
+      nomeAmigavel: nome,
+      direcao: trade.signal,
+      modo: trade.mode,
+      entry: trade.entry,
+      currentPrice,
+      takeProfit: trade.takeProfit,
+      stopLoss: trade.stopLoss,
+      motivo,
+      percentualPercorrido: pct + '%',
+      duracao: tempoDecorridoMin + 'min'
+    }
+  };
+}
+
 function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo) {
   const nome = getFriendlyName(trade.symbol);
   const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
@@ -984,7 +1044,7 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
     } catch (err) { logger.error('Erro ao gravar sinal:', err.message); }
   }
 
-  const _openUrl = (tipo === 'SINAL_CONFIRMADO' || tipo === 'PRONTIDAO' || tipo === 'ARREFECIMENTO')
+  const _openUrl = (tipo === 'SINAL_CONFIRMADO' || tipo === 'PRONTIDAO' || tipo === 'ARREFECIMENTO' || tipo === 'EXAUSTAO')
     ? '/?open=signals'
     : '/';
   await sendPushToWatchers(watchers, {
@@ -1062,6 +1122,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
   if (trade) {
     trade.currentPrice = currentPrice;
+    // ⭐ FIX #56/#57 (v2.16) — cache de esticamento para o ciclo atual
+    const esticTradeCache = avaliarEsticamento(dados.consolidated.score_reasons);
 
     const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
     const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
@@ -1097,8 +1159,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
         tradesAbertos.delete(tradeKey);
         removePersistedTrade(tradeKey);
-        cooldownPosTrade.set(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
-        persistCooldown(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
+
+        // ⭐ FIX #57 (v2.16) — cooldown dinâmico após TIMEOUT
+        const cdMsTimeout = calcularCooldownDinamico('TIMEOUT', dados, esticTradeCache);
+        cooldownPosTrade.set(tradeKey, agora + cdMsTimeout);
+        persistCooldown(tradeKey, agora + cdMsTimeout);
+        logger.info(`⏱️ [FIX #57] Cooldown TIMEOUT → ${Math.round(cdMsTimeout/60000)}min | ${symbol} (${mode})`);
         return;
       }
     }
@@ -1111,6 +1177,27 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     else if (trade.signal === 'PUT' && currentPrice <= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
     else if (trade.signal === 'CALL' && currentPrice <= trade.stopLoss) { msgObj = formatarMensagemStop(trade); tipo = 'STOP'; fecharTrade = true; }
     else if (trade.signal === 'PUT' && currentPrice >= trade.stopLoss) { msgObj = formatarMensagemStop(trade); tipo = 'STOP'; fecharTrade = true; }
+    // ⭐ FIX #56 (v2.16) — exaustão ANTES do TEMPO_ESGOTADO
+    else if (!trade.avisoExaustaoEnviado && percentualPercorrido >= 0.10 && percentualPercorrido < 0.50) {
+      const contraDirecao =
+        (trade.signal === 'CALL' && /sobrecompra|RSI extremo alto|RSI.*zona alta|DeM a esticar/i.test(esticTradeCache.motivo)) ||
+        (trade.signal === 'PUT'  && /sobrevenda|RSI extremo baixo|RSI.*zona baixa|DeM a esticar \(baixo\)/i.test(esticTradeCache.motivo));
+
+      if (esticTradeCache.esticado && esticTradeCache.nivel === 'ALTO' && contraDirecao) {
+        msgObj = formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, esticTradeCache.motivo);
+        tipo = 'EXAUSTAO';
+        trade.avisoExaustaoEnviado = true;
+        logger.info(`⚠️ [FIX #56] Exaustão em ${tradeKey} | ${esticTradeCache.motivo} | ${(percentualPercorrido*100).toFixed(1)}% do alvo`);
+      } else {
+        // Não houve exaustão — continuar cadeia normal
+        if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
+        else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
+        else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
+        else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
+        else if (!trade.avisoZeroRiscoEnviado && percentualPercorrido >= 0.50) { msgObj = formatarMensagemZeroRisco(trade); tipo = 'ZERO_RISCO'; trade.avisoZeroRiscoEnviado = true; }
+        else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
+      }
+    }
     else if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
     else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
     else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
@@ -1121,8 +1208,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     if (fecharTrade) {
       tradesAbertos.delete(tradeKey);
       removePersistedTrade(tradeKey);
-      cooldownPosTrade.set(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
-      persistCooldown(tradeKey, agora + COOLDOWN_POS_TRADE_MS);
+
+      // ⭐ FIX #57 (v2.16) — cooldown dinâmico após fecho
+      const cdMs = calcularCooldownDinamico(tipo, dados, esticTradeCache);
+      cooldownPosTrade.set(tradeKey, agora + cdMs);
+      persistCooldown(tradeKey, agora + cdMs);
+      logger.info(`⏱️ [FIX #57] Cooldown ${tipo} → ${Math.round(cdMs/60000)}min | ${symbol} (${mode})`);
     } else {
       persistTradeUpdate(tradeKey, trade);
     }
@@ -1182,6 +1273,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         avisoAceleracaoEnviado: false,
         avisoTempoEsgotadoEnviado: false,
         aviso5MinEnviado: false,
+        // ⭐ FIX #56 (v2.16) — flag de exaustão
+        avisoExaustaoEnviado: false,
         timeoutAt: agora + getTimeoutModo(mode),
         extensoes: 0,
         percentualNoUltimoCheck: 0
@@ -1809,7 +1902,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
   logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
   logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
-  logger.info(`v2.15: reconhece FIX #40b/#50/#51/#52 do servidor de análise no diagnóstico e na UI`);
+  logger.info(`v2.16: FIX #56 (exaustão em trade aberto) + FIX #57 (cooldown dinâmico) ativos`);
   await loadStateFromFirestore();
 });
 
