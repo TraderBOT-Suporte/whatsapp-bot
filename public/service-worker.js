@@ -3,7 +3,7 @@
 //        Badge ativo (silhueta branca do logo).
 //        + Notifica janelas abertas quando chega push (auto-refresh do painel).
 
-const CACHE_NAME = 'painel-sinais-v12';
+const CACHE_NAME = 'painel-sinais-v13';  
 const APP_SHELL = ['/', '/index.html', '/manifest.json'];
 
 // ============ INSTALL ============
