@@ -10,6 +10,9 @@
 //         bloqueios de micro timing (FIX #47) e micro contra tendência
 // v2.14 — FILTRO EXTREMO: ignora PRONTIDAO e SINAL_CONFIRMADO quando
 //         DeMarker/RSI estão em zona de perigo (mercado esticado)
+// v2.15 — Reconhece no diagnóstico os bloqueios do servidor de análise:
+//         FIX #40b (hist a desacelerar), FIX #50/#52 (Zona A rebaixada),
+//         FIX #51 (structure esticada). avaliarEsticamento aceita "DeM".
 
 import express from 'express';
 import cors from 'cors';
@@ -648,6 +651,7 @@ function extrairDirecaoPrep(dados) {
 }
 
 // ⭐ v2.13 — reconhece bloqueio de micro timing e micro contra tendência
+// ⭐ v2.15 — reconhece também FIX #40b, #50, #51, #52 do servidor de análise
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
 
@@ -666,6 +670,21 @@ function diagnosticoProximidade(reasons) {
     return { nivel: 'BLOQUEADO', detalhe: 'micro timing contra a tendência' };
   }
 
+  // ⭐ v2.15 — FIX #40b: hist macro a desacelerar (trigger em conflito não aceite)
+  if (/\[FIX #40b\]|hist a desacelerar|trigger em conflito NÃO aceite/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'momentum a desacelerar — aguarda estabilizar' };
+  }
+
+  // ⭐ v2.15 — FIX #51: pullback bloqueado por estrutura esticada
+  if (/Pullback.*BLOQUEADO por estrutura esticada|estrutura no extremo.*aguarda correção/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'estrutura esticada — aguarda correção' };
+  }
+
+  // ⭐ v2.15 — FIX #50 / FIX #52: Zona A rebaixada por confiança baixa
+  if (/Zona A rebaixada para B|Zona final rebaixada para B/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'confiança baixa — aguarda reforço' };
+  }
+
   // 💤 4) Macro fraca
   if (/ADX muito fraco/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'macro sem força' };
@@ -681,13 +700,14 @@ function diagnosticoProximidade(reasons) {
 }
 
 // ⭐ v2.14 — FILTRO EXTREMO: deteta mercado esticado (DeM/RSI em perigo)
+// ⭐ v2.15 — aceita abreviação "DeM" usada pelos logs do servidor de análise
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
 
-  // DeMarker extremo — sobrecompra / sobrevenda
-  if (/DeMarker\s+0\.[7-9]\d/i.test(texto) || /DeMarker.*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
-  if (/DeMarker\s+0\.[0-2]\d/i.test(texto) || /DeMarker.*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
+  // DeMarker extremo — sobrecompra / sobrevenda (aceita "DeMarker" e "DeM")
+  if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
+  if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
 
   // RSI extremo (>=75 CALL / <=25 PUT)
   if (/RSI\s+(7[5-9]|8\d|9\d)\b/i.test(texto)) alertas.push('RSI extremo alto');
@@ -697,9 +717,9 @@ function avaliarEsticamento(reasons) {
   if (/RSI.*zona alta/i.test(texto)) alertas.push('RSI zona alta');
   if (/RSI.*zona baixa/i.test(texto)) alertas.push('RSI zona baixa');
 
-  // DeMarker em zona perigosa
-  if (/DeMarker\s+0\.6[5-9]/i.test(texto)) alertas.push('DeM a esticar');
-  if (/DeMarker\s+0\.3[0-5]/i.test(texto)) alertas.push('DeM a esticar (baixo)');
+  // DeMarker em zona perigosa (aceita "DeMarker" e "DeM")
+  if (/(DeMarker|DeM)\s+0\.6[5-9]/i.test(texto)) alertas.push('DeM a esticar');
+  if (/(DeMarker|DeM)\s+0\.3[0-5]/i.test(texto)) alertas.push('DeM a esticar (baixo)');
 
   // Nível de esticamento
   if (alertas.length >= 2) {
@@ -740,6 +760,22 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
     emoji = '🚫';
     proximidade = 'BLOQUEADO';
     detalhe = 'micro timing contra a tendência';
+  }
+  // ⭐ v2.15 — novos bloqueios do servidor de análise
+  else if (/\[FIX #40b\]|hist a desacelerar|trigger em conflito NÃO aceite/i.test(reasons)) {
+    emoji = '🛑';
+    proximidade = 'BLOQUEADO';
+    detalhe = 'momentum a desacelerar — aguarda estabilizar';
+  }
+  else if (/Pullback.*BLOQUEADO por estrutura esticada|estrutura no extremo.*aguarda correção/i.test(reasons)) {
+    emoji = '🛑';
+    proximidade = 'BLOQUEADO';
+    detalhe = 'estrutura esticada — aguarda correção';
+  }
+  else if (/Zona A rebaixada para B|Zona final rebaixada para B/i.test(reasons)) {
+    emoji = '👀';
+    proximidade = 'EM FORMAÇÃO';
+    detalhe = 'confiança baixa — aguarda reforço';
   }
   else if (/ADX muito fraco/i.test(reasons)) {
     emoji = '💤';
@@ -1773,6 +1809,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
   logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
   logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
+  logger.info(`v2.15: reconhece FIX #40b/#50/#51/#52 do servidor de análise no diagnóstico e na UI`);
   await loadStateFromFirestore();
 });
 
