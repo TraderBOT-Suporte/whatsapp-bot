@@ -19,6 +19,10 @@
 //         FIX #57: cooldown dinâmico pós-trade — reduz para 3-5min
 //         quando mercado está pronto (zona A + mercado saudável),
 //         aumenta para 15min quando esticado.
+// v2.17 — FIX #58: confirmação multi-TF antes de alertar exaustão.
+//         O trigger TF avisa; o TF superior (M5/M15/H4/H24) tem de
+//         confirmar com MACD invertido OU RSI extremo. Sem isso,
+//         é apenas respiração e o trade continua até TP.
 
 import express from 'express';
 import cors from 'cors';
@@ -768,6 +772,61 @@ function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
   return COOLDOWN_DEFAULT;
 }
 
+// ⭐ FIX #58 (v2.17) — Confirmação multi-TF antes de alertar exaustão
+// Se o TF superior não confirmar (MACD/RSI), é apenas respiração do trigger TF.
+// Só devolve confirmado=true quando há sinal real de reversão no TF superior.
+function confirmaExaustaoMultiTF(dados, trade) {
+  const tfs = dados?.timeframes || {};
+  const mode = trade?.mode;
+
+  const CONFIRM_TF = {
+    'SNIPER':   { trigger: 'M1',  confirm: 'M5'  },
+    'CAÇADOR':  { trigger: 'M5',  confirm: 'M15' },
+    'PESCADOR': { trigger: 'H1',  confirm: 'H4'  },
+    'BALEEIRO': { trigger: 'H4',  confirm: 'H24' }
+  };
+
+  const cfg = CONFIRM_TF[mode];
+  if (!cfg) return { confirmado: false, motivo: 'modo desconhecido' };
+
+  const confTF = tfs[cfg.confirm];
+  if (!confTF) return { confirmado: false, motivo: `${cfg.confirm} sem dados` };
+
+  const confRSI = confTF.rsi ?? 50;
+  const confStatus = confTF.macd_phase?.status || {};
+  const confHist = confTF.macd_phase?.histogram ?? null;
+  const confPrevHist = confTF.macd_phase?.prev_histogram ?? null;
+
+  const isCall = trade.signal === 'CALL';
+
+  // 1) MACD histograma invertido no TF superior (sinal mais forte)
+  const macdInvertido = isCall
+    ? confStatus.histograma === '❌ NEGATIVO'
+    : confStatus.histograma === '✅ POSITIVO';
+
+  if (macdInvertido) {
+    return { confirmado: true, motivo: `${cfg.confirm} MACD virou contra` };
+  }
+
+  // 2) RSI extremo no TF superior
+  const rsiExtremo = isCall ? confRSI >= 75 : confRSI <= 25;
+  if (rsiExtremo) {
+    return { confirmado: true, motivo: `${cfg.confirm} RSI ${confRSI.toFixed(0)} extremo` };
+  }
+
+  // 3) Histograma a encolher para <=60% + RSI próximo extremo
+  const histEncolhendo = (confHist != null && confPrevHist != null && confPrevHist !== 0)
+    ? Math.abs(confHist) < Math.abs(confPrevHist) * 0.60
+    : false;
+
+  if (histEncolhendo && (isCall ? confRSI >= 68 : confRSI <= 32)) {
+    return { confirmado: true, motivo: `${cfg.confirm} hist a encolher + RSI ${confRSI.toFixed(0)}` };
+  }
+
+  // Sem confirmação → é apenas respiração
+  return { confirmado: false, motivo: `${cfg.confirm} ainda suporta (RSI ${confRSI.toFixed(0)})` };
+}
+
 // ========== FORMATAÇÃO DE MENSAGENS ==========
 
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
@@ -1182,14 +1241,32 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       const contraDirecao =
         (trade.signal === 'CALL' && /sobrecompra|RSI extremo alto|RSI.*zona alta|DeM a esticar/i.test(esticTradeCache.motivo)) ||
         (trade.signal === 'PUT'  && /sobrevenda|RSI extremo baixo|RSI.*zona baixa|DeM a esticar \(baixo\)/i.test(esticTradeCache.motivo));
-
       if (esticTradeCache.esticado && esticTradeCache.nivel === 'ALTO' && contraDirecao) {
-        msgObj = formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, esticTradeCache.motivo);
-        tipo = 'EXAUSTAO';
-        trade.avisoExaustaoEnviado = true;
-        logger.info(`⚠️ [FIX #56] Exaustão em ${tradeKey} | ${esticTradeCache.motivo} | ${(percentualPercorrido*100).toFixed(1)}% do alvo`);
+        // ⭐ FIX #58 (v2.17) — só dispara se TF superior confirmar
+        const confirmacao = confirmaExaustaoMultiTF(dados, trade);
+
+        if (confirmacao.confirmado) {
+          msgObj = formatarMensagemExaustao(
+            trade, currentPrice, tempoDecorridoMin, percentualPercorrido,
+            `${esticTradeCache.motivo} · ${confirmacao.motivo}`
+          );
+          tipo = 'EXAUSTAO';
+          trade.avisoExaustaoEnviado = true;
+          logger.info(`⚠️ [FIX #56+#58] Exaustão CONFIRMADA em ${tradeKey} | ${esticTradeCache.motivo} | ${confirmacao.motivo} | ${(percentualPercorrido*100).toFixed(1)}% do alvo`);
+        } else {
+          // Sem confirmação do TF superior → é respiração.
+          // NÃO marca avisoExaustaoEnviado → pode disparar mais tarde se confirmar.
+          logger.info(`💨 [FIX #58] ${tradeKey} trigger esticado mas ${confirmacao.motivo} — aguarda confirmação`);
+          // Cadeia normal de avisos continua sem marcar exaustão
+          if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
+          else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
+          else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
+          else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
+          else if (!trade.avisoZeroRiscoEnviado && percentualPercorrido >= 0.50) { msgObj = formatarMensagemZeroRisco(trade); tipo = 'ZERO_RISCO'; trade.avisoZeroRiscoEnviado = true; }
+          else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
+        }
       } else {
-        // Não houve exaustão — continuar cadeia normal
+        // Não houve trigger esticado — continuar cadeia normal
         if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
         else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
         else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
@@ -1902,7 +1979,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
   logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
   logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
-  logger.info(`v2.16: FIX #56 (exaustão em trade aberto) + FIX #57 (cooldown dinâmico) ativos`);
+  logger.info(`v2.17: FIX #56 (exaustão) + #57 (cooldown) + #58 (confirmação multi-TF) ativos`);
   await loadStateFromFirestore();
 });
 
