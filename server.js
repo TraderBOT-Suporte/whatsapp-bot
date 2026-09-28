@@ -638,32 +638,93 @@ async function removePersistedProntidao(tradeKey) {
   catch (err) { logger.error('Erro removePersistedProntidao:', err.message); }
 }
 
+// ⭐ PATCH 5 — flag global para saber se o arranque falhou por quota
+let _arranqueConcluido = false;
+
 async function loadStateFromFirestore() {
   if (!firebaseInitialized) {
     logger.warn('⏭️ loadStateFromFirestore: Firebase indisponível, a saltar.');
     return;
   }
-  try {
-    // ⭐ OTIMIZAÇÃO #2 — restaurar anti-duplicado em memória (1 única query no arranque)
-    try {
-      const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
-      const recentes = await db.collection('signals')
-        .where('tipo', '==', 'SINAL_CONFIRMADO')
-        .where('criadoEm', '>=', cincoMinAtras)
-        .get();
-      recentes.docs.forEach(d => {
-        const data = d.data();
-        if (data.symbol && data.mode) {
-          const ts = data.criadoEm?.toDate?.()?.getTime?.() || Date.now();
-          ultimoSinalPorPar.set(`${data.symbol}_${data.mode}`, ts);
-        }
-      });
-      logger.info(`♻️ Anti-duplicado restaurado: ${recentes.size} sinal(is) recente(s)`);
-    } catch (e) {
-      logger.warn(`⚠️ Falha ao restaurar anti-duplicado: ${e.message}`);
-    }
 
-    const tradesSnap = await db.collection('open_trades').get();
+  // ⭐ PATCH 5 — detetar quota esgotada e agendar retry
+  const tentarRestauro = async (tentativa) => {
+    try {
+      // Restaurar anti-duplicado
+      try {
+        const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
+        const recentes = await db.collection('signals')
+          .where('tipo', '==', 'SINAL_CONFIRMADO')
+          .where('criadoEm', '>=', cincoMinAtras)
+          .get();
+        recentes.docs.forEach(d => {
+          const data = d.data();
+          if (data.symbol && data.mode) {
+            const ts = data.criadoEm?.toDate?.()?.getTime?.() || Date.now();
+            ultimoSinalPorPar.set(`${data.symbol}_${data.mode}`, ts);
+          }
+        });
+        logger.info(`♻️ Anti-duplicado restaurado: ${recentes.size} sinal(is) recente(s)`);
+      } catch (e) {
+        logger.warn(`⚠️ Falha ao restaurar anti-duplicado: ${e.message}`);
+      }
+
+      const tradesSnap = await db.collection('open_trades').get();
+      const agora = Date.now();
+      let tradesRestaurados = 0, tradesExpirados = 0;
+      for (const doc of tradesSnap.docs) {
+        const t = doc.data();
+        const timestampTrade = t.timestamp || 0;
+        const timeoutModo = getTimeoutModo(t.mode);
+        const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
+
+        if (agora > timeoutAt && !t.timeoutAt) {
+          t.timeoutAt = agora + 60 * 1000;
+        } else if (agora > timeoutAt) {
+          t.timeoutAt = agora + 60 * 1000;
+        }
+        if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
+        tradesAbertos.set(doc.id, t);
+        tradesRestaurados++;
+      }
+
+      const cdSnap = await db.collection('cooldowns').get();
+      let cdRestaurados = 0, cdExpirados = 0;
+      for (const doc of cdSnap.docs) {
+        const c = doc.data();
+        if (c.expiresAt && c.expiresAt > agora) { cooldownPosTrade.set(doc.id, c.expiresAt); cdRestaurados++; }
+        else { await doc.ref.delete(); cdExpirados++; }
+      }
+
+      const prSnap = await db.collection('prontidao_state').get();
+      let prRestaurados = 0;
+      for (const doc of prSnap.docs) {
+        const p = doc.data();
+        if (Array.isArray(p.historico) && p.historico.length > 0) prontidaoHistorico.set(doc.id, p.historico);
+        if (p.ativa) prontidaoAtiva.add(doc.id);
+        prRestaurados++;
+      }
+
+      logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${tradesExpirados} trade(s) expirado(s), ${cdExpirados} cooldown(s) expirado(s)`);
+      _arranqueConcluido = true;
+      return true;
+    } catch (err) {
+      logger.error(`❌ Erro ao carregar estado do Firestore (tentativa ${tentativa}): ${err.message}`);
+
+      // ⭐ PATCH 5 — se for quota esgotada, agendar retry em 30 min
+      const isQuotaError = /RESOURCE_EXHAUSTED|Quota exceeded/i.test(err.message);
+      if (isQuotaError && tentativa < 24) {
+        const proximaTentativa = tentativa + 1;
+        const espera = Math.min(30 * 60 * 1000, 5 * 60 * 1000 * Math.pow(2, tentativa - 1));
+        logger.warn(`⏳ Quota esgotada. Nova tentativa de restauro em ${Math.round(espera/60000)}min (tentativa ${proximaTentativa}/24)`);
+        setTimeout(() => tentarRestauro(proximaTentativa), espera);
+      }
+      return false;
+    }
+  };
+
+  await tentarRestauro(1);
+}
     const agora = Date.now();
     let tradesRestaurados = 0, tradesExpirados = 0;
     for (const doc of tradesSnap.docs) {
@@ -2065,8 +2126,9 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
   logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
   logger.info(`v2.19: FIX #61 — aceita SINAL em Zona A (SINAL CONFIRMADO) e Zona B (SINAL MODERADO) — tipo interno mantido`);
-  logger.info(`v2.18: FIX #56 (exaustão) + #57 (cooldown) + #58 (multi-TF) + #60 (bloquear PRONTIDAO em CHOP) ativos`);
-  await loadStateFromFirestore();
+   logger.info(`v2.18: FIX #56 (exaustão) + #57 (cooldown) + #58 (multi-TF) + #60 (bloquear PRONTIDAO em CHOP) ativos`);
+  logger.info(`v2.20: PATCH 1+2+3 (cache) + PATCH 5 (arranque resiliente a quota) ativos`);
+  loadStateFromFirestore().catch(e => logger.error('loadStateFromFirestore falhou:', e.message));
 });
 
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
