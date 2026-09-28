@@ -5,24 +5,17 @@
 // v2.11 — PRONTIDAO agora dispara em Zona B E Zona C (aviso antecipado)
 //         com níveis EARLY (formação) e MATURE (perto de entrar)
 // v2.12 — Limiares de Score configuráveis por utilizador (por modo)
-//         (endpoints /api/user-preferences + filtro individual por watcher)
-// v2.13 — diagnosticoProximidade e formatarMensagemPrep reconhecem
-//         bloqueios de micro timing (FIX #47) e micro contra tendência
-// v2.14 — FILTRO EXTREMO: ignora PRONTIDAO e SINAL_CONFIRMADO quando
-//         DeMarker/RSI estão em zona de perigo (mercado esticado)
-// v2.15 — Reconhece no diagnóstico os bloqueios do servidor de análise:
-//         FIX #40b (hist a desacelerar), FIX #50/#52 (Zona A rebaixada),
-//         FIX #51 (structure esticada). avaliarEsticamento aceita "DeM".
-// v2.16 — FIX #56: alerta de EXAUSTÃO durante trade aberto
-//         (avisa para fechar antes do SL quando DeM/RSI ficam extremos
-//         contra a direcção do trade, entre 10% e 50% do alvo).
-//         FIX #57: cooldown dinâmico pós-trade — reduz para 3-5min
-//         quando mercado está pronto (zona A + mercado saudável),
-//         aumenta para 15min quando esticado.
-// v2.18 — FIX #60: bloqueia PRONTIDAO em regime CHOP (mercado lateral).
-//         O trigger TF avisa; o TF superior (M5/M15/H4/H24) tem de
-//         confirmar com MACD invertido OU RSI extremo. Sem isso,
-//         é apenas respiração e o trade continua até TP.
+// v2.13 — diagnosticoProximidade reconhece bloqueios de micro timing
+// v2.14 — FILTRO EXTREMO: ignora PRONTIDAO/SINAL quando DeM/RSI extremos
+// v2.15 — Reconhece bloqueios FIX #40b, #50/#52, #51
+// v2.16 — FIX #56 (exaustão) + FIX #57 (cooldown dinâmico)
+// v2.18 — FIX #60: bloqueia PRONTIDAO em regime CHOP
+// v2.19 — FIX #61: aceita SINAL em Zona A **e** Zona B.
+//         Título diferenciado ("SINAL CONFIRMADO" vs "SINAL MODERADO")
+//         sem mudar o tipo interno (compatível com Firestore/anti-duplicado).
+//         Motivo: o servidor de análise já envia sinais de Zona B válidos
+//         (score alto com penalização DeMarker), mas o push ignorava-os
+//         silenciosamente — só saíam PRONTIDAO.
 
 import express from 'express';
 import cors from 'cors';
@@ -857,7 +850,6 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
     proximidade = 'BLOQUEADO';
     detalhe = 'micro timing contra a tendência';
   }
-  // ⭐ v2.15 — novos bloqueios do servidor de análise
   else if (/\[FIX #40b\]|hist a desacelerar|trigger em conflito NÃO aceite/i.test(reasons)) {
     emoji = '🛑';
     proximidade = 'BLOQUEADO';
@@ -901,7 +893,8 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
       proximidade, detalhe,
       nivelProntidao: nivel,
       scoreQuase,
-      reasons: (dados.consolidated.score_reasons || []).slice(0, 8),
+      // ⭐ v2.19 — mais razões (8 → 14)
+      reasons: (dados.consolidated.score_reasons || []).slice(0, 14),
       price: dados.consolidated.price
     }
   };
@@ -920,6 +913,7 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   };
 }
 
+// ⭐ v2.19 (FIX #61) — título diferenciado por zona, tipo interno mantido
 function formatarMensagemSinal(symbol, dados, mode) {
   const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
@@ -927,16 +921,21 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const nomeAmigavel = getFriendlyName(symbol);
   const confNum = Number(consolidated?.confidence);
   const conf = (Number.isFinite(confNum) ? (confNum * 100).toFixed(1) : '0.0');
+  const zona = consolidated.zona === 'B' ? 'B' : 'A';
+  const tituloBase = zona === 'A' ? '🚨 SINAL CONFIRMADO' : '⚡ SINAL MODERADO';
 
   return {
-    titulo: `🚨 SINAL CONFIRMADO: ${nomeAmigavel}`,
-    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}%`,
+    titulo: `${tituloBase}: ${nomeAmigavel}`,
+    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}`,
     detalhes: {
-      tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
+      // tipo interno MANTIDO — compatível com Firestore, anti-duplicado e frontend
+      tipo: 'SINAL_CONFIRMADO',
+      nomeAmigavel, direcao: consolidated.signal, modo: mode,
       entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
       score: consolidated.score, confidence: conf, price: consolidated.price,
-      reasons: (consolidated.score_reasons || []).slice(0, 8),
-      zona: 'A'
+      // ⭐ v2.19 — mais razões (8 → 14)
+      reasons: (consolidated.score_reasons || []).slice(0, 14),
+      zona
     }
   };
 }
@@ -1301,7 +1300,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     return;
   }
 
-  // ⭐ Anti-duplicado
+  // ⭐ Anti-duplicado (mantém apenas SINAL_CONFIRMADO — v2.19)
   if (firebaseInitialized) {
     try {
       const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
@@ -1321,14 +1320,16 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     }
   }
 
-  if (dados.consolidated.signal !== 'HOLD' && dados.consolidated.zona === 'A') {
+  // ⭐ v2.19 (FIX #61) — aceitar Zona A **e** Zona B
+  if (dados.consolidated.signal !== 'HOLD'
+      && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
 
-      // ⭐ v2.14 — FILTRO EXTREMO: não envia SINAL_CONFIRMADO se mercado está esticado
+      // ⭐ v2.14 — FILTRO EXTREMO: não envia se mercado está esticado
       const esticSinal = avaliarEsticamento(dados.consolidated.score_reasons);
       if (esticSinal.esticado && esticSinal.nivel === 'ALTO') {
-        logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) SINAL_CONFIRMADO ignorado — ${esticSinal.motivo}`);
+        logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) SINAL ignorado (zona ${dados.consolidated.zona}) — ${esticSinal.motivo}`);
         prontidaoAtiva.delete(tradeKey);
         prontidaoHistorico.delete(tradeKey);
         prontidaoForaContagem.delete(tradeKey);
@@ -1342,6 +1343,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         entry: dados.suggestion.entry,
         takeProfit: dados.suggestion.takeProfit,
         stopLoss: dados.suggestion.stopLoss,
+        zonaEntrada: dados.consolidated.zona,   // ⭐ v2.19 — guardar zona
         watchers: [...watchers],
         timestamp: agora,
         avisoSeguindoEnviado: false,
@@ -1360,7 +1362,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
 
-      logger.info(`🚀 [ENTRAR AGORA] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | score ${dados.consolidated.score}`);
+      const zonaTxt = dados.consolidated.zona === 'A' ? 'SINAL CONFIRMADO' : 'SINAL MODERADO';
+      logger.info(`🚀 [${zonaTxt}] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | zona ${dados.consolidated.zona} | score ${dados.consolidated.score}`);
 
       try {
         const msgSinal = formatarMensagemSinal(symbol, dados, mode);
@@ -1369,12 +1372,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', msgSinal, {
           score: dados.consolidated.score,
           confidence: dados.consolidated.confidence,
+          zona: dados.consolidated.zona,          // ⭐ v2.19 — passar zona real
           entry: dados.suggestion.entry,
           takeProfit: dados.suggestion.takeProfit,
           stopLoss: dados.suggestion.stopLoss
         }, watchers);
 
-        logger.info(`✅ [PUSH ENVIADO] ${symbol} (${mode}) → SINAL_CONFIRMADO`);
+        logger.info(`✅ [PUSH ENVIADO] ${symbol} (${mode}) → SINAL_CONFIRMADO (zona ${dados.consolidated.zona})`);
       } catch (errSinal) {
         logger.error(`❌ FALHA AO ENVIAR SINAL_CONFIRMADO ${symbol} (${mode}): ${errSinal.message}\n${errSinal.stack || ''}`);
       }
@@ -1989,6 +1993,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
   logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
   logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
+  logger.info(`v2.19: FIX #61 — aceita SINAL em Zona A (SINAL CONFIRMADO) e Zona B (SINAL MODERADO) — tipo interno mantido`);
   logger.info(`v2.18: FIX #56 (exaustão) + #57 (cooldown) + #58 (multi-TF) + #60 (bloquear PRONTIDAO em CHOP) ativos`);
   await loadStateFromFirestore();
 });
