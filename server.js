@@ -3,7 +3,6 @@
 // v2.9  — h4_timing incluído no fallback de direção (BALEEIRO)
 // v2.10 — diagnosticoProximidade reconhece bloqueio DeMarker extremo
 // v2.11 — PRONTIDAO agora dispara em Zona B E Zona C (aviso antecipado)
-//         com níveis EARLY (formação) e MATURE (perto de entrar)
 // v2.12 — Limiares de Score configuráveis por utilizador (por modo)
 // v2.13 — diagnosticoProximidade reconhece bloqueios de micro timing
 // v2.14 — FILTRO EXTREMO: ignora PRONTIDAO/SINAL quando DeM/RSI extremos
@@ -11,11 +10,8 @@
 // v2.16 — FIX #56 (exaustão) + FIX #57 (cooldown dinâmico)
 // v2.18 — FIX #60: bloqueia PRONTIDAO em regime CHOP
 // v2.19 — FIX #61: aceita SINAL em Zona A **e** Zona B.
-//         Título diferenciado ("SINAL CONFIRMADO" vs "SINAL MODERADO")
-//         sem mudar o tipo interno (compatível com Firestore/anti-duplicado).
-//         Motivo: o servidor de análise já envia sinais de Zona B válidos
-//         (score alto com penalização DeMarker), mas o push ignorava-os
-//         silenciosamente — só saíam PRONTIDAO.
+// v2.20 — OTIMIZAÇÕES: cache watchlists, anti-duplicado em memória,
+//         cache subscrições push, arranque resiliente a quota Firestore.
 
 import express from 'express';
 import cors from 'cors';
@@ -139,7 +135,7 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
 }
 
 // ⭐ OTIMIZAÇÃO #3 — cache de subscrições em memória (poupa ~2.000 reads/dia)
-const _subsCache = new Map();   // tokenHash → { subs: [...], expira }
+const _subsCache = new Map();
 const SUBS_CACHE_TTL = 5 * 60 * 1000;
 
 async function _getSubsDeToken(tokenHash) {
@@ -368,7 +364,6 @@ function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
 }
 
-// ⭐ NOVO v2.11 — score mínimo para disparar PRONTIDAO por modo
 const SCORE_PRONTIDAO_MIN = {
   SNIPER:   25,
   'CAÇADOR': 28,
@@ -376,7 +371,6 @@ const SCORE_PRONTIDAO_MIN = {
   BALEEIRO: 35
 };
 
-// ⭐ NOVO v2.11 — score a partir do qual já consideramos "PERTO DE ENTRAR"
 const SCORE_QUASE_ENTRADA = {
   SNIPER:   40,
   'CAÇADOR': 42,
@@ -391,7 +385,6 @@ function getScoreQuaseEntrada(mode) {
   return SCORE_QUASE_ENTRADA[mode] || 40;
 }
 
-// ⭐ NOVO v2.12 — Preferências por utilizador (limiares configuráveis)
 const DEFAULT_PREFS = {
   SNIPER:    { scoreEarly: 25, scoreMature: 40 },
   'CAÇADOR': { scoreEarly: 28, scoreMature: 42 },
@@ -521,7 +514,6 @@ async function getAllUserWatchlists() {
   return resultado;
 }
 
-// ⭐ OTIMIZAÇÃO #1 — invalidar cache quando user altera watchlist
 function invalidarCacheWatchlists() {
   _watchlistsCache = null;
   _watchlistsCacheExpira = 0;
@@ -539,8 +531,9 @@ function contarAtivosWatchlist(wl) {
 const tradesAbertos = new Map();
 const cooldownPosTrade = new Map();
 
-// ⭐ OTIMIZAÇÃO #2 — anti-duplicado em memória (poupa ~7.600 reads/dia)
-const ultimoSinalPorPar = new Map();   // `${symbol}_${mode}` → timestamp
+// ⭐ OTIMIZAÇÃO #2 — anti-duplicado em memória
+const ultimoSinalPorPar = new Map();
+
 const prontidaoHistorico = new Map();
 const prontidaoAtiva = new Set();
 const prontidaoForaContagem = new Map();
@@ -590,7 +583,6 @@ async function persistTradeUpdate(tradeKey, trade) {
       avisoAceleracaoEnviado: trade.avisoAceleracaoEnviado,
       avisoTempoEsgotadoEnviado: trade.avisoTempoEsgotadoEnviado,
       aviso5MinEnviado: trade.aviso5MinEnviado,
-      // ⭐ FIX #56: persistir flag de exaustão
       avisoExaustaoEnviado: trade.avisoExaustaoEnviado,
       timeoutAt: trade.timeoutAt,
       extensoes: trade.extensoes,
@@ -638,7 +630,7 @@ async function removePersistedProntidao(tradeKey) {
   catch (err) { logger.error('Erro removePersistedProntidao:', err.message); }
 }
 
-// ⭐ PATCH 5 — flag global para saber se o arranque falhou por quota
+// ⭐ PATCH 5 — arranque resiliente a quota esgotada
 let _arranqueConcluido = false;
 
 async function loadStateFromFirestore() {
@@ -647,7 +639,6 @@ async function loadStateFromFirestore() {
     return;
   }
 
-  // ⭐ PATCH 5 — detetar quota esgotada e agendar retry
   const tentarRestauro = async (tentativa) => {
     try {
       // Restaurar anti-duplicado
@@ -711,7 +702,6 @@ async function loadStateFromFirestore() {
     } catch (err) {
       logger.error(`❌ Erro ao carregar estado do Firestore (tentativa ${tentativa}): ${err.message}`);
 
-      // ⭐ PATCH 5 — se for quota esgotada, agendar retry em 30 min
       const isQuotaError = /RESOURCE_EXHAUSTED|Quota exceeded/i.test(err.message);
       if (isQuotaError && tentativa < 24) {
         const proximaTentativa = tentativa + 1;
@@ -724,46 +714,6 @@ async function loadStateFromFirestore() {
   };
 
   await tentarRestauro(1);
-}
-    const agora = Date.now();
-    let tradesRestaurados = 0, tradesExpirados = 0;
-    for (const doc of tradesSnap.docs) {
-      const t = doc.data();
-      const timestampTrade = t.timestamp || 0;
-      const timeoutModo = getTimeoutModo(t.mode);
-      const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
-
-      if (agora > timeoutAt && !t.timeoutAt) {
-        t.timeoutAt = agora + 60 * 1000;
-      } else if (agora > timeoutAt) {
-        t.timeoutAt = agora + 60 * 1000;
-      }
-      if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
-      tradesAbertos.set(doc.id, t);
-      tradesRestaurados++;
-    }
-
-    const cdSnap = await db.collection('cooldowns').get();
-    let cdRestaurados = 0, cdExpirados = 0;
-    for (const doc of cdSnap.docs) {
-      const c = doc.data();
-      if (c.expiresAt && c.expiresAt > agora) { cooldownPosTrade.set(doc.id, c.expiresAt); cdRestaurados++; }
-      else { await doc.ref.delete(); cdExpirados++; }
-    }
-
-    const prSnap = await db.collection('prontidao_state').get();
-    let prRestaurados = 0;
-    for (const doc of prSnap.docs) {
-      const p = doc.data();
-      if (Array.isArray(p.historico) && p.historico.length > 0) prontidaoHistorico.set(doc.id, p.historico);
-      if (p.ativa) prontidaoAtiva.add(doc.id);
-      prRestaurados++;
-    }
-
-    logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${tradesExpirados} trade(s) expirado(s), ${cdExpirados} cooldown(s) expirado(s)`);
-  } catch (err) {
-    logger.error('Erro ao carregar estado do Firestore:', err.message);
-  }
 }
 
 function extrairDirecaoPrep(dados) {
@@ -789,78 +739,52 @@ function extrairDirecaoPrep(dados) {
   return null;
 }
 
-// ⭐ v2.13 — reconhece bloqueio de micro timing e micro contra tendência
-// ⭐ v2.15 — reconhece também FIX #40b, #50, #51, #52 do servidor de análise
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
 
-  // ⛔ 1) DeMarker extremo global (multi-TF / anulação)
   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
   }
-
-  // ⛔ 2) Micro timing bloqueou (FIX #47 / FIX #41 / FIX #44)
   if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'micro timing contra — aguarda alinhar' };
   }
-
-  // ⛔ 3) Micro timing explicitamente contra tendência
   if (/\(micro timing\) está contra a tendência/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'micro timing contra a tendência' };
   }
-
-  // ⭐ v2.15 — FIX #40b: hist macro a desacelerar (trigger em conflito não aceite)
   if (/\[FIX #40b\]|hist a desacelerar|trigger em conflito NÃO aceite/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'momentum a desacelerar — aguarda estabilizar' };
   }
-
-  // ⭐ v2.15 — FIX #51: pullback bloqueado por estrutura esticada
   if (/Pullback.*BLOQUEADO por estrutura esticada|estrutura no extremo.*aguarda correção/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'estrutura esticada — aguarda correção' };
   }
-
-  // ⭐ v2.15 — FIX #50 / FIX #52: Zona A rebaixada por confiança baixa
   if (/Zona A rebaixada para B|Zona final rebaixada para B/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'confiança baixa — aguarda reforço' };
   }
-
-  // 💤 4) Macro fraca
   if (/ADX muito fraco/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'macro sem força' };
   }
-
-  // ⏳ 5) Em ajuste — ainda NÃO bloqueado, mas ainda não entrou
   if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'gatilho em ajuste' };
   }
-
-  // 📊 6) Neutro
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
-// ⭐ v2.14 — FILTRO EXTREMO: deteta mercado esticado (DeM/RSI em perigo)
-// ⭐ v2.15 — aceita abreviação "DeM" usada pelos logs do servidor de análise
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
 
-  // DeMarker extremo — sobrecompra / sobrevenda (aceita "DeMarker" e "DeM")
   if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
   if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
 
-  // RSI extremo (>=75 CALL / <=25 PUT)
   if (/RSI\s+(7[5-9]|8\d|9\d)\b/i.test(texto)) alertas.push('RSI extremo alto');
   if (/RSI\s+([0-9]|1\d|2[0-5])\b/i.test(texto)) alertas.push('RSI extremo baixo');
 
-  // RSI zona alta/baixa (menos grave, mas ajuda)
   if (/RSI.*zona alta/i.test(texto)) alertas.push('RSI zona alta');
   if (/RSI.*zona baixa/i.test(texto)) alertas.push('RSI zona baixa');
 
-  // DeMarker em zona perigosa (aceita "DeMarker" e "DeM")
   if (/(DeMarker|DeM)\s+0\.6[5-9]/i.test(texto)) alertas.push('DeM a esticar');
   if (/(DeMarker|DeM)\s+0\.3[0-5]/i.test(texto)) alertas.push('DeM a esticar (baixo)');
 
-  // Nível de esticamento
   if (alertas.length >= 2) {
     return { esticado: true, nivel: 'ALTO', motivo: alertas.slice(0, 3).join(' · ') };
   }
@@ -870,13 +794,6 @@ function avaliarEsticamento(reasons) {
   return { esticado: false, nivel: 'BAIXO', motivo: 'mercado saudável' };
 }
 
-// ⭐ FIX #57 (v2.16) — calcular cooldown dinâmico pós-trade
-// Regras:
-//   WIN + zona A + score >=60 + mercado saudável    → 3min (reentrada rápida)
-//   STOP + zona A + score >=55 + mercado saudável   → 5min
-//   TIMEOUT em pullback ativo                       → 4min
-//   Mercado esticado (nível ALTO)                   → 15min (proteção)
-//   Caso contrário                                  → 10min (default)
 function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
   const COOLDOWN_DEFAULT = COOLDOWN_POS_TRADE_MS;
   const zona = dados?.consolidated?.zona || 'C';
@@ -899,9 +816,6 @@ function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
   return COOLDOWN_DEFAULT;
 }
 
-// ⭐ FIX #58 (v2.17) — Confirmação multi-TF antes de alertar exaustão
-// Se o TF superior não confirmar (MACD/RSI), é apenas respiração do trigger TF.
-// Só devolve confirmado=true quando há sinal real de reversão no TF superior.
 function confirmaExaustaoMultiTF(dados, trade) {
   const tfs = dados?.timeframes || {};
   const mode = trade?.mode;
@@ -926,7 +840,6 @@ function confirmaExaustaoMultiTF(dados, trade) {
 
   const isCall = trade.signal === 'CALL';
 
-  // 1) MACD histograma invertido no TF superior (sinal mais forte)
   const macdInvertido = isCall
     ? confStatus.histograma === '❌ NEGATIVO'
     : confStatus.histograma === '✅ POSITIVO';
@@ -935,13 +848,11 @@ function confirmaExaustaoMultiTF(dados, trade) {
     return { confirmado: true, motivo: `${cfg.confirm} MACD virou contra` };
   }
 
-  // 2) RSI extremo no TF superior
   const rsiExtremo = isCall ? confRSI >= 75 : confRSI <= 25;
   if (rsiExtremo) {
     return { confirmado: true, motivo: `${cfg.confirm} RSI ${confRSI.toFixed(0)} extremo` };
   }
 
-  // 3) Histograma a encolher para <=60% + RSI próximo extremo
   const histEncolhendo = (confHist != null && confPrevHist != null && confPrevHist !== 0)
     ? Math.abs(confHist) < Math.abs(confPrevHist) * 0.60
     : false;
@@ -950,7 +861,6 @@ function confirmaExaustaoMultiTF(dados, trade) {
     return { confirmado: true, motivo: `${cfg.confirm} hist a encolher + RSI ${confRSI.toFixed(0)}` };
   }
 
-  // Sem confirmação → é apenas respiração
   return { confirmado: false, motivo: `${cfg.confirm} ainda suporta (RSI ${confRSI.toFixed(0)})` };
 }
 
@@ -1027,7 +937,6 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
       proximidade, detalhe,
       nivelProntidao: nivel,
       scoreQuase,
-      // ⭐ v2.19 — mais razões (8 → 14)
       reasons: (dados.consolidated.score_reasons || []).slice(0, 14),
       price: dados.consolidated.price
     }
@@ -1047,7 +956,6 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   };
 }
 
-// ⭐ v2.19 (FIX #61) — título diferenciado por zona, tipo interno mantido
 function formatarMensagemSinal(symbol, dados, mode) {
   const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
@@ -1062,12 +970,10 @@ function formatarMensagemSinal(symbol, dados, mode) {
     titulo: `${tituloBase}: ${nomeAmigavel}`,
     corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}`,
     detalhes: {
-      // tipo interno MANTIDO — compatível com Firestore, anti-duplicado e frontend
       tipo: 'SINAL_CONFIRMADO',
       nomeAmigavel, direcao: consolidated.signal, modo: mode,
       entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
       score: consolidated.score, confidence: conf, price: consolidated.price,
-      // ⭐ v2.19 — mais razões (8 → 14)
       reasons: (consolidated.score_reasons || []).slice(0, 14),
       zona
     }
@@ -1177,7 +1083,6 @@ function formatarMensagemTempoEsgotado(trade) {
   };
 }
 
-// ⭐ FIX #56 (v2.16) — alerta de exaustão durante trade aberto
 function formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, motivo) {
   const nome = getFriendlyName(trade.symbol);
   const pct = (percentualPercorrido * 100).toFixed(1);
@@ -1314,7 +1219,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
   if (trade) {
     trade.currentPrice = currentPrice;
-    // ⭐ FIX #56/#57 (v2.16) — cache de esticamento para o ciclo atual
     const esticTradeCache = avaliarEsticamento(dados.consolidated.score_reasons);
 
     const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
@@ -1352,7 +1256,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         tradesAbertos.delete(tradeKey);
         removePersistedTrade(tradeKey);
 
-        // ⭐ FIX #57 (v2.16) — cooldown dinâmico após TIMEOUT
         const cdMsTimeout = calcularCooldownDinamico('TIMEOUT', dados, esticTradeCache);
         cooldownPosTrade.set(tradeKey, agora + cdMsTimeout);
         persistCooldown(tradeKey, agora + cdMsTimeout);
@@ -1369,13 +1272,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     else if (trade.signal === 'PUT' && currentPrice <= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
     else if (trade.signal === 'CALL' && currentPrice <= trade.stopLoss) { msgObj = formatarMensagemStop(trade); tipo = 'STOP'; fecharTrade = true; }
     else if (trade.signal === 'PUT' && currentPrice >= trade.stopLoss) { msgObj = formatarMensagemStop(trade); tipo = 'STOP'; fecharTrade = true; }
-    // ⭐ FIX #56 (v2.16) — exaustão ANTES do TEMPO_ESGOTADO
     else if (!trade.avisoExaustaoEnviado && percentualPercorrido >= 0.10 && percentualPercorrido < 0.50) {
       const contraDirecao =
         (trade.signal === 'CALL' && /sobrecompra|RSI extremo alto|RSI.*zona alta|DeM a esticar/i.test(esticTradeCache.motivo)) ||
         (trade.signal === 'PUT'  && /sobrevenda|RSI extremo baixo|RSI.*zona baixa|DeM a esticar \(baixo\)/i.test(esticTradeCache.motivo));
       if (esticTradeCache.esticado && esticTradeCache.nivel === 'ALTO' && contraDirecao) {
-        // ⭐ FIX #58 (v2.17) — só dispara se TF superior confirmar
         const confirmacao = confirmaExaustaoMultiTF(dados, trade);
 
         if (confirmacao.confirmado) {
@@ -1387,10 +1288,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           trade.avisoExaustaoEnviado = true;
           logger.info(`⚠️ [FIX #56+#58] Exaustão CONFIRMADA em ${tradeKey} | ${esticTradeCache.motivo} | ${confirmacao.motivo} | ${(percentualPercorrido*100).toFixed(1)}% do alvo`);
         } else {
-          // Sem confirmação do TF superior → é respiração.
-          // NÃO marca avisoExaustaoEnviado → pode disparar mais tarde se confirmar.
           logger.info(`💨 [FIX #58] ${tradeKey} trigger esticado mas ${confirmacao.motivo} — aguarda confirmação`);
-          // Cadeia normal de avisos continua sem marcar exaustão
           if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
           else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
           else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
@@ -1399,7 +1297,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
         }
       } else {
-        // Não houve trigger esticado — continuar cadeia normal
         if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
         else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
         else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
@@ -1419,7 +1316,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       tradesAbertos.delete(tradeKey);
       removePersistedTrade(tradeKey);
 
-      // ⭐ FIX #57 (v2.16) — cooldown dinâmico após fecho
       const cdMs = calcularCooldownDinamico(tipo, dados, esticTradeCache);
       cooldownPosTrade.set(tradeKey, agora + cdMs);
       persistCooldown(tradeKey, agora + cdMs);
@@ -1443,13 +1339,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     return;
   }
 
-  // ⭐ v2.19 (FIX #61) — aceitar Zona A **e** Zona B
   if (dados.consolidated.signal !== 'HOLD'
       && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
 
-      // ⭐ v2.14 — FILTRO EXTREMO: não envia se mercado está esticado
       const esticSinal = avaliarEsticamento(dados.consolidated.score_reasons);
       if (esticSinal.esticado && esticSinal.nivel === 'ALTO') {
         logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) SINAL ignorado (zona ${dados.consolidated.zona}) — ${esticSinal.motivo}`);
@@ -1466,7 +1360,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         entry: dados.suggestion.entry,
         takeProfit: dados.suggestion.takeProfit,
         stopLoss: dados.suggestion.stopLoss,
-        zonaEntrada: dados.consolidated.zona,   // ⭐ v2.19 — guardar zona
+        zonaEntrada: dados.consolidated.zona,
         watchers: [...watchers],
         timestamp: agora,
         avisoSeguindoEnviado: false,
@@ -1475,14 +1369,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         avisoAceleracaoEnviado: false,
         avisoTempoEsgotadoEnviado: false,
         aviso5MinEnviado: false,
-        // ⭐ FIX #56 (v2.16) — flag de exaustão
         avisoExaustaoEnviado: false,
         timeoutAt: agora + getTimeoutModo(mode),
         extensoes: 0,
         percentualNoUltimoCheck: 0
       };
 
-        tradesAbertos.set(tradeKey, novoTrade);
+      tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
 
       // ⭐ OTIMIZAÇÃO #2 — registar timestamp para anti-duplicado em memória
@@ -1498,7 +1391,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', msgSinal, {
           score: dados.consolidated.score,
           confidence: dados.consolidated.confidence,
-          zona: dados.consolidated.zona,          // ⭐ v2.19 — passar zona real
+          zona: dados.consolidated.zona,
           entry: dados.suggestion.entry,
           takeProfit: dados.suggestion.takeProfit,
           stopLoss: dados.suggestion.stopLoss
@@ -1519,15 +1412,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       removePersistedProntidao(tradeKey);
     }
   }
-  // ⭐ v2.11 + v2.12 + v2.14: PRONTIDAO com limiares configuráveis e filtro extremo
-   else if (dados.consolidated.signal === 'HOLD'
+  else if (dados.consolidated.signal === 'HOLD'
         && (dados.consolidated.zona === 'B'
          || dados.consolidated.zona === 'C')) {
     const scoreAtual = dados.consolidated.score || 0;
 
-    // ⭐ FIX #60: não envia PRONTIDAO em regime CHOP
-    // Motivo: em mercado lateral, o score oscila sem direcção real —
-    // 90% das prontidões não viram sinal → ruído para o utilizador.
     const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
     if (regimeAtualPush === 'CHOP') {
       logger.info(`🔇 [FIX #60] PRONTIDAO ignorada em CHOP: ${symbol} (${mode}) score=${scoreAtual}`);
@@ -1535,7 +1424,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       return;
     }
 
-    // ⭐ v2.14 — FILTRO EXTREMO: não avisa prontidão se mercado está esticado
     const estic = avaliarEsticamento(dados.consolidated.score_reasons);
     if (estic.esticado && estic.nivel === 'ALTO') {
       logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) PRONTIDAO ignorada — ${estic.motivo}`);
@@ -1543,19 +1431,16 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       return;
     }
 
-    // ⭐ v2.12: carregar preferências de cada watcher (com cache)
     const prefsPorWatcher = new Map();
     for (const tk of watchers) {
       const prefs = await getUserPreferences(tk);
       prefsPorWatcher.set(tk, prefs[mode] || DEFAULT_PREFS[mode]);
     }
 
-    // Se não há watchers com prefs, usa fallback global
     const scoreGlobalMin = prefsPorWatcher.size > 0
       ? Math.min(...Array.from(prefsPorWatcher.values()).map(p => p.scoreEarly))
       : getScoreProntidaoMin(mode);
 
-    // Zona C só entra se pelo menos 1 watcher quer (score >= seu mínimo)
     if (dados.consolidated.zona === 'C' && scoreAtual < scoreGlobalMin) {
       prontidaoForaContagem.delete(tradeKey);
       return;
@@ -1580,7 +1465,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       if (direcaoPrep) {
         const subindo = historico.length >= 3 && historico[historico.length - 1].score > historico[0].score;
 
-        // ⭐ v2.12: separar watchers por nível (EARLY / MATURE)
         const earlyTks = [];
         const matureTks = [];
         for (const tk of watchers) {
@@ -1590,7 +1474,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           else earlyTks.push(tk);
         }
 
-        // Enviar MATURE primeiro (mais relevante)
         if (matureTks.length > 0) {
           await registrarEEnviarSinal(
             symbol, mode, 'PRONTIDAO',
@@ -1737,7 +1620,7 @@ app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
       email: req.user.email || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    invalidarCacheSubs(req.user.tokenHash);   // ⭐ OTIMIZAÇÃO #3
+    invalidarCacheSubs(req.user.tokenHash);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1747,9 +1630,9 @@ app.post('/api/push/unsubscribe', authMiddleware, async (req, res) => {
   const { endpoint } = req.body;
   if (!endpoint) return res.status(400).json({ error: 'endpoint obrigatório' });
   try {
-     const docId = Buffer.from(endpoint).toString('base64').replace(/[/+=]/g, '_').slice(0, 400);
+    const docId = Buffer.from(endpoint).toString('base64').replace(/[/+=]/g, '_').slice(0, 400);
     await db.collection('push_subscriptions').doc(docId).delete();
-    invalidarCacheSubs(req.user.tokenHash);   // ⭐ OTIMIZAÇÃO #3
+    invalidarCacheSubs(req.user.tokenHash);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1763,7 +1646,6 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
   res.json({ success: true });
 });
 
-// ⭐ NOVO v2.12 — Endpoints de preferências de limiares
 app.get('/api/user-preferences', authMiddleware, async (req, res) => {
   try {
     const preferences = await getUserPreferences(req.user.tokenHash);
@@ -1828,8 +1710,8 @@ app.post('/api/engine-start', authMiddleware, async (req, res) => {
       });
     }
 
-     await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null });
-    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
+    await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null });
+    invalidarCacheWatchlists();
     logger.info(`✅ [ENGINE-START] user=${req.user.tokenHash} ativou motor com ${totalAtivos} ativo(s)`);
     res.json({ success: true, active: true, totalAtivos });
   } catch (err) {
@@ -1841,8 +1723,8 @@ app.post('/api/engine-start', authMiddleware, async (req, res) => {
 app.post('/api/engine-stop', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   try {
-      await saveUserWatchlist(req.user.tokenHash, { engineActive: false });
-    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
+    await saveUserWatchlist(req.user.tokenHash, { engineActive: false });
+    invalidarCacheWatchlists();
     res.json({ success: true, active: false });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1885,7 +1767,7 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
       email: req.user.email || null
     };
     await saveUserWatchlist(req.user.tokenHash, final);
-    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
+    invalidarCacheWatchlists();
 
     const houveCorte = Object.values(cortado).some(Boolean);
     res.json({
@@ -1904,8 +1786,8 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
 app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   try {
-     await saveUserWatchlist(req.user.tokenHash, { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] });
-    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
+    await saveUserWatchlist(req.user.tokenHash, { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] });
+    invalidarCacheWatchlists();
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -2125,8 +2007,8 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
   logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
   logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
-  logger.info(`v2.19: FIX #61 — aceita SINAL em Zona A (SINAL CONFIRMADO) e Zona B (SINAL MODERADO) — tipo interno mantido`);
-   logger.info(`v2.18: FIX #56 (exaustão) + #57 (cooldown) + #58 (multi-TF) + #60 (bloquear PRONTIDAO em CHOP) ativos`);
+  logger.info(`v2.19: FIX #61 — aceita SINAL em Zona A (SINAL CONFIRMADO) e Zona B (SINAL MODERADO)`);
+  logger.info(`v2.18: FIX #56 (exaustão) + #57 (cooldown) + #58 (multi-TF) + #60 (bloquear PRONTIDAO em CHOP) ativos`);
   logger.info(`v2.20: PATCH 1+2+3 (cache) + PATCH 5 (arranque resiliente a quota) ativos`);
   loadStateFromFirestore().catch(e => logger.error('loadStateFromFirestore falhou:', e.message));
 });
