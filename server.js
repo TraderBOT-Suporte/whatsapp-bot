@@ -19,7 +19,7 @@
 //         FIX #57: cooldown dinâmico pós-trade — reduz para 3-5min
 //         quando mercado está pronto (zona A + mercado saudável),
 //         aumenta para 15min quando esticado.
-// v2.17 — FIX #58: confirmação multi-TF antes de alertar exaustão.
+// v2.18 — FIX #60: bloqueia PRONTIDAO em regime CHOP (mercado lateral).
 //         O trigger TF avisa; o TF superior (M5/M15/H4/H24) tem de
 //         confirmar com MACD invertido OU RSI extremo. Sem isso,
 //         é apenas respiração e o trade continua até TP.
@@ -1390,10 +1390,20 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     }
   }
   // ⭐ v2.11 + v2.12 + v2.14: PRONTIDAO com limiares configuráveis e filtro extremo
-  else if (dados.consolidated.signal === 'HOLD'
+   else if (dados.consolidated.signal === 'HOLD'
         && (dados.consolidated.zona === 'B'
          || dados.consolidated.zona === 'C')) {
     const scoreAtual = dados.consolidated.score || 0;
+
+    // ⭐ FIX #60: não envia PRONTIDAO em regime CHOP
+    // Motivo: em mercado lateral, o score oscila sem direcção real —
+    // 90% das prontidões não viram sinal → ruído para o utilizador.
+    const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
+    if (regimeAtualPush === 'CHOP') {
+      logger.info(`🔇 [FIX #60] PRONTIDAO ignorada em CHOP: ${symbol} (${mode}) score=${scoreAtual}`);
+      prontidaoForaContagem.delete(tradeKey);
+      return;
+    }
 
     // ⭐ v2.14 — FILTRO EXTREMO: não avisa prontidão se mercado está esticado
     const estic = avaliarEsticamento(dados.consolidated.score_reasons);
@@ -1979,7 +1989,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
   logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
   logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
-  logger.info(`v2.17: FIX #56 (exaustão) + #57 (cooldown) + #58 (confirmação multi-TF) ativos`);
+  logger.info(`v2.18: FIX #56 (exaustão) + #57 (cooldown) + #58 (multi-TF) + #60 (bloquear PRONTIDAO em CHOP) ativos`);
   await loadStateFromFirestore();
 });
 
