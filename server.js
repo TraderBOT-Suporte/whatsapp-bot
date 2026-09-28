@@ -91,6 +91,12 @@ const PORT = process.env.PORT || 3000;
 // ========== FIREBASE ==========
 let db = null;
 let firebaseInitialized = false;
+
+// ⭐ OTIMIZAÇÃO #1 — cache de watchlists em memória (poupa ~1.400 reads/dia)
+let _watchlistsCache = null;
+let _watchlistsCacheExpira = 0;
+const WATCHLISTS_CACHE_TTL = 5 * 60 * 1000;
+
 function initializeFirebase() {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -132,29 +138,57 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado.');
 }
 
+// ⭐ OTIMIZAÇÃO #3 — cache de subscrições em memória (poupa ~2.000 reads/dia)
+const _subsCache = new Map();   // tokenHash → { subs: [...], expira }
+const SUBS_CACHE_TTL = 5 * 60 * 1000;
+
+async function _getSubsDeToken(tokenHash) {
+  const agora = Date.now();
+  const cached = _subsCache.get(tokenHash);
+  if (cached && agora < cached.expira) return cached.subs;
+
+  const snap = await db.collection('push_subscriptions')
+    .where('tokenHash', '==', tokenHash)
+    .get();
+
+  const subs = snap.docs.map(d => ({ id: d.id, ref: d.ref, data: d.data() }));
+  _subsCache.set(tokenHash, { subs, expira: agora + SUBS_CACHE_TTL });
+  return subs;
+}
+
+function invalidarCacheSubs(tokenHash) {
+  if (tokenHash) _subsCache.delete(tokenHash);
+  else _subsCache.clear();
+}
+
 async function sendPushToWatchers(watchers, payload) {
   if (!pushConfigured || !firebaseInitialized || !watchers || watchers.length === 0) return;
   try {
     const body = JSON.stringify(payload);
     const deletions = [];
-    const chunks = [];
-    for (let i = 0; i < watchers.length; i += 30) chunks.push(watchers.slice(i, i + 30));
 
-    for (const chunk of chunks) {
-      const snap = await db.collection('push_subscriptions')
-        .where('tokenHash', 'in', chunk)
-        .get();
+    for (const tokenHash of watchers) {
+      let subs;
+      try {
+        subs = await _getSubsDeToken(tokenHash);
+      } catch (err) {
+        logger.error(`Erro a obter subs de ${tokenHash.slice(0, 8)}:`, err.message);
+        continue;
+      }
 
-      await Promise.all(snap.docs.map(async (doc) => {
-        const sub = doc.data();
-        if (!sub.subscription) return;
+      for (const sub of subs) {
+        if (!sub.data.subscription) continue;
         try {
-          await webpush.sendNotification(sub.subscription, body);
+          await webpush.sendNotification(sub.data.subscription, body);
         } catch (err) {
-          if (err.statusCode === 404 || err.statusCode === 410) deletions.push(doc.ref.delete());
-          else logger.error('Erro push:', err.message);
+          if (err.statusCode === 404 || err.statusCode === 410) {
+            deletions.push(sub.ref.delete());
+            _subsCache.delete(tokenHash);
+          } else {
+            logger.error('Erro push:', err.message);
+          }
         }
-      }));
+      }
     }
     if (deletions.length) await Promise.all(deletions);
   } catch (err) {
@@ -459,10 +493,17 @@ async function saveUserWatchlist(tokenHash, patch) {
   }, { merge: true });
 }
 
+// ⭐ OTIMIZAÇÃO #1 — cache em memória (5 min TTL)
 async function getAllUserWatchlists() {
   if (!firebaseInitialized) return [];
+
+  const agora = Date.now();
+  if (_watchlistsCache && agora < _watchlistsCacheExpira) {
+    return _watchlistsCache;
+  }
+
   const snap = await db.collection('user_watchlists').get();
-  return snap.docs.map(d => {
+  const resultado = snap.docs.map(d => {
     const data = d.data() || {};
     return {
       tokenHash: d.id,
@@ -474,6 +515,16 @@ async function getAllUserWatchlists() {
       BALEEIRO: data.BALEEIRO || []
     };
   });
+
+  _watchlistsCache = resultado;
+  _watchlistsCacheExpira = agora + WATCHLISTS_CACHE_TTL;
+  return resultado;
+}
+
+// ⭐ OTIMIZAÇÃO #1 — invalidar cache quando user altera watchlist
+function invalidarCacheWatchlists() {
+  _watchlistsCache = null;
+  _watchlistsCacheExpira = 0;
 }
 
 function contarAtivosWatchlist(wl) {
@@ -487,6 +538,9 @@ function contarAtivosWatchlist(wl) {
 // ========== ESTADO DE TRADES / PRONTIDÃO ==========
 const tradesAbertos = new Map();
 const cooldownPosTrade = new Map();
+
+// ⭐ OTIMIZAÇÃO #2 — anti-duplicado em memória (poupa ~7.600 reads/dia)
+const ultimoSinalPorPar = new Map();   // `${symbol}_${mode}` → timestamp
 const prontidaoHistorico = new Map();
 const prontidaoAtiva = new Set();
 const prontidaoForaContagem = new Map();
@@ -590,6 +644,25 @@ async function loadStateFromFirestore() {
     return;
   }
   try {
+    // ⭐ OTIMIZAÇÃO #2 — restaurar anti-duplicado em memória (1 única query no arranque)
+    try {
+      const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
+      const recentes = await db.collection('signals')
+        .where('tipo', '==', 'SINAL_CONFIRMADO')
+        .where('criadoEm', '>=', cincoMinAtras)
+        .get();
+      recentes.docs.forEach(d => {
+        const data = d.data();
+        if (data.symbol && data.mode) {
+          const ts = data.criadoEm?.toDate?.()?.getTime?.() || Date.now();
+          ultimoSinalPorPar.set(`${data.symbol}_${data.mode}`, ts);
+        }
+      });
+      logger.info(`♻️ Anti-duplicado restaurado: ${recentes.size} sinal(is) recente(s)`);
+    } catch (e) {
+      logger.warn(`⚠️ Falha ao restaurar anti-duplicado: ${e.message}`);
+    }
+
     const tradesSnap = await db.collection('open_trades').get();
     const agora = Date.now();
     let tradesRestaurados = 0, tradesExpirados = 0;
@@ -1300,24 +1373,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     return;
   }
 
-  // ⭐ Anti-duplicado (mantém apenas SINAL_CONFIRMADO — v2.19)
-  if (firebaseInitialized) {
-    try {
-      const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
-      const snap = await db.collection('signals')
-        .where('symbol', '==', symbol)
-        .where('mode', '==', mode)
-        .where('tipo', '==', 'SINAL_CONFIRMADO')
-        .where('criadoEm', '>=', cincoMinAtras)
-        .limit(1)
-        .get();
-      if (!snap.empty) {
-        logger.info(`⏭️ Anti-duplicado: sinal já emitido nos últimos 5min para ${symbol}/${mode} — a saltar`);
-        return;
-      }
-    } catch (err) {
-      logger.warn(`Anti-duplicado indisponível (índice?): ${err.message}`);
-    }
+  // ⭐ OTIMIZAÇÃO #2 — anti-duplicado em memória (sem query ao Firestore)
+  const chaveAntiDup = `${symbol}_${mode}`;
+  const ultimoTs = ultimoSinalPorPar.get(chaveAntiDup) || 0;
+  const CINCO_MIN_MS = 5 * 60 * 1000;
+  if (Date.now() - ultimoTs < CINCO_MIN_MS) {
+    logger.info(`⏭️ Anti-duplicado (memória): sinal emitido há ${Math.round((Date.now() - ultimoTs)/1000)}s para ${symbol}/${mode} — a saltar`);
+    return;
   }
 
   // ⭐ v2.19 (FIX #61) — aceitar Zona A **e** Zona B
@@ -1359,8 +1421,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         percentualNoUltimoCheck: 0
       };
 
-      tradesAbertos.set(tradeKey, novoTrade);
+        tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
+
+      // ⭐ OTIMIZAÇÃO #2 — registar timestamp para anti-duplicado em memória
+      ultimoSinalPorPar.set(`${symbol}_${mode}`, agora);
 
       const zonaTxt = dados.consolidated.zona === 'A' ? 'SINAL CONFIRMADO' : 'SINAL MODERADO';
       logger.info(`🚀 [${zonaTxt}] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | zona ${dados.consolidated.zona} | score ${dados.consolidated.score}`);
@@ -1611,6 +1676,7 @@ app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
       email: req.user.email || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+    invalidarCacheSubs(req.user.tokenHash);   // ⭐ OTIMIZAÇÃO #3
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1620,8 +1686,9 @@ app.post('/api/push/unsubscribe', authMiddleware, async (req, res) => {
   const { endpoint } = req.body;
   if (!endpoint) return res.status(400).json({ error: 'endpoint obrigatório' });
   try {
-    const docId = Buffer.from(endpoint).toString('base64').replace(/[/+=]/g, '_').slice(0, 400);
+     const docId = Buffer.from(endpoint).toString('base64').replace(/[/+=]/g, '_').slice(0, 400);
     await db.collection('push_subscriptions').doc(docId).delete();
+    invalidarCacheSubs(req.user.tokenHash);   // ⭐ OTIMIZAÇÃO #3
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1700,7 +1767,8 @@ app.post('/api/engine-start', authMiddleware, async (req, res) => {
       });
     }
 
-    await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null });
+     await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null });
+    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
     logger.info(`✅ [ENGINE-START] user=${req.user.tokenHash} ativou motor com ${totalAtivos} ativo(s)`);
     res.json({ success: true, active: true, totalAtivos });
   } catch (err) {
@@ -1712,7 +1780,8 @@ app.post('/api/engine-start', authMiddleware, async (req, res) => {
 app.post('/api/engine-stop', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   try {
-    await saveUserWatchlist(req.user.tokenHash, { engineActive: false });
+      await saveUserWatchlist(req.user.tokenHash, { engineActive: false });
+    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
     res.json({ success: true, active: false });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1755,6 +1824,7 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
       email: req.user.email || null
     };
     await saveUserWatchlist(req.user.tokenHash, final);
+    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
 
     const houveCorte = Object.values(cortado).some(Boolean);
     res.json({
@@ -1773,7 +1843,8 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
 app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
   if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
   try {
-    await saveUserWatchlist(req.user.tokenHash, { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] });
+     await saveUserWatchlist(req.user.tokenHash, { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] });
+    invalidarCacheWatchlists();   // ⭐ OTIMIZAÇÃO #1
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
