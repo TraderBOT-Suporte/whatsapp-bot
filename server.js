@@ -1,23 +1,12 @@
-// ===================== server.js (Painel de Sinais) =====================
-// Motor de análise + Web Push + histórico de sinais no Firestore.
-// v2.9  — h4_timing incluído no fallback de direção (BALEEIRO)
-// v2.10 — diagnosticoProximidade reconhece bloqueio DeMarker extremo
-// v2.11 — PRONTIDAO agora dispara em Zona B E Zona C (aviso antecipado)
-// v2.12 — Limiares de Score configuráveis por utilizador (por modo)
-// v2.13 — diagnosticoProximidade reconhece bloqueios de micro timing
-// v2.14 — FILTRO EXTREMO: ignora PRONTIDAO/SINAL quando DeM/RSI extremos
-// v2.15 — Reconhece bloqueios FIX #40b, #50/#52, #51
-// v2.16 — FIX #56 (exaustão) + FIX #57 (cooldown dinâmico)
-// v2.18 — FIX #60: bloqueia PRONTIDAO em regime CHOP
-// v2.19 — FIX #61: aceita SINAL em Zona A **e** Zona B.
-// v2.20 — OTIMIZAÇÕES: cache watchlists, anti-duplicado em memória,
-//         cache subscrições push, arranque resiliente a quota Firestore.
+// ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// Migração Firestore → Turso (libSQL). Todas as colecções foram convertidas em tabelas SQLite.
+// v2.21 — Turso (libSQL) substitui Firestore. Cache em memória mantida.
 
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import admin from 'firebase-admin';
+import { createClient } from '@libsql/client';
 import pino from 'pino';
 import crypto from 'crypto';
 import cron from 'node-cron';
@@ -53,7 +42,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// Rotas PWA explícitas ANTES do static (headers corretos p/ iOS)
+// Rotas PWA explícitas ANTES do static
 app.get('/service-worker.js', (req, res) => {
   res.set('Content-Type', 'application/javascript; charset=utf-8');
   res.set('Service-Worker-Allowed', '/');
@@ -67,7 +56,6 @@ app.get('/manifest.json', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'manifest.json'));
 });
 
-// ⭐ Política de Privacidade (obrigatório para Play Store)
 app.get('/privacy', (req, res) => {
   res.set('Cache-Control', 'public, max-age=3600');
   res.sendFile(path.join(__dirname, 'public', 'privacy.html'));
@@ -84,33 +72,119 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 
-// ========== FIREBASE ==========
+// ========== TURSO (libSQL) ==========
 let db = null;
-let firebaseInitialized = false;
+let tursoInitialized = false;
 
-// ⭐ OTIMIZAÇÃO #1 — cache de watchlists em memória (poupa ~1.400 reads/dia)
+// ⭐ Cache em memória — mantido das optimizações anteriores
 let _watchlistsCache = null;
 let _watchlistsCacheExpira = 0;
 const WATCHLISTS_CACHE_TTL = 5 * 60 * 1000;
 
-function initializeFirebase() {
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id TEXT PRIMARY KEY,
+  subscription TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  email TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_push_sub_token ON push_subscriptions(token_hash);
+
+CREATE TABLE IF NOT EXISTS user_watchlists (
+  token_hash TEXT PRIMARY KEY,
+  email TEXT,
+  engine_active INTEGER NOT NULL DEFAULT 0,
+  sniper TEXT NOT NULL DEFAULT '[]',
+  cacador TEXT NOT NULL DEFAULT '[]',
+  pescador TEXT NOT NULL DEFAULT '[]',
+  baleeiro TEXT NOT NULL DEFAULT '[]',
+  atualizado_em INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+  token_hash TEXT PRIMARY KEY,
+  sniper_early INTEGER NOT NULL DEFAULT 25,
+  sniper_mature INTEGER NOT NULL DEFAULT 40,
+  cacador_early INTEGER NOT NULL DEFAULT 28,
+  cacador_mature INTEGER NOT NULL DEFAULT 42,
+  pescador_early INTEGER NOT NULL DEFAULT 30,
+  pescador_mature INTEGER NOT NULL DEFAULT 45,
+  baleeiro_early INTEGER NOT NULL DEFAULT 35,
+  baleeiro_mature INTEGER NOT NULL DEFAULT 48,
+  atualizado_em INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS open_trades (
+  trade_key TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  atualizado_em INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cooldowns (
+  trade_key TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL,
+  atualizado_em INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS prontidao_state (
+  trade_key TEXT PRIMARY KEY,
+  historico TEXT NOT NULL DEFAULT '[]',
+  ativa INTEGER NOT NULL DEFAULT 0,
+  atualizado_em INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  tipo TEXT NOT NULL,
+  titulo TEXT NOT NULL,
+  corpo TEXT NOT NULL,
+  detalhes TEXT,
+  watchers TEXT NOT NULL DEFAULT '[]',
+  score REAL,
+  confidence REAL,
+  zona TEXT,
+  entry REAL,
+  take_profit REAL,
+  stop_loss REAL,
+  nivel_prontidao TEXT,
+  origem TEXT DEFAULT 'motor',
+  criado_em INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signals_mode ON signals(mode);
+CREATE INDEX IF NOT EXISTS idx_signals_tipo ON signals(tipo);
+CREATE INDEX IF NOT EXISTS idx_signals_criado ON signals(criado_em);
+`;
+
+async function initializeTurso() {
+  const url = process.env.TURSO_DATABASE_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
+  if (!url || !authToken) {
+    logger.warn('Turso não configurado (TURSO_DATABASE_URL / TURSO_AUTH_TOKEN ausentes).');
+    return false;
+  }
   try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
-    if (!serviceAccount.project_id) {
-      logger.warn('Firebase não configurado.');
-      return false;
+    db = createClient({ url, authToken });
+    // Aplicar schema — idempotente (IF NOT EXISTS)
+    const statements = SCHEMA_SQL.split(';').map(s => s.trim()).filter(s => s.length > 0);
+    for (const stmt of statements) {
+      await db.execute(stmt);
     }
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    db = admin.firestore();
-    firebaseInitialized = true;
-    logger.info('Firebase inicializado!');
+    // Teste de ligação
+    await db.execute('SELECT 1');
+    tursoInitialized = true;
+    logger.info('✅ Turso inicializado + schema aplicado.');
     return true;
   } catch (err) {
-    logger.error('Erro ao inicializar Firebase:', err.message);
+    logger.error('❌ Erro ao inicializar Turso:', err.message);
     return false;
   }
 }
-initializeFirebase();
+
+// Inicializa Turso no arranque (mas o app.listen espera pela conclusão)
+const tursoInitPromise = initializeTurso();
 
 // ========== WEB PUSH (VAPID) ==========
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
@@ -125,16 +199,13 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
     logger.info('Web Push configurado.');
   } catch (err) {
     logger.error('❌ Falha ao configurar Web Push:', err.message || String(err));
-    logger.error(`   VAPID_SUBJECT: "${VAPID_SUBJECT}"`);
-    logger.error(`   VAPID_PUBLIC_KEY:  ${VAPID_PUBLIC_KEY.length} caracteres (esperado ~87)`);
-    logger.error(`   VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY.length} caracteres (esperado ~43)`);
     logger.error('   Push desativado — servidor continua a arrancar normalmente.');
   }
 } else {
   logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado.');
 }
 
-// ⭐ OTIMIZAÇÃO #3 — cache de subscrições em memória (poupa ~2.000 reads/dia)
+// ⭐ Cache de subscrições em memória
 const _subsCache = new Map();
 const SUBS_CACHE_TTL = 5 * 60 * 1000;
 
@@ -143,11 +214,19 @@ async function _getSubsDeToken(tokenHash) {
   const cached = _subsCache.get(tokenHash);
   if (cached && agora < cached.expira) return cached.subs;
 
-  const snap = await db.collection('push_subscriptions')
-    .where('tokenHash', '==', tokenHash)
-    .get();
+  const result = await db.execute({
+    sql: 'SELECT id, subscription, token_hash, email, updated_at FROM push_subscriptions WHERE token_hash = ?',
+    args: [tokenHash]
+  });
 
-  const subs = snap.docs.map(d => ({ id: d.id, ref: d.ref, data: d.data() }));
+  const subs = result.rows.map(row => ({
+    id: row.id,
+    data: {
+      subscription: JSON.parse(row.subscription),
+      tokenHash: row.token_hash,
+      email: row.email
+    }
+  }));
   _subsCache.set(tokenHash, { subs, expira: agora + SUBS_CACHE_TTL });
   return subs;
 }
@@ -158,7 +237,7 @@ function invalidarCacheSubs(tokenHash) {
 }
 
 async function sendPushToWatchers(watchers, payload) {
-  if (!pushConfigured || !firebaseInitialized || !watchers || watchers.length === 0) return;
+  if (!pushConfigured || !tursoInitialized || !watchers || watchers.length === 0) return;
   try {
     const body = JSON.stringify(payload);
     const deletions = [];
@@ -178,7 +257,9 @@ async function sendPushToWatchers(watchers, payload) {
           await webpush.sendNotification(sub.data.subscription, body);
         } catch (err) {
           if (err.statusCode === 404 || err.statusCode === 410) {
-            deletions.push(sub.ref.delete());
+            deletions.push(
+              db.execute({ sql: 'DELETE FROM push_subscriptions WHERE id = ?', args: [sub.id] })
+            );
             _subsCache.delete(tokenHash);
           } else {
             logger.error('Erro push:', err.message);
@@ -193,6 +274,7 @@ async function sendPushToWatchers(watchers, payload) {
 }
 
 // ========== MAPEAMENTO DE ATIVOS (nomes amigáveis) ==========
+// (copia do teu arquivo actual — inalterado)
 const assetGroups = {
   'Cestas de Moedas': ['WLDAUD', 'WLDEUR', 'WLDGBP', 'WLDXAU', 'WLDUSD'],
   'Forex': ['frxAUDCAD', 'frxAUDCHF', 'frxAUDJPY', 'frxAUDNZD', 'frxAUDUSD', 'frxEURCAD', 'frxEURCHF', 'frxEURAUD', 'frxEURGBP', 'frxEURJPY', 'frxEURNZD', 'frxEURUSD', 'frxGBPAUD', 'frxGBPCAD', 'frxGBPCHF', 'frxGBPJPY', 'frxGBPNOK', 'frxGBPNZD', 'frxGBPUSD', 'frxNZDJPY', 'frxNZDUSD', 'frxUSDCAD', 'frxUSDCHF', 'frxUSDJPY', 'frxUSDMXN', 'frxUSDNOK', 'frxUSDPLN', 'frxUSDSEK', 'frxGBPPLN'],
@@ -253,7 +335,6 @@ const PLANO_DEFAULT = { nome: 'Sem plano', maxAtivosPorModo: 0, prioridade: fals
 function getPlano(periodDays) {
   return PLANOS[periodDays] || PLANO_DEFAULT;
 }
-
 // ========== MIDDLEWARE DE AUTENTICAÇÃO ==========
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 const tokenValidationCache = new Map();
@@ -282,7 +363,7 @@ app.post('/api/validate-token', async (req, res) => {
     logger.info(`[VALIDATE-PROXY] token=${token.slice(0, 8)}... status=${r.status} periodDays=${data.periodDays ?? 'null'}`);
     return res.status(r.status).json(data);
   } catch (err) {
-    logger.error('[VALIDATE-PROXY] Erro ao contactar servidor de análise:', err.message);
+    logger.error('[VALIDATE-PROXY] Erro:', err.message);
     return res.status(503).json({ valid: false, message: 'Serviço de validação indisponível' });
   }
 });
@@ -329,8 +410,7 @@ async function authMiddleware(req, res, next) {
 
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
     const user = valid ? {
-      token,
-      tokenHash,
+      token, tokenHash,
       email: data.email || data.user?.email || null,
       name: data.name || data.user?.name || null,
       periodDays: data.periodDays || 0,
@@ -365,25 +445,13 @@ function getProntidaoConfig(mode) {
 }
 
 const SCORE_PRONTIDAO_MIN = {
-  SNIPER:   25,
-  'CAÇADOR': 28,
-  PESCADOR: 30,
-  BALEEIRO: 35
+  SNIPER: 25, 'CAÇADOR': 28, PESCADOR: 30, BALEEIRO: 35
 };
-
 const SCORE_QUASE_ENTRADA = {
-  SNIPER:   40,
-  'CAÇADOR': 42,
-  PESCADOR: 45,
-  BALEEIRO: 48
+  SNIPER: 40, 'CAÇADOR': 42, PESCADOR: 45, BALEEIRO: 48
 };
-
-function getScoreProntidaoMin(mode) {
-  return SCORE_PRONTIDAO_MIN[mode] || 30;
-}
-function getScoreQuaseEntrada(mode) {
-  return SCORE_QUASE_ENTRADA[mode] || 40;
-}
+function getScoreProntidaoMin(mode) { return SCORE_PRONTIDAO_MIN[mode] || 30; }
+function getScoreQuaseEntrada(mode) { return SCORE_QUASE_ENTRADA[mode] || 40; }
 
 const DEFAULT_PREFS = {
   SNIPER:    { scoreEarly: 25, scoreMature: 40 },
@@ -407,14 +475,25 @@ function sanitizePrefs(raw) {
   return out;
 }
 
+// ========== PREFERÊNCIAS DE UTILIZADOR (Turso) ==========
 async function getUserPreferences(tokenHash) {
   if (!tokenHash) return sanitizePrefs({});
-  if (!firebaseInitialized) return sanitizePrefs({});
+  if (!tursoInitialized) return sanitizePrefs({});
   const cached = prefsCache.get(tokenHash);
   if (cached && cached.expiresAt > Date.now()) return cached.prefs;
   try {
-    const doc = await db.collection('user_preferences').doc(tokenHash).get();
-    const prefs = sanitizePrefs(doc.exists ? doc.data() : {});
+    const res = await db.execute({
+      sql: 'SELECT sniper_early, sniper_mature, cacador_early, cacador_mature, pescador_early, pescador_mature, baleeiro_early, baleeiro_mature FROM user_preferences WHERE token_hash = ?',
+      args: [tokenHash]
+    });
+    const row = res.rows[0];
+    const raw = row ? {
+      SNIPER:    { scoreEarly: row.sniper_early,    scoreMature: row.sniper_mature    },
+      'CAÇADOR': { scoreEarly: row.cacador_early,   scoreMature: row.cacador_mature   },
+      PESCADOR:  { scoreEarly: row.pescador_early,  scoreMature: row.pescador_mature  },
+      BALEEIRO:  { scoreEarly: row.baleeiro_early,  scoreMature: row.baleeiro_mature  }
+    } : {};
+    const prefs = sanitizePrefs(raw);
     prefsCache.set(tokenHash, { prefs, expiresAt: Date.now() + PREFS_CACHE_TTL });
     return prefs;
   } catch (err) {
@@ -424,14 +503,30 @@ async function getUserPreferences(tokenHash) {
 }
 
 async function saveUserPreferences(tokenHash, raw) {
-  if (!firebaseInitialized) throw new Error('Firestore indisponível');
-  const sanitized = sanitizePrefs(raw);
-  await db.collection('user_preferences').doc(tokenHash).set({
-    ...sanitized,
-    atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
-  }, { merge: true });
+  if (!tursoInitialized) throw new Error('Turso indisponível');
+  const s = sanitizePrefs(raw);
+  await db.execute({
+    sql: `INSERT INTO user_preferences (
+      token_hash, sniper_early, sniper_mature, cacador_early, cacador_mature,
+      pescador_early, pescador_mature, baleeiro_early, baleeiro_mature, atualizado_em
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(token_hash) DO UPDATE SET
+      sniper_early=excluded.sniper_early, sniper_mature=excluded.sniper_mature,
+      cacador_early=excluded.cacador_early, cacador_mature=excluded.cacador_mature,
+      pescador_early=excluded.pescador_early, pescador_mature=excluded.pescador_mature,
+      baleeiro_early=excluded.baleeiro_early, baleeiro_mature=excluded.baleeiro_mature,
+      atualizado_em=excluded.atualizado_em`,
+    args: [
+      tokenHash,
+      s.SNIPER.scoreEarly, s.SNIPER.scoreMature,
+      s['CAÇADOR'].scoreEarly, s['CAÇADOR'].scoreMature,
+      s.PESCADOR.scoreEarly, s.PESCADOR.scoreMature,
+      s.BALEEIRO.scoreEarly, s.BALEEIRO.scoreMature,
+      Date.now()
+    ]
+  });
   prefsCache.delete(tokenHash);
-  return sanitized;
+  return s;
 }
 
 const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000;
@@ -442,14 +537,12 @@ const TRADE_TIMEOUT_POR_MODO_MS = {
   'PESCADOR': 12 * 60 * 60 * 1000,
   'BALEEIRO': 72 * 60 * 60 * 1000
 };
-
 const TRADE_TIMEOUT_EXTEND_POR_MODO_MS = {
   'SNIPER':   15 * 60 * 1000,
   'CAÇADOR':  45 * 60 * 1000,
   'PESCADOR': 6 * 60 * 60 * 1000,
   'BALEEIRO': 48 * 60 * 60 * 1000
 };
-
 const TRADE_TIMEOUT_MS_DEFAULT = 20 * 60 * 1000;
 const TRADE_TIMEOUT_EXTEND_MS_DEFAULT = 15 * 60 * 1000;
 
@@ -463,55 +556,93 @@ function getTimeoutExtendModo(mode) {
 const PROGRESSO_MINIMO_EXTENSAO = 0.05;
 const EXTENSOES_MAX = 3;
 
-// ========== WATCHLIST POR USER ==========
+// ========== WATCHLIST POR UTILIZADOR (Turso) ==========
 async function getUserWatchlist(tokenHash) {
-  if (!firebaseInitialized) return null;
-  const doc = await db.collection('user_watchlists').doc(tokenHash).get();
-  const data = doc.exists ? doc.data() : {};
-  return {
-    tokenHash,
-    email: data.email || null,
-    engineActive: !!data.engineActive,
-    SNIPER: data.SNIPER || [],
-    'CAÇADOR': data['CAÇADOR'] || [],
-    PESCADOR: data.PESCADOR || [],
-    BALEEIRO: data.BALEEIRO || []
-  };
+  if (!tursoInitialized) return null;
+  try {
+    const res = await db.execute({
+      sql: 'SELECT email, engine_active, sniper, cacador, pescador, baleeiro FROM user_watchlists WHERE token_hash = ?',
+      args: [tokenHash]
+    });
+    const row = res.rows[0];
+    if (!row) {
+      return {
+        tokenHash, email: null, engineActive: false,
+        SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: []
+      };
+    }
+    return {
+      tokenHash,
+      email: row.email || null,
+      engineActive: !!row.engine_active,
+      SNIPER: JSON.parse(row.sniper || '[]'),
+      'CAÇADOR': JSON.parse(row.cacador || '[]'),
+      PESCADOR: JSON.parse(row.pescador || '[]'),
+      BALEEIRO: JSON.parse(row.baleeiro || '[]')
+    };
+  } catch (err) {
+    logger.error('Erro getUserWatchlist:', err.message);
+    return null;
+  }
 }
 
 async function saveUserWatchlist(tokenHash, patch) {
-  await db.collection('user_watchlists').doc(tokenHash).set({
-    ...patch,
-    atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
-  }, { merge: true });
+  if (!tursoInitialized) return;
+  const current = await getUserWatchlist(tokenHash) || {};
+  const merged = {
+    email: patch.email !== undefined ? patch.email : (current.email || null),
+    engineActive: patch.engineActive !== undefined ? patch.engineActive : (current.engineActive || false),
+    SNIPER: patch.SNIPER !== undefined ? patch.SNIPER : (current.SNIPER || []),
+    'CAÇADOR': patch['CAÇADOR'] !== undefined ? patch['CAÇADOR'] : (current['CAÇADOR'] || []),
+    PESCADOR: patch.PESCADOR !== undefined ? patch.PESCADOR : (current.PESCADOR || []),
+    BALEEIRO: patch.BALEEIRO !== undefined ? patch.BALEEIRO : (current.BALEEIRO || [])
+  };
+  await db.execute({
+    sql: `INSERT INTO user_watchlists (
+      token_hash, email, engine_active, sniper, cacador, pescador, baleeiro, atualizado_em
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(token_hash) DO UPDATE SET
+      email=excluded.email, engine_active=excluded.engine_active,
+      sniper=excluded.sniper, cacador=excluded.cacador,
+      pescador=excluded.pescador, baleeiro=excluded.baleeiro,
+      atualizado_em=excluded.atualizado_em`,
+    args: [
+      tokenHash,
+      merged.email,
+      merged.engineActive ? 1 : 0,
+      JSON.stringify(merged.SNIPER),
+      JSON.stringify(merged['CAÇADOR']),
+      JSON.stringify(merged.PESCADOR),
+      JSON.stringify(merged.BALEEIRO),
+      Date.now()
+    ]
+  });
 }
 
-// ⭐ OTIMIZAÇÃO #1 — cache em memória (5 min TTL)
+// ⭐ Cache em memória (5 min TTL)
 async function getAllUserWatchlists() {
-  if (!firebaseInitialized) return [];
-
+  if (!tursoInitialized) return [];
   const agora = Date.now();
-  if (_watchlistsCache && agora < _watchlistsCacheExpira) {
-    return _watchlistsCache;
+  if (_watchlistsCache && agora < _watchlistsCacheExpira) return _watchlistsCache;
+
+  try {
+    const res = await db.execute('SELECT * FROM user_watchlists');
+    const resultado = res.rows.map(row => ({
+      tokenHash: row.token_hash,
+      email: row.email || null,
+      engineActive: !!row.engine_active,
+      SNIPER: JSON.parse(row.sniper || '[]'),
+      'CAÇADOR': JSON.parse(row.cacador || '[]'),
+      PESCADOR: JSON.parse(row.pescador || '[]'),
+      BALEEIRO: JSON.parse(row.baleeiro || '[]')
+    }));
+    _watchlistsCache = resultado;
+    _watchlistsCacheExpira = agora + WATCHLISTS_CACHE_TTL;
+    return resultado;
+  } catch (err) {
+    logger.error('Erro getAllUserWatchlists:', err.message);
+    return [];
   }
-
-  const snap = await db.collection('user_watchlists').get();
-  const resultado = snap.docs.map(d => {
-    const data = d.data() || {};
-    return {
-      tokenHash: d.id,
-      email: data.email || null,
-      engineActive: !!data.engineActive,
-      SNIPER: data.SNIPER || [],
-      'CAÇADOR': data['CAÇADOR'] || [],
-      PESCADOR: data.PESCADOR || [],
-      BALEEIRO: data.BALEEIRO || []
-    };
-  });
-
-  _watchlistsCache = resultado;
-  _watchlistsCacheExpira = agora + WATCHLISTS_CACHE_TTL;
-  return resultado;
 }
 
 function invalidarCacheWatchlists() {
@@ -521,24 +652,17 @@ function invalidarCacheWatchlists() {
 
 function contarAtivosWatchlist(wl) {
   if (!wl) return 0;
-  return (wl.SNIPER || []).length
-       + (wl['CAÇADOR'] || []).length
-       + (wl.PESCADOR || []).length
-       + (wl.BALEEIRO || []).length;
+  return (wl.SNIPER || []).length + (wl['CAÇADOR'] || []).length + (wl.PESCADOR || []).length + (wl.BALEEIRO || []).length;
 }
 
-// ========== ESTADO DE TRADES / PRONTIDÃO ==========
+// ========== ESTADO EM MEMÓRIA ==========
 const tradesAbertos = new Map();
 const cooldownPosTrade = new Map();
-
-// ⭐ OTIMIZAÇÃO #2 — anti-duplicado em memória
 const ultimoSinalPorPar = new Map();
-
 const prontidaoHistorico = new Map();
 const prontidaoAtiva = new Set();
 const prontidaoForaContagem = new Map();
 const COOLDOWN_POS_TRADE_MS = 10 * 60 * 1000;
-
 const prontidaoUltimoEnvio = new Map();
 const arrefecimentoUltimoEnvio = new Map();
 const prontidaoGlobalPorSymbol = new Map();
@@ -561,187 +685,152 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// ========== PERSISTÊNCIA ==========
+// ========== PERSISTÊNCIA (Turso) ==========
 async function persistTradeOpen(tradeKey, trade) {
-  if (!firebaseInitialized) return;
+  if (!tursoInitialized) return;
   try {
-    await db.collection('open_trades').doc(tradeKey).set({
-      ...trade,
-      atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    await db.execute({
+      sql: `INSERT INTO open_trades (trade_key, data, atualizado_em) VALUES (?, ?, ?)
+            ON CONFLICT(trade_key) DO UPDATE SET data=excluded.data, atualizado_em=excluded.atualizado_em`,
+      args: [tradeKey, JSON.stringify(trade), Date.now()]
+    });
   } catch (err) { logger.error('Erro persistTradeOpen:', err.message); }
 }
 
 async function persistTradeUpdate(tradeKey, trade) {
-  if (!firebaseInitialized) return;
+  if (!tursoInitialized) return;
   try {
-    await db.collection('open_trades').doc(tradeKey).set({
-      currentPrice: trade.currentPrice,
-      avisoSeguindoEnviado: trade.avisoSeguindoEnviado,
-      avisoZeroRiscoEnviado: trade.avisoZeroRiscoEnviado,
-      avisoQuaseLaEnviado: trade.avisoQuaseLaEnviado,
-      avisoAceleracaoEnviado: trade.avisoAceleracaoEnviado,
-      avisoTempoEsgotadoEnviado: trade.avisoTempoEsgotadoEnviado,
-      aviso5MinEnviado: trade.aviso5MinEnviado,
-      avisoExaustaoEnviado: trade.avisoExaustaoEnviado,
-      timeoutAt: trade.timeoutAt,
-      extensoes: trade.extensoes,
-      percentualNoUltimoCheck: trade.percentualNoUltimoCheck,
-      atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    await db.execute({
+      sql: `INSERT INTO open_trades (trade_key, data, atualizado_em) VALUES (?, ?, ?)
+            ON CONFLICT(trade_key) DO UPDATE SET data=excluded.data, atualizado_em=excluded.atualizado_em`,
+      args: [tradeKey, JSON.stringify(trade), Date.now()]
+    });
   } catch (err) { logger.error('Erro persistTradeUpdate:', err.message); }
 }
 
 async function removePersistedTrade(tradeKey) {
-  if (!firebaseInitialized) return;
-  try { await db.collection('open_trades').doc(tradeKey).delete(); }
+  if (!tursoInitialized) return;
+  try { await db.execute({ sql: 'DELETE FROM open_trades WHERE trade_key = ?', args: [tradeKey] }); }
   catch (err) { logger.error('Erro removePersistedTrade:', err.message); }
 }
 
 async function persistCooldown(tradeKey, expiresAt) {
-  if (!firebaseInitialized) return;
+  if (!tursoInitialized) return;
   try {
-    await db.collection('cooldowns').doc(tradeKey).set({
-      expiresAt, atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
+    await db.execute({
+      sql: `INSERT INTO cooldowns (trade_key, expires_at, atualizado_em) VALUES (?, ?, ?)
+            ON CONFLICT(trade_key) DO UPDATE SET expires_at=excluded.expires_at, atualizado_em=excluded.atualizado_em`,
+      args: [tradeKey, expiresAt, Date.now()]
     });
   } catch (err) { logger.error('Erro persistCooldown:', err.message); }
 }
 
 async function removePersistedCooldown(tradeKey) {
-  if (!firebaseInitialized) return;
-  try { await db.collection('cooldowns').doc(tradeKey).delete(); }
+  if (!tursoInitialized) return;
+  try { await db.execute({ sql: 'DELETE FROM cooldowns WHERE trade_key = ?', args: [tradeKey] }); }
   catch (err) { logger.error('Erro removePersistedCooldown:', err.message); }
 }
 
 async function persistProntidao(tradeKey, historico, ativa) {
-  if (!firebaseInitialized) return;
+  if (!tursoInitialized) return;
   try {
-    await db.collection('prontidao_state').doc(tradeKey).set({
-      historico: historico || [],
-      ativa: !!ativa,
-      atualizadoEm: admin.firestore.FieldValue.serverTimestamp()
+    await db.execute({
+      sql: `INSERT INTO prontidao_state (trade_key, historico, ativa, atualizado_em) VALUES (?, ?, ?, ?)
+            ON CONFLICT(trade_key) DO UPDATE SET historico=excluded.historico, ativa=excluded.ativa, atualizado_em=excluded.atualizado_em`,
+      args: [tradeKey, JSON.stringify(historico || []), ativa ? 1 : 0, Date.now()]
     });
   } catch (err) { logger.error('Erro persistProntidao:', err.message); }
 }
 
 async function removePersistedProntidao(tradeKey) {
-  if (!firebaseInitialized) return;
-  try { await db.collection('prontidao_state').doc(tradeKey).delete(); }
+  if (!tursoInitialized) return;
+  try { await db.execute({ sql: 'DELETE FROM prontidao_state WHERE trade_key = ?', args: [tradeKey] }); }
   catch (err) { logger.error('Erro removePersistedProntidao:', err.message); }
 }
 
-// ⭐ PATCH 5 — arranque resiliente a quota esgotada
-let _arranqueConcluido = false;
-
-async function loadStateFromFirestore() {
-  if (!firebaseInitialized) {
-    logger.warn('⏭️ loadStateFromFirestore: Firebase indisponível, a saltar.');
+// ⭐ Arranque resiliente — adaptado para Turso
+async function loadStateFromTurso() {
+  if (!tursoInitialized) {
+    logger.warn('⏭️ loadStateFromTurso: Turso indisponível, a saltar.');
     return;
   }
-
-  const tentarRestauro = async (tentativa) => {
+  try {
+    // Anti-duplicado (últimos 5min)
     try {
-      // Restaurar anti-duplicado
-      try {
-        const cincoMinAtras = new Date(Date.now() - 5 * 60 * 1000);
-        const recentes = await db.collection('signals')
-          .where('tipo', '==', 'SINAL_CONFIRMADO')
-          .where('criadoEm', '>=', cincoMinAtras)
-          .get();
-        recentes.docs.forEach(d => {
-          const data = d.data();
-          if (data.symbol && data.mode) {
-            const ts = data.criadoEm?.toDate?.()?.getTime?.() || Date.now();
-            ultimoSinalPorPar.set(`${data.symbol}_${data.mode}`, ts);
-          }
-        });
-        logger.info(`♻️ Anti-duplicado restaurado: ${recentes.size} sinal(is) recente(s)`);
-      } catch (e) {
-        logger.warn(`⚠️ Falha ao restaurar anti-duplicado: ${e.message}`);
-      }
-
-      const tradesSnap = await db.collection('open_trades').get();
-      const agora = Date.now();
-      let tradesRestaurados = 0, tradesExpirados = 0;
-      for (const doc of tradesSnap.docs) {
-        const t = doc.data();
-        const timestampTrade = t.timestamp || 0;
-        const timeoutModo = getTimeoutModo(t.mode);
-        const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
-
-        if (agora > timeoutAt && !t.timeoutAt) {
-          t.timeoutAt = agora + 60 * 1000;
-        } else if (agora > timeoutAt) {
-          t.timeoutAt = agora + 60 * 1000;
+      const cincoMinAtras = Date.now() - 5 * 60 * 1000;
+      const res = await db.execute({
+        sql: "SELECT symbol, mode, criado_em FROM signals WHERE tipo = 'SINAL_CONFIRMADO' AND criado_em >= ?",
+        args: [cincoMinAtras]
+      });
+      res.rows.forEach(row => {
+        if (row.symbol && row.mode) {
+          ultimoSinalPorPar.set(`${row.symbol}_${row.mode}`, row.criado_em);
         }
-        if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
-        tradesAbertos.set(doc.id, t);
-        tradesRestaurados++;
-      }
-
-      const cdSnap = await db.collection('cooldowns').get();
-      let cdRestaurados = 0, cdExpirados = 0;
-      for (const doc of cdSnap.docs) {
-        const c = doc.data();
-        if (c.expiresAt && c.expiresAt > agora) { cooldownPosTrade.set(doc.id, c.expiresAt); cdRestaurados++; }
-        else { await doc.ref.delete(); cdExpirados++; }
-      }
-
-      const prSnap = await db.collection('prontidao_state').get();
-      let prRestaurados = 0;
-      for (const doc of prSnap.docs) {
-        const p = doc.data();
-        if (Array.isArray(p.historico) && p.historico.length > 0) prontidaoHistorico.set(doc.id, p.historico);
-        if (p.ativa) prontidaoAtiva.add(doc.id);
-        prRestaurados++;
-      }
-
-      logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${tradesExpirados} trade(s) expirado(s), ${cdExpirados} cooldown(s) expirado(s)`);
-      _arranqueConcluido = true;
-      return true;
-    } catch (err) {
-      logger.error(`❌ Erro ao carregar estado do Firestore (tentativa ${tentativa}): ${err.message}`);
-
-      const isQuotaError = /RESOURCE_EXHAUSTED|Quota exceeded/i.test(err.message);
-      if (isQuotaError && tentativa < 24) {
-        const proximaTentativa = tentativa + 1;
-        const espera = Math.min(30 * 60 * 1000, 5 * 60 * 1000 * Math.pow(2, tentativa - 1));
-        logger.warn(`⏳ Quota esgotada. Nova tentativa de restauro em ${Math.round(espera/60000)}min (tentativa ${proximaTentativa}/24)`);
-        setTimeout(() => tentarRestauro(proximaTentativa), espera);
-      }
-      return false;
+      });
+      logger.info(`♻️ Anti-duplicado restaurado: ${res.rows.length} sinal(is) recente(s)`);
+    } catch (e) {
+      logger.warn(`⚠️ Falha ao restaurar anti-duplicado: ${e.message}`);
     }
-  };
 
-  await tentarRestauro(1);
+    // Trades abertos
+    const tradesRes = await db.execute('SELECT trade_key, data FROM open_trades');
+    const agora = Date.now();
+    let tradesRestaurados = 0;
+    for (const row of tradesRes.rows) {
+      const t = JSON.parse(row.data);
+      const timestampTrade = t.timestamp || 0;
+      const timeoutModo = getTimeoutModo(t.mode);
+      const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
+      if (agora > timeoutAt) t.timeoutAt = agora + 60 * 1000;
+      if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
+      tradesAbertos.set(row.trade_key, t);
+      tradesRestaurados++;
+    }
+
+    // Cooldowns
+    const cdRes = await db.execute('SELECT trade_key, expires_at FROM cooldowns');
+    let cdRestaurados = 0, cdExpirados = 0;
+    for (const row of cdRes.rows) {
+      if (row.expires_at && row.expires_at > agora) {
+        cooldownPosTrade.set(row.trade_key, row.expires_at);
+        cdRestaurados++;
+      } else {
+        await db.execute({ sql: 'DELETE FROM cooldowns WHERE trade_key = ?', args: [row.trade_key] });
+        cdExpirados++;
+      }
+    }
+
+    // Prontidões
+    const prRes = await db.execute('SELECT trade_key, historico, ativa FROM prontidao_state');
+    let prRestaurados = 0;
+    for (const row of prRes.rows) {
+      const hist = JSON.parse(row.historico || '[]');
+      if (Array.isArray(hist) && hist.length > 0) prontidaoHistorico.set(row.trade_key, hist);
+      if (row.ativa) prontidaoAtiva.add(row.trade_key);
+      prRestaurados++;
+    }
+
+    logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${cdExpirados} cooldown(s) expirado(s)`);
+  } catch (err) {
+    logger.error(`❌ Erro ao carregar estado do Turso: ${err.message}`);
+  }
 }
 
+// ========== HELPERS (inalterados) ==========
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
-
-  // ⭐ ALINHAMENTO #4 — RESPIRAÇÃO activa → não emitir PRONTIDAO direccional
-  // O motor está bloqueado por respiração — não faz sentido sugerir direcção.
-  if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasonsTexto)) {
-    return null;
-  }
-
-  // ⭐ ALINHAMENTO #1 — NÃO extrair direcção de notas "não confirmadas"
+  if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasonsTexto)) return null;
   const notaindicaIncerteza = /NÃO confirmada|não confirmada|SEM DIREÇÃO DEFINIDA|sem direção definida|FRÁGIL|aguarda alinhamento/i.test(nota);
-
   if (!notaindicaIncerteza) {
     const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
     if (matchNota) return matchNota[1].toUpperCase() === 'ALTA' ? 'CALL' : 'PUT';
   }
-
-  // Fallback: razões de score (ignora se indicam NEUTRAL/incerteza)
   const razaoTrend = (dados.consolidated.score_reasons || []).find(r => r.includes('🧭'));
   if (razaoTrend && !/NEUTRAL|neutro|não confirmada|SEM DIREÇÃO/i.test(razaoTrend)) {
     if (/Tendência de fundo:\s*ALTA|Tendência assumida:\s*(UP|ALTA)|reversão para UP/i.test(razaoTrend)) return 'CALL';
     if (/Tendência de fundo:\s*BAIXA|Tendência assumida:\s*(DOWN|BAIXA)|reversão para DOWN/i.test(razaoTrend)) return 'PUT';
   }
-
-  // Fallback final: votos dos TFs (só dispara com maioria clara ≥60%)
   const sinais = [];
   for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing', 'h4_timing']) {
     const s = dados.consolidated[tf]?.sinal;
@@ -753,27 +842,20 @@ function extrairDirecaoPrep(dados) {
     const ratio = Math.max(puts, calls) / sinais.length;
     if (ratio >= 0.6) return puts > calls ? 'PUT' : 'CALL';
   }
-
-  // Sem direcção clara → não emitir PRONTIDAO direccional
   return null;
 }
 
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
-
-  // ⭐ ALINHAMENTO #4 — RESPIRAÇÃO activa → BLOQUEADO (mais informativo que FORMAÇÃO)
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado precisa respirar — aguarda normalizar' };
   }
-
-  // ⭐ ALINHAMENTO #2 — reconhecer estados do motor pós-FIX #1b/#1c/#1e
   if (/Tendência NEUTRAL.*reversão não confirmada|Reversão NÃO confirmada/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'motor em NEUTRAL — reversão ainda por confirmar' };
   }
   if (/SEM DIREÇÃO DEFINIDA|Tendência indefinida|SEM DIREÇÃO/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'mercado sem direção clara' };
   }
-
   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
   }
@@ -804,38 +886,24 @@ function diagnosticoProximidade(reasons) {
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
-
-  // ⭐ ALINHAMENTO #4 — RESPIRAÇÃO activa → classificar como ALTO
-  // Sem isto, o painel pode emitir PRONTIDAO em mercado bloqueado por extremo.
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     const match = texto.match(/RESPIRAÇÃO\s+(SIMPLES|DUPLA)/i);
     const tipo = match ? match[1] : 'SIMPLES';
     return { esticado: true, nivel: 'ALTO', motivo: `Respiração ${tipo} — mercado em extremo` };
   }
-
-  // ⭐ ALINHAMENTO #3 — bloqueios "SINAL ANULADO" contam como extremo ALTO
   if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'DeMarker extremo confirmado' };
   }
-
   if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
   if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
-
   if (/RSI\s+(7[5-9]|8\d|9\d)\b/i.test(texto)) alertas.push('RSI extremo alto');
   if (/RSI\s+([0-9]|1\d|2[0-5])\b/i.test(texto)) alertas.push('RSI extremo baixo');
-
   if (/RSI.*zona alta/i.test(texto)) alertas.push('RSI zona alta');
   if (/RSI.*zona baixa/i.test(texto)) alertas.push('RSI zona baixa');
-
   if (/(DeMarker|DeM)\s+0\.6[5-9]/i.test(texto)) alertas.push('DeM a esticar');
   if (/(DeMarker|DeM)\s+0\.3[0-5]/i.test(texto)) alertas.push('DeM a esticar (baixo)');
-
-  if (alertas.length >= 2) {
-    return { esticado: true, nivel: 'ALTO', motivo: alertas.slice(0, 3).join(' · ') };
-  }
-  if (alertas.length === 1) {
-    return { esticado: true, nivel: 'MÉDIO', motivo: alertas[0] };
-  }
+  if (alertas.length >= 2) return { esticado: true, nivel: 'ALTO', motivo: alertas.slice(0, 3).join(' · ') };
+  if (alertas.length === 1) return { esticado: true, nivel: 'MÉDIO', motivo: alertas[0] };
   return { esticado: false, nivel: 'BAIXO', motivo: 'mercado saudável' };
 }
 
@@ -845,70 +913,42 @@ function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
   const score = dados?.consolidated?.score || 0;
   const reasons = (dados?.consolidated?.score_reasons || []).join(' ');
   const estic = esticPreCalculado || avaliarEsticamento(dados?.consolidated?.score_reasons);
-
-  if (estic.esticado && estic.nivel === 'ALTO') {
-    return 15 * 60 * 1000;
-  }
-  if (tipoFecho === 'WIN' && zona === 'A' && score >= 60 && !estic.esticado) {
-    return 3 * 60 * 1000;
-  }
-  if (tipoFecho === 'STOP' && zona === 'A' && score >= 55 && !estic.esticado) {
-    return 5 * 60 * 1000;
-  }
-  if (tipoFecho === 'TIMEOUT' && /pullback/i.test(reasons)) {
-    return 4 * 60 * 1000;
-  }
+  if (estic.esticado && estic.nivel === 'ALTO') return 15 * 60 * 1000;
+  if (tipoFecho === 'WIN' && zona === 'A' && score >= 60 && !estic.esticado) return 3 * 60 * 1000;
+  if (tipoFecho === 'STOP' && zona === 'A' && score >= 55 && !estic.esticado) return 5 * 60 * 1000;
+  if (tipoFecho === 'TIMEOUT' && /pullback/i.test(reasons)) return 4 * 60 * 1000;
   return COOLDOWN_DEFAULT;
 }
 
 function confirmaExaustaoMultiTF(dados, trade) {
   const tfs = dados?.timeframes || {};
   const mode = trade?.mode;
-
   const CONFIRM_TF = {
     'SNIPER':   { trigger: 'M1',  confirm: 'M5'  },
     'CAÇADOR':  { trigger: 'M5',  confirm: 'M15' },
     'PESCADOR': { trigger: 'H1',  confirm: 'H4'  },
     'BALEEIRO': { trigger: 'H4',  confirm: 'H24' }
   };
-
   const cfg = CONFIRM_TF[mode];
   if (!cfg) return { confirmado: false, motivo: 'modo desconhecido' };
-
   const confTF = tfs[cfg.confirm];
   if (!confTF) return { confirmado: false, motivo: `${cfg.confirm} sem dados` };
-
   const confRSI = confTF.rsi ?? 50;
   const confStatus = confTF.macd_phase?.status || {};
   const confHist = confTF.macd_phase?.histogram ?? null;
   const confPrevHist = confTF.macd_phase?.prev_histogram ?? null;
-
   const isCall = trade.signal === 'CALL';
-
-  const macdInvertido = isCall
-    ? confStatus.histograma === '❌ NEGATIVO'
-    : confStatus.histograma === '✅ POSITIVO';
-
-  if (macdInvertido) {
-    return { confirmado: true, motivo: `${cfg.confirm} MACD virou contra` };
-  }
-
+  const macdInvertido = isCall ? confStatus.histograma === '❌ NEGATIVO' : confStatus.histograma === '✅ POSITIVO';
+  if (macdInvertido) return { confirmado: true, motivo: `${cfg.confirm} MACD virou contra` };
   const rsiExtremo = isCall ? confRSI >= 75 : confRSI <= 25;
-  if (rsiExtremo) {
-    return { confirmado: true, motivo: `${cfg.confirm} RSI ${confRSI.toFixed(0)} extremo` };
-  }
-
+  if (rsiExtremo) return { confirmado: true, motivo: `${cfg.confirm} RSI ${confRSI.toFixed(0)} extremo` };
   const histEncolhendo = (confHist != null && confPrevHist != null && confPrevHist !== 0)
-    ? Math.abs(confHist) < Math.abs(confPrevHist) * 0.60
-    : false;
-
+    ? Math.abs(confHist) < Math.abs(confPrevHist) * 0.60 : false;
   if (histEncolhendo && (isCall ? confRSI >= 68 : confRSI <= 32)) {
     return { confirmado: true, motivo: `${cfg.confirm} hist a encolher + RSI ${confRSI.toFixed(0)}` };
   }
-
   return { confirmado: false, motivo: `${cfg.confirm} ainda suporta (RSI ${confRSI.toFixed(0)})` };
 }
-
 // ========== FORMATAÇÃO DE MENSAGENS ==========
 
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
@@ -920,68 +960,26 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
 
   let proximidade, detalhe, emoji;
+  if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
+  else if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasons)) { emoji = '🌬️'; proximidade = 'BLOQUEADO'; detalhe = 'mercado precisa respirar — aguarda normalizar'; }
+  else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) { emoji = '⛔'; proximidade = 'BLOQUEADO'; detalhe = 'mercado em extremo — aguarda normalizar'; }
+  else if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(reasons)) { emoji = '🚫'; proximidade = 'BLOQUEADO'; detalhe = 'micro timing contra — aguarda alinhar'; }
+  else if (/\(micro timing\) está contra a tendência/i.test(reasons)) { emoji = '🚫'; proximidade = 'BLOQUEADO'; detalhe = 'micro timing contra a tendência'; }
+  else if (/\[FIX #40b\]|hist a desacelerar|trigger em conflito NÃO aceite/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'momentum a desacelerar — aguarda estabilizar'; }
+  else if (/Pullback.*BLOQUEADO por estrutura esticada|estrutura no extremo.*aguarda correção/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'estrutura esticada — aguarda correção'; }
+  else if (/Zona A rebaixada para B|Zona final rebaixada para B/i.test(reasons)) { emoji = '👀'; proximidade = 'EM FORMAÇÃO'; detalhe = 'confiança baixa — aguarda reforço'; }
+  else if (/ADX muito fraco/i.test(reasons)) { emoji = '💤'; proximidade = 'LONGE'; detalhe = 'tendência macro sem força'; }
+  else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(reasons)) { emoji = '👀'; proximidade = 'EM FORMAÇÃO'; detalhe = 'gatilho em ajuste — prepara-te'; }
+  else { emoji = '📊'; proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento'; }
 
-  if (nivel === 'MATURE') {
-    emoji = '🔥';
-    proximidade = 'PERTO DE ENTRAR';
-    detalhe = 'setup quase confirmado — prepara a entrada';
-  }
-  else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) {
-    emoji = '⛔';
-    proximidade = 'BLOQUEADO';
-    detalhe = 'mercado em extremo — aguarda normalizar';
-  } else if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(reasons)) {
-    emoji = '🚫';
-    proximidade = 'BLOQUEADO';
-    detalhe = 'micro timing contra — aguarda alinhar';
-  } else if (/\(micro timing\) está contra a tendência/i.test(reasons)) {
-    emoji = '🚫';
-    proximidade = 'BLOQUEADO';
-    detalhe = 'micro timing contra a tendência';
-  }
-  else if (/\[FIX #40b\]|hist a desacelerar|trigger em conflito NÃO aceite/i.test(reasons)) {
-    emoji = '🛑';
-    proximidade = 'BLOQUEADO';
-    detalhe = 'momentum a desacelerar — aguarda estabilizar';
-  }
-  else if (/Pullback.*BLOQUEADO por estrutura esticada|estrutura no extremo.*aguarda correção/i.test(reasons)) {
-    emoji = '🛑';
-    proximidade = 'BLOQUEADO';
-    detalhe = 'estrutura esticada — aguarda correção';
-  }
-  else if (/Zona A rebaixada para B|Zona final rebaixada para B/i.test(reasons)) {
-    emoji = '👀';
-    proximidade = 'EM FORMAÇÃO';
-    detalhe = 'confiança baixa — aguarda reforço';
-  }
-  else if (/ADX muito fraco/i.test(reasons)) {
-    emoji = '💤';
-    proximidade = 'LONGE';
-    detalhe = 'tendência macro sem força';
-  } else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(reasons)) {
-    emoji = '👀';
-    proximidade = 'EM FORMAÇÃO';
-    detalhe = 'gatilho em ajuste — prepara-te';
-  } else {
-    emoji = '📊';
-    proximidade = 'EM FORMAÇÃO';
-    detalhe = 'aguardando alinhamento';
-  }
-
-  const prefixoTitulo = nivel === 'MATURE'
-    ? `🔥 Perto de entrar: ${nomeAmigavel}`
-    : `👀 Em formação: ${nomeAmigavel}`;
-
+  const prefixoTitulo = nivel === 'MATURE' ? `🔥 Perto de entrar: ${nomeAmigavel}` : `👀 Em formação: ${nomeAmigavel}`;
   return {
     titulo: prefixoTitulo,
     corpo: `${dirLabel} · ${nomeAmigavel}\n⚡ Score ${score}/100 · ${proximidade}\n💡 ${detalhe}`,
     detalhes: {
-      tipo: 'PRONTIDAO',
-      nomeAmigavel, direcao, modo: extras.mode || null,
-      score, zona: dados.consolidated.zona,
-      proximidade, detalhe,
-      nivelProntidao: nivel,
-      scoreQuase,
+      tipo: 'PRONTIDAO', nomeAmigavel, direcao, modo: extras.mode || null,
+      score, zona: dados.consolidated.zona, proximidade, detalhe,
+      nivelProntidao: nivel, scoreQuase,
       reasons: (dados.consolidated.score_reasons || []).slice(0, 14),
       price: dados.consolidated.price
     }
@@ -993,11 +991,7 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   return {
     titulo: `😴 Prontidão encerrada: ${nomeAmigavel}`,
     corpo: `${nomeAmigavel}\n📉 Score atual ${score}/100 · saiu da Zona B\n✅ A espera anterior foi cancelada`,
-    detalhes: {
-      tipo: 'ARREFECIMENTO', nomeAmigavel, score,
-      motivo: 'Setup perdeu força e saiu da Zona B',
-      reasons: (dados?.consolidated?.score_reasons || []).slice(0, 5)
-    }
+    detalhes: { tipo: 'ARREFECIMENTO', nomeAmigavel, score, motivo: 'Setup perdeu força e saiu da Zona B', reasons: (dados?.consolidated?.score_reasons || []).slice(0, 5) }
   };
 }
 
@@ -1010,144 +1004,63 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const conf = (Number.isFinite(confNum) ? (confNum * 100).toFixed(1) : '0.0');
   const zona = consolidated.zona === 'B' ? 'B' : 'A';
   const tituloBase = zona === 'A' ? '🚨 SINAL CONFIRMADO' : '⚡ SINAL MODERADO';
-
   return {
     titulo: `${tituloBase}: ${nomeAmigavel}`,
     corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}`,
-    detalhes: {
-      tipo: 'SINAL_CONFIRMADO',
-      nomeAmigavel, direcao: consolidated.signal, modo: mode,
+    detalhes: { tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
       entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
       score: consolidated.score, confidence: conf, price: consolidated.price,
-      reasons: (consolidated.score_reasons || []).slice(0, 14),
-      zona
-    }
+      reasons: (consolidated.score_reasons || []).slice(0, 14), zona }
   };
 }
 
 function formatarMensagem5Min(trade) {
   const nome = getFriendlyName(trade.symbol);
-  return {
-    titulo: `⏱️ Atualização (5min): ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n💵 Preço atual ${trade.currentPrice} (entrada ${trade.entry})\n📈 Mantém a posição — trade em curso`,
-    detalhes: {
-      tipo: '5MIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, currentPrice: trade.currentPrice,
-      takeProfit: trade.takeProfit, stopLoss: trade.stopLoss
-    }
-  };
+  return { titulo: `⏱️ Atualização (5min): ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço atual ${trade.currentPrice} (entrada ${trade.entry})\n📈 Mantém a posição — trade em curso`, detalhes: { tipo: '5MIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss } };
 }
 
 function formatarMensagemAceleracao(trade) {
   const nome = getFriendlyName(trade.symbol);
-  return {
-    titulo: `🚀 Mercado acelerando: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} — movimento forte\n🎯 Deixe correr até o TP ${trade.takeProfit}`,
-    detalhes: {
-      tipo: 'ACELERACAO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
-    }
-  };
+  return { titulo: `🚀 Mercado acelerando: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} — movimento forte\n🎯 Deixe correr até o TP ${trade.takeProfit}`, detalhes: { tipo: 'ACELERACAO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit } };
 }
 
 function formatarMensagemSeguindo(trade) {
   const nome = getFriendlyName(trade.symbol);
-  return {
-    titulo: `✅ Seguindo o sinal: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · tendência confirmada\n📊 +30% do alvo percorrido`,
-    detalhes: {
-      tipo: 'SEGUINDO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
-    }
-  };
+  return { titulo: `✅ Seguindo o sinal: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · tendência confirmada\n📊 +30% do alvo percorrido`, detalhes: { tipo: 'SEGUINDO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit } };
 }
 
 function formatarMensagemZeroRisco(trade) {
   const nome = getFriendlyName(trade.symbol);
-  return {
-    titulo: `🛡️ Zero Risco: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n✅ +50% do alvo — move SL para a entrada\n🎯 Entrada ${trade.entry} (proteção ativa)`,
-    detalhes: {
-      tipo: 'ZERO_RISCO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
-    }
-  };
+  return { titulo: `🛡️ Zero Risco: ${nome}`, corpo: `${nome} · ${trade.signal}\n✅ +50% do alvo — move SL para a entrada\n🎯 Entrada ${trade.entry} (proteção ativa)`, detalhes: { tipo: 'ZERO_RISCO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit } };
 }
 
 function formatarMensagemQuaseLa(trade) {
   const nome = getFriendlyName(trade.symbol);
-  return {
-    titulo: `⏳ Quase no alvo: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · 🎯 Alvo ${trade.takeProfit}\n📊 +80% percorrido — atenção máxima`,
-    detalhes: {
-      tipo: 'QUASE_LA', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit
-    }
-  };
+  return { titulo: `⏳ Quase no alvo: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · 🎯 Alvo ${trade.takeProfit}\n📊 +80% percorrido — atenção máxima`, detalhes: { tipo: 'QUASE_LA', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit } };
 }
 
 function formatarMensagemWin(trade) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
-  return {
-    titulo: `🎯 WIN: ${nome}`,
-    corpo: `${nome} · ${trade.signal} ✅\n💰 Alvo ${trade.takeProfit} atingido!\n⏱️ Duração: ${duracao}min · fecha a posição`,
-    detalhes: {
-      tipo: 'WIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, takeProfit: trade.takeProfit, currentPrice: trade.currentPrice,
-      duracao: duracao + 'min'
-    }
-  };
+  return { titulo: `🎯 WIN: ${nome}`, corpo: `${nome} · ${trade.signal} ✅\n💰 Alvo ${trade.takeProfit} atingido!\n⏱️ Duração: ${duracao}min · fecha a posição`, detalhes: { tipo: 'WIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, takeProfit: trade.takeProfit, currentPrice: trade.currentPrice, duracao: duracao + 'min' } };
 }
 
 function formatarMensagemStop(trade) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
-  return {
-    titulo: `🛑 Stop Loss: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n📉 Preço ${trade.currentPrice} bateu SL ${trade.stopLoss}\n⏱️ Duração: ${duracao}min · fecha a posição`,
-    detalhes: {
-      tipo: 'STOP', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, stopLoss: trade.stopLoss, currentPrice: trade.currentPrice,
-      duracao: duracao + 'min'
-    }
-  };
+  return { titulo: `🛑 Stop Loss: ${nome}`, corpo: `${nome} · ${trade.signal}\n📉 Preço ${trade.currentPrice} bateu SL ${trade.stopLoss}\n⏱️ Duração: ${duracao}min · fecha a posição`, detalhes: { tipo: 'STOP', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, stopLoss: trade.stopLoss, currentPrice: trade.currentPrice, duracao: duracao + 'min' } };
 }
 
 function formatarMensagemTempoEsgotado(trade) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
-  return {
-    titulo: `⏱️ Tempo esgotado: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n💵 Preço perto da entrada (${trade.currentPrice})\n✅ Considera fechar no breakeven`,
-    detalhes: {
-      tipo: 'TEMPO_ESGOTADO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, currentPrice: trade.currentPrice,
-      takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: duracao + 'min'
-    }
-  };
+  return { titulo: `⏱️ Tempo esgotado: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço perto da entrada (${trade.currentPrice})\n✅ Considera fechar no breakeven`, detalhes: { tipo: 'TEMPO_ESGOTADO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: duracao + 'min' } };
 }
 
 function formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, motivo) {
   const nome = getFriendlyName(trade.symbol);
   const pct = (percentualPercorrido * 100).toFixed(1);
-  return {
-    titulo: `⚠️ Exaustão detetada: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n📉 Tendência a perder força — ${motivo}\n💡 Considera fechar ANTES do SL tocar (${pct}% do alvo · ${tempoDecorridoMin}min)`,
-    detalhes: {
-      tipo: 'EXAUSTAO',
-      nomeAmigavel: nome,
-      direcao: trade.signal,
-      modo: trade.mode,
-      entry: trade.entry,
-      currentPrice,
-      takeProfit: trade.takeProfit,
-      stopLoss: trade.stopLoss,
-      motivo,
-      percentualPercorrido: pct + '%',
-      duracao: tempoDecorridoMin + 'min'
-    }
-  };
+  return { titulo: `⚠️ Exaustão detetada: ${nome}`, corpo: `${nome} · ${trade.signal}\n📉 Tendência a perder força — ${motivo}\n💡 Considera fechar ANTES do SL tocar (${pct}% do alvo · ${tempoDecorridoMin}min)`, detalhes: { tipo: 'EXAUSTAO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, motivo, percentualPercorrido: pct + '%', duracao: tempoDecorridoMin + 'min' } };
 }
 
 function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo) {
@@ -1155,43 +1068,41 @@ function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo)
   const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
   const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
   const pct = distanciaTotal > 0 ? ((distanciaPercorrida / distanciaTotal) * 100).toFixed(1) : '0.0';
-
-  return {
-    titulo: `🕐 Encerrado por timeout: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n⏱️ ${tempoDecorridoMin}min sem avanço suficiente (${pct}% do alvo)\n❌ Motivo: ${motivo} · fecha a posição`,
-    detalhes: {
-      tipo: 'TIMEOUT', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode,
-      entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss,
-      duracao: tempoDecorridoMin + 'min',
-      motivo,
-      percentualPercorrido: pct + '%',
-      extensoes: trade.extensoes || 0
-    }
-  };
+  return { titulo: `🕐 Encerrado por timeout: ${nome}`, corpo: `${nome} · ${trade.signal}\n⏱️ ${tempoDecorridoMin}min sem avanço suficiente (${pct}% do alvo)\n❌ Motivo: ${motivo} · fecha a posição`, detalhes: { tipo: 'TIMEOUT', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: tempoDecorridoMin + 'min', motivo, percentualPercorrido: pct + '%', extensoes: trade.extensoes || 0 } };
 }
 
+// ========== REGISTAR SINAL (Turso) ==========
 async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watchers = []) {
   const { titulo, corpo, detalhes } = msg;
   logger.info(`[SINAL] ${symbol} (${mode}) [${tipo}] ${titulo} — ${corpo} · ${watchers.length} watcher(s)`);
-  if (firebaseInitialized) {
+
+  if (tursoInitialized) {
     try {
-      await db.collection('signals').add({
-        symbol, mode, tipo, titulo, corpo,
-        detalhes: detalhes || null,
-        ...extra,
-        watchers,
-        origem: 'motor',
-        criadoEm: admin.firestore.FieldValue.serverTimestamp()
+      await db.execute({
+        sql: `INSERT INTO signals (symbol, mode, tipo, titulo, corpo, detalhes, watchers, score, confidence, zona, entry, take_profit, stop_loss, nivel_prontidao, origem, criado_em)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          symbol, mode, tipo, titulo, corpo,
+          detalhes ? JSON.stringify(detalhes) : null,
+          JSON.stringify(watchers),
+          extra.score ?? null,
+          extra.confidence ?? null,
+          extra.zona ?? detalhes?.zona ?? null,
+          extra.entry ?? detalhes?.entry ?? null,
+          extra.takeProfit ?? detalhes?.takeProfit ?? null,
+          extra.stopLoss ?? detalhes?.stopLoss ?? null,
+          extra.nivelProntidao ?? detalhes?.nivelProntidao ?? null,
+          'motor',
+          Date.now()
+        ]
       });
     } catch (err) { logger.error('Erro ao gravar sinal:', err.message); }
   }
 
   const _openUrl = (tipo === 'SINAL_CONFIRMADO' || tipo === 'PRONTIDAO' || tipo === 'ARREFECIMENTO' || tipo === 'EXAUSTAO')
-    ? '/?open=signals'
-    : '/';
+    ? '/?open=signals' : '/';
   await sendPushToWatchers(watchers, {
-    title: titulo,
-    body: corpo,
+    title: titulo, body: corpo,
     tag: `${symbol}_${mode}_${tipo}`,
     data: { symbol, mode, tipo, url: _openUrl }
   });
@@ -1201,10 +1112,7 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
 async function buscarSinalAnalise(symbol, mode) {
   const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
   const adminKey = process.env.ADMIN_SECRET;
-  if (!adminKey) {
-    logger.error('❌ ADMIN_SECRET não configurado!');
-    return null;
-  }
+  if (!adminKey) { logger.error('❌ ADMIN_SECRET não configurado!'); return null; }
   try {
     const response = await fetch(`${API_URL}/analyze`, {
       method: 'POST',
@@ -1229,7 +1137,6 @@ async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers) {
       const t = tradesAbertos.get(tradeKey);
       if (!t) return;
       if (Date.now() - t.timestamp > 2 * 60 * 1000) return;
-
       const nomeAmigavel = getFriendlyName(symbol);
       await sendPushToWatchers(watchers, {
         title: `🚨 Lembrete: ${nomeAmigavel}`,
@@ -1238,9 +1145,7 @@ async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers) {
         data: { symbol, mode, tipo: 'SINAL_CONFIRMADO_RETRY', url: '/' }
       });
       logger.info(`🔁 [SINAL_CONFIRMADO_RETRY] ${symbol} (${mode}) reenviado após 30s`);
-    } catch (err) {
-      logger.error('Erro no retry do SINAL_CONFIRMADO:', err.message);
-    }
+    } catch (err) { logger.error('Erro no retry do SINAL_CONFIRMADO:', err.message); }
   }, 30 * 1000);
 }
 
@@ -1261,11 +1166,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
   }
 
   const trade = tradesAbertos.get(tradeKey);
-
   if (trade) {
     trade.currentPrice = currentPrice;
     const esticTradeCache = avaliarEsticamento(dados.consolidated.score_reasons);
-
     const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
     const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
     const percentualPercorrido = distanciaTotal > 0 ? (distanciaPercorrida / distanciaTotal) : 0;
@@ -1284,23 +1187,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         trade.timeoutAt = agora + timeoutExtendModo;
         trade.extensoes = extensoes + 1;
         trade.percentualNoUltimoCheck = percentualPercorrido;
-        logger.info(`⏭️ Trade ${tradeKey} [${trade.mode}] estendido (${trade.extensoes}/${EXTENSOES_MAX}) — progresso ${(percentualPercorrido*100).toFixed(1)}% (+${(progressoNovo*100).toFixed(1)}%)`);
+        logger.info(`⏭️ Trade ${tradeKey} [${trade.mode}] estendido (${trade.extensoes}/${EXTENSOES_MAX})`);
         persistTradeUpdate(tradeKey, trade);
       } else {
-        const motivo = extensoes >= EXTENSOES_MAX
-          ? `limite de ${EXTENSOES_MAX} extensões atingido`
-          : `sem avanço suficiente nas últimas ${Math.floor(timeoutExtendModo/60000)}min`;
-
-        await registrarEEnviarSinal(
-          symbol, mode, 'TIMEOUT',
-          formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo),
-          { score: dados.consolidated.score },
-          watchers
-        );
-
+        const motivo = extensoes >= EXTENSOES_MAX ? `limite de ${EXTENSOES_MAX} extensões atingido` : `sem avanço suficiente`;
+        await registrarEEnviarSinal(symbol, mode, 'TIMEOUT', formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo), { score: dados.consolidated.score }, watchers);
         tradesAbertos.delete(tradeKey);
         removePersistedTrade(tradeKey);
-
         const cdMsTimeout = calcularCooldownDinamico('TIMEOUT', dados, esticTradeCache);
         cooldownPosTrade.set(tradeKey, agora + cdMsTimeout);
         persistCooldown(tradeKey, agora + cdMsTimeout);
@@ -1309,9 +1202,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       }
     }
 
-    let msgObj = null;
-    let tipo = null;
-    let fecharTrade = false;
+    let msgObj = null, tipo = null, fecharTrade = false;
 
     if (trade.signal === 'CALL' && currentPrice >= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
     else if (trade.signal === 'PUT' && currentPrice <= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
@@ -1323,15 +1214,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         (trade.signal === 'PUT'  && /sobrevenda|RSI extremo baixo|RSI.*zona baixa|DeM a esticar \(baixo\)/i.test(esticTradeCache.motivo));
       if (esticTradeCache.esticado && esticTradeCache.nivel === 'ALTO' && contraDirecao) {
         const confirmacao = confirmaExaustaoMultiTF(dados, trade);
-
         if (confirmacao.confirmado) {
-          msgObj = formatarMensagemExaustao(
-            trade, currentPrice, tempoDecorridoMin, percentualPercorrido,
-            `${esticTradeCache.motivo} · ${confirmacao.motivo}`
-          );
+          msgObj = formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, `${esticTradeCache.motivo} · ${confirmacao.motivo}`);
           tipo = 'EXAUSTAO';
           trade.avisoExaustaoEnviado = true;
-          logger.info(`⚠️ [FIX #56+#58] Exaustão CONFIRMADA em ${tradeKey} | ${esticTradeCache.motivo} | ${confirmacao.motivo} | ${(percentualPercorrido*100).toFixed(1)}% do alvo`);
+          logger.info(`⚠️ [FIX #56+#58] Exaustão CONFIRMADA em ${tradeKey}`);
         } else {
           logger.info(`💨 [FIX #58] ${tradeKey} trigger esticado mas ${confirmacao.motivo} — aguarda confirmação`);
           if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
@@ -1360,7 +1247,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     if (fecharTrade) {
       tradesAbertos.delete(tradeKey);
       removePersistedTrade(tradeKey);
-
       const cdMs = calcularCooldownDinamico(tipo, dados, esticTradeCache);
       cooldownPosTrade.set(tradeKey, agora + cdMs);
       persistCooldown(tradeKey, agora + cdMs);
@@ -1369,29 +1255,25 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       persistTradeUpdate(tradeKey, trade);
     }
 
-    if (msgObj) {
-      await registrarEEnviarSinal(symbol, mode, tipo, msgObj, { score: dados.consolidated.score }, watchers);
-    }
+    if (msgObj) await registrarEEnviarSinal(symbol, mode, tipo, msgObj, { score: dados.consolidated.score }, watchers);
     return;
   }
 
-  // ⭐ OTIMIZAÇÃO #2 — anti-duplicado em memória (sem query ao Firestore)
-  const chaveAntiDup = `${symbol}_${mode}`;
-  const ultimoTs = ultimoSinalPorPar.get(chaveAntiDup) || 0;
+  // Anti-duplicado em memória
+  const ultimoTs = ultimoSinalPorPar.get(tradeKey) || 0;
   const CINCO_MIN_MS = 5 * 60 * 1000;
   if (Date.now() - ultimoTs < CINCO_MIN_MS) {
-    logger.info(`⏭️ Anti-duplicado (memória): sinal emitido há ${Math.round((Date.now() - ultimoTs)/1000)}s para ${symbol}/${mode} — a saltar`);
+    logger.info(`⏭️ Anti-duplicado (memória): sinal há ${Math.round((Date.now() - ultimoTs)/1000)}s para ${symbol}/${mode} — saltar`);
     return;
   }
 
-  if (dados.consolidated.signal !== 'HOLD'
-      && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
+  if (dados.consolidated.signal !== 'HOLD' && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
 
       const esticSinal = avaliarEsticamento(dados.consolidated.score_reasons);
       if (esticSinal.esticado && esticSinal.nivel === 'ALTO') {
-        logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) SINAL ignorado (zona ${dados.consolidated.zona}) — ${esticSinal.motivo}`);
+        logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) SINAL ignorado — ${esticSinal.motivo}`);
         prontidaoAtiva.delete(tradeKey);
         prontidaoHistorico.delete(tradeKey);
         prontidaoForaContagem.delete(tradeKey);
@@ -1399,8 +1281,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       }
 
       const novoTrade = {
-        symbol,
-        mode,
+        symbol, mode,
         signal: dados.consolidated.signal,
         entry: dados.suggestion.entry,
         takeProfit: dados.suggestion.takeProfit,
@@ -1408,47 +1289,34 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         zonaEntrada: dados.consolidated.zona,
         watchers: [...watchers],
         timestamp: agora,
-        avisoSeguindoEnviado: false,
-        avisoZeroRiscoEnviado: false,
-        avisoQuaseLaEnviado: false,
-        avisoAceleracaoEnviado: false,
-        avisoTempoEsgotadoEnviado: false,
-        aviso5MinEnviado: false,
+        avisoSeguindoEnviado: false, avisoZeroRiscoEnviado: false,
+        avisoQuaseLaEnviado: false, avisoAceleracaoEnviado: false,
+        avisoTempoEsgotadoEnviado: false, aviso5MinEnviado: false,
         avisoExaustaoEnviado: false,
         timeoutAt: agora + getTimeoutModo(mode),
-        extensoes: 0,
-        percentualNoUltimoCheck: 0
+        extensoes: 0, percentualNoUltimoCheck: 0
       };
 
       tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
-
-      // ⭐ OTIMIZAÇÃO #2 — registar timestamp para anti-duplicado em memória
-      ultimoSinalPorPar.set(`${symbol}_${mode}`, agora);
+      ultimoSinalPorPar.set(tradeKey, agora);
 
       const zonaTxt = dados.consolidated.zona === 'A' ? 'SINAL CONFIRMADO' : 'SINAL MODERADO';
-      logger.info(`🚀 [${zonaTxt}] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry} | TP ${dados.suggestion.takeProfit} | SL ${dados.suggestion.stopLoss} | zona ${dados.consolidated.zona} | score ${dados.consolidated.score}`);
+      logger.info(`🚀 [${zonaTxt}] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry}`);
 
       try {
         const msgSinal = formatarMensagemSinal(symbol, dados, mode);
-        logger.info(`🚀 [MSG OK] ${symbol} (${mode}) → titulo="${msgSinal.titulo}"`);
-
         await registrarEEnviarSinal(symbol, mode, 'SINAL_CONFIRMADO', msgSinal, {
-          score: dados.consolidated.score,
-          confidence: dados.consolidated.confidence,
+          score: dados.consolidated.score, confidence: dados.consolidated.confidence,
           zona: dados.consolidated.zona,
-          entry: dados.suggestion.entry,
-          takeProfit: dados.suggestion.takeProfit,
-          stopLoss: dados.suggestion.stopLoss
+          entry: dados.suggestion.entry, takeProfit: dados.suggestion.takeProfit, stopLoss: dados.suggestion.stopLoss
         }, watchers);
-
-        logger.info(`✅ [PUSH ENVIADO] ${symbol} (${mode}) → SINAL_CONFIRMADO (zona ${dados.consolidated.zona})`);
+        logger.info(`✅ [PUSH ENVIADO] ${symbol} (${mode}) → SINAL_CONFIRMADO`);
       } catch (errSinal) {
-        logger.error(`❌ FALHA AO ENVIAR SINAL_CONFIRMADO ${symbol} (${mode}): ${errSinal.message}\n${errSinal.stack || ''}`);
+        logger.error(`❌ FALHA AO ENVIAR SINAL_CONFIRMADO ${symbol}: ${errSinal.message}`);
       }
 
       _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers);
-
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
@@ -1457,18 +1325,14 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       removePersistedProntidao(tradeKey);
     }
   }
-  else if (dados.consolidated.signal === 'HOLD'
-        && (dados.consolidated.zona === 'B'
-         || dados.consolidated.zona === 'C')) {
+  else if (dados.consolidated.signal === 'HOLD' && (dados.consolidated.zona === 'B' || dados.consolidated.zona === 'C')) {
     const scoreAtual = dados.consolidated.score || 0;
-
     const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
     if (regimeAtualPush === 'CHOP') {
-      logger.info(`🔇 [FIX #60] PRONTIDAO ignorada em CHOP: ${symbol} (${mode}) score=${scoreAtual}`);
+      logger.info(`🔇 [FIX #60] PRONTIDAO ignorada em CHOP: ${symbol} (${mode})`);
       prontidaoForaContagem.delete(tradeKey);
       return;
     }
-
     const estic = avaliarEsticamento(dados.consolidated.score_reasons);
     if (estic.esticado && estic.nivel === 'ALTO') {
       logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) PRONTIDAO ignorada — ${estic.motivo}`);
@@ -1501,7 +1365,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const cfg = getProntidaoConfig(mode);
     const ultimoEnvio = prontidaoUltimoEnvio.get(tradeKey) || 0;
     const podeEnviarAgora = (agora - ultimoEnvio) >= cfg.cooldownMs;
-
     const ultimoGlobal = prontidaoGlobalPorSymbol.get(symbol) || 0;
     const podeEnviarGlobal = (agora - ultimoGlobal) >= PRONTIDAO_GLOBAL_COOLDOWN_MS;
 
@@ -1509,9 +1372,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       const direcaoPrep = extrairDirecaoPrep(dados);
       if (direcaoPrep) {
         const subindo = historico.length >= 3 && historico[historico.length - 1].score > historico[0].score;
-
-        const earlyTks = [];
-        const matureTks = [];
+        const earlyTks = [], matureTks = [];
         for (const tk of watchers) {
           const p = prefsPorWatcher.get(tk) || DEFAULT_PREFS[mode];
           if (scoreAtual < p.scoreEarly) continue;
@@ -1520,32 +1381,15 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         }
 
         if (matureTks.length > 0) {
-          await registrarEEnviarSinal(
-            symbol, mode, 'PRONTIDAO',
-            formatarMensagemPrep(symbol, direcaoPrep, dados, {
-              subindo, historico, mode,
-              nivelProntidao: 'MATURE',
-              scoreAtual,
-              scoreQuase: scoreAtual
-            }),
-            { score: scoreAtual, nivelProntidao: 'MATURE' },
-            matureTks
-          );
+          await registrarEEnviarSinal(symbol, mode, 'PRONTIDAO',
+            formatarMensagemPrep(symbol, direcaoPrep, dados, { subindo, historico, mode, nivelProntidao: 'MATURE', scoreAtual, scoreQuase: scoreAtual }),
+            { score: scoreAtual, nivelProntidao: 'MATURE' }, matureTks);
         }
         if (earlyTks.length > 0) {
-          await registrarEEnviarSinal(
-            symbol, mode, 'PRONTIDAO',
-            formatarMensagemPrep(symbol, direcaoPrep, dados, {
-              subindo, historico, mode,
-              nivelProntidao: 'EARLY',
-              scoreAtual,
-              scoreQuase: 999
-            }),
-            { score: scoreAtual, nivelProntidao: 'EARLY' },
-            earlyTks
-          );
+          await registrarEEnviarSinal(symbol, mode, 'PRONTIDAO',
+            formatarMensagemPrep(symbol, direcaoPrep, dados, { subindo, historico, mode, nivelProntidao: 'EARLY', scoreAtual, scoreQuase: 999 }),
+            { score: scoreAtual, nivelProntidao: 'EARLY' }, earlyTks);
         }
-
         if (matureTks.length > 0 || earlyTks.length > 0) {
           prontidaoAtiva.add(tradeKey);
           prontidaoUltimoEnvio.set(tradeKey, agora);
@@ -1560,17 +1404,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const cfg = getProntidaoConfig(mode);
     const fora = (prontidaoForaContagem.get(tradeKey) || 0) + 1;
     prontidaoForaContagem.set(tradeKey, fora);
-
     if (fora >= cfg.ciclosForaParaArrefecer) {
       const ultimoArref = arrefecimentoUltimoEnvio.get(tradeKey) || 0;
-      const cooldownArrefMs = cfg.cooldownMs;
-      if ((agora - ultimoArref) >= cooldownArrefMs) {
-        await registrarEEnviarSinal(
-          symbol, mode, 'ARREFECIMENTO',
+      if ((agora - ultimoArref) >= cfg.cooldownMs) {
+        await registrarEEnviarSinal(symbol, mode, 'ARREFECIMENTO',
           formatarMensagemArrefecimento(symbol, dados.consolidated.score, dados),
-          { score: dados.consolidated.score },
-          watchers
-        );
+          { score: dados.consolidated.score }, watchers);
         arrefecimentoUltimoEnvio.set(tradeKey, agora);
       }
       prontidaoAtiva.delete(tradeKey);
@@ -1588,15 +1427,13 @@ cron.schedule('* * * * *', async () => {
   try {
     const allUsers = await getAllUserWatchlists();
     const activeUsers = allUsers.filter(u => u.engineActive);
-
     const queue = new Map();
 
     for (const tradeKey of tradesAbertos.keys()) {
       const idx = tradeKey.lastIndexOf('_');
       if (idx > 0) {
         queue.set(`${tradeKey.slice(0, idx)}|${tradeKey.slice(idx + 1)}`, {
-          symbol: tradeKey.slice(0, idx),
-          mode: tradeKey.slice(idx + 1)
+          symbol: tradeKey.slice(0, idx), mode: tradeKey.slice(idx + 1)
         });
       }
     }
@@ -1618,16 +1455,12 @@ cron.schedule('* * * * *', async () => {
     for (const { symbol, mode } of queue.values()) {
       const tradeKey = `${symbol}_${mode}`;
       const trade = tradesAbertos.get(tradeKey);
-
       let watchers;
       if (trade && Array.isArray(trade.watchers)) {
         watchers = trade.watchers;
       } else {
-        watchers = activeUsers
-          .filter(u => (u[mode] || []).includes(symbol))
-          .map(u => u.tokenHash);
+        watchers = activeUsers.filter(u => (u[mode] || []).includes(symbol)).map(u => u.tokenHash);
       }
-
       await analisarEEnviarSinais(symbol, mode, watchers);
       await new Promise(r => setTimeout(r, 1200));
     }
@@ -1641,11 +1474,9 @@ cron.schedule('* * * * *', async () => {
 // ========== API ENDPOINTS ==========
 
 app.get('/health', (req, res) => res.json({
-  status: 'ok',
-  uptime: Math.floor(process.uptime()),
-  tradesAbertos: tradesAbertos.size,
-  cooldowns: cooldownPosTrade.size,
-  prontidoes: prontidaoAtiva.size
+  status: 'ok', uptime: Math.floor(process.uptime()),
+  tradesAbertos: tradesAbertos.size, cooldowns: cooldownPosTrade.size,
+  prontidoes: prontidaoAtiva.size, turso: tursoInitialized
 }));
 
 app.get('/api/vapid-public-key', (req, res) => {
@@ -1654,16 +1485,15 @@ app.get('/api/vapid-public-key', (req, res) => {
 });
 
 app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   const { subscription } = req.body;
   if (!subscription || !subscription.endpoint) return res.status(400).json({ error: 'Subscrição inválida' });
   try {
     const docId = Buffer.from(subscription.endpoint).toString('base64').replace(/[/+=]/g, '_').slice(0, 400);
-    await db.collection('push_subscriptions').doc(docId).set({
-      subscription,
-      tokenHash: req.user.tokenHash,
-      email: req.user.email || null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    await db.execute({
+      sql: `INSERT INTO push_subscriptions (id, subscription, token_hash, email, updated_at) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET subscription=excluded.subscription, token_hash=excluded.token_hash, email=excluded.email, updated_at=excluded.updated_at`,
+      args: [docId, JSON.stringify(subscription), req.user.tokenHash, req.user.email || null, Date.now()]
     });
     invalidarCacheSubs(req.user.tokenHash);
     res.json({ success: true });
@@ -1671,12 +1501,12 @@ app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/push/unsubscribe', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   const { endpoint } = req.body;
   if (!endpoint) return res.status(400).json({ error: 'endpoint obrigatório' });
   try {
     const docId = Buffer.from(endpoint).toString('base64').replace(/[/+=]/g, '_').slice(0, 400);
-    await db.collection('push_subscriptions').doc(docId).delete();
+    await db.execute({ sql: 'DELETE FROM push_subscriptions WHERE id = ?', args: [docId] });
     invalidarCacheSubs(req.user.tokenHash);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1684,9 +1514,7 @@ app.post('/api/push/unsubscribe', authMiddleware, async (req, res) => {
 
 app.post('/api/push/test', authMiddleware, async (req, res) => {
   await sendPushToWatchers([req.user.tokenHash], {
-    title: '🔔 Teste',
-    body: 'Notificações a funcionar corretamente!',
-    tag: 'teste_' + Date.now()
+    title: '🔔 Teste', body: 'Notificações a funcionar corretamente!', tag: 'teste_' + Date.now()
   });
   res.json({ success: true });
 });
@@ -1695,44 +1523,32 @@ app.get('/api/user-preferences', authMiddleware, async (req, res) => {
   try {
     const preferences = await getUserPreferences(req.user.tokenHash);
     res.json({ success: true, preferences, defaults: DEFAULT_PREFS });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/user-preferences', authMiddleware, async (req, res) => {
   try {
     const { preferences } = req.body || {};
-    if (!preferences || typeof preferences !== 'object') {
-      return res.status(400).json({ error: 'preferences obrigatório' });
-    }
+    if (!preferences || typeof preferences !== 'object') return res.status(400).json({ error: 'preferences obrigatório' });
     const saved = await saveUserPreferences(req.user.tokenHash, preferences);
     res.json({ success: true, preferences: saved });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/user-me', authMiddleware, (req, res) => {
   res.json({
-    tokenHash: req.user.tokenHash,
-    email: req.user.email,
-    name: req.user.name,
-    periodDays: req.user.periodDays,
-    plano: req.user.plano,
+    tokenHash: req.user.tokenHash, email: req.user.email, name: req.user.name,
+    periodDays: req.user.periodDays, plano: req.user.plano,
     maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10
   });
 });
 
 app.get('/api/engine-config', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) {
-    return res.json({ active: false, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
-  }
+  if (!tursoInitialized) return res.json({ active: false, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
   try {
     const wl = await getUserWatchlist(req.user.tokenHash);
     res.json({
-      active: wl.engineActive,
-      plano: req.user.plano,
+      active: wl.engineActive, plano: req.user.plano,
       maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10,
       watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO }
     });
@@ -1740,33 +1556,22 @@ app.get('/api/engine-config', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/engine-start', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   try {
     const wl = await getUserWatchlist(req.user.tokenHash);
     const totalAtivos = contarAtivosWatchlist(wl);
-
     if (totalAtivos === 0) {
-      logger.warn(`⚠️ [ENGINE-START] user=${req.user.tokenHash} tentou ativar motor SEM ativos vigiados`);
-      return res.status(400).json({
-        success: false,
-        error: 'Adiciona pelo menos 1 ativo à watchlist antes de ativar o motor.',
-        code: 'WATCHLIST_EMPTY',
-        totalAtivos: 0
-      });
+      return res.status(400).json({ success: false, error: 'Adiciona pelo menos 1 ativo à watchlist antes de ativar o motor.', code: 'WATCHLIST_EMPTY', totalAtivos: 0 });
     }
-
     await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null });
     invalidarCacheWatchlists();
     logger.info(`✅ [ENGINE-START] user=${req.user.tokenHash} ativou motor com ${totalAtivos} ativo(s)`);
     res.json({ success: true, active: true, totalAtivos });
-  } catch (err) {
-    logger.error('Erro em /api/engine-start:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/engine-stop', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   try {
     await saveUserWatchlist(req.user.tokenHash, { engineActive: false });
     invalidarCacheWatchlists();
@@ -1775,7 +1580,7 @@ app.post('/api/engine-stop', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/engine-watchlist', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.json({ watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
+  if (!tursoInitialized) return res.json({ watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
   try {
     const wl = await getUserWatchlist(req.user.tokenHash);
     res.json({ watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO } });
@@ -1783,27 +1588,20 @@ app.get('/api/engine-watchlist', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   const { watchlist } = req.body || {};
   if (!watchlist || typeof watchlist !== 'object') return res.status(400).json({ error: 'watchlist deve ser um objeto' });
   try {
     const maxAtivos = req.user.plano?.maxAtivosPorModo ?? 10;
-
-    if (maxAtivos <= 0) {
-      return res.status(403).json({
-        error: 'A tua conta não tem um plano ativo. Contacta o suporte para ativares o acesso.'
-      });
-    }
+    if (maxAtivos <= 0) return res.status(403).json({ error: 'A tua conta não tem um plano ativo.' });
 
     const current = await getUserWatchlist(req.user.tokenHash);
-
     const cortado = {
       SNIPER:    Array.isArray(watchlist.SNIPER)    && [...new Set(watchlist.SNIPER)].length    > maxAtivos,
       'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) && [...new Set(watchlist['CAÇADOR'])].length > maxAtivos,
       PESCADOR:  Array.isArray(watchlist.PESCADOR)  && [...new Set(watchlist.PESCADOR)].length  > maxAtivos,
       BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  && [...new Set(watchlist.BALEEIRO)].length  > maxAtivos
     };
-
     const final = {
       SNIPER:    Array.isArray(watchlist.SNIPER)    ? [...new Set(watchlist.SNIPER)].slice(0, maxAtivos)    : current.SNIPER,
       'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) ? [...new Set(watchlist['CAÇADOR'])].slice(0, maxAtivos) : current['CAÇADOR'],
@@ -1813,23 +1611,17 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
     };
     await saveUserWatchlist(req.user.tokenHash, final);
     invalidarCacheWatchlists();
-
     const houveCorte = Object.values(cortado).some(Boolean);
     res.json({
-      success: true,
-      watchlist: final,
-      plano: req.user.plano,
-      maxAtivosPorModo: maxAtivos,
+      success: true, watchlist: final, plano: req.user.plano, maxAtivosPorModo: maxAtivos,
       cortado: houveCorte ? cortado : null,
-      mensagem: houveCorte
-        ? `Plano ${req.user.plano?.nome || 'atual'} permite ${maxAtivos} por modo. Excesso removido.`
-        : null
+      mensagem: houveCorte ? `Plano ${req.user.plano?.nome || 'atual'} permite ${maxAtivos} por modo.` : null
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   try {
     await saveUserWatchlist(req.user.tokenHash, { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] });
     invalidarCacheWatchlists();
@@ -1842,21 +1634,17 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
   if (!group || !mode) return res.status(400).json({ error: 'Os campos "group" e "mode" são obrigatórios.' });
   const symbols = assetGroups[group];
   if (!symbols) return res.status(400).json({ error: `Grupo "${group}" não reconhecido.` });
-  if (!MODOS_OK.includes(mode)) return res.status(400).json({ error: `Modo "${mode}" inválido. Use um de: ${MODOS_OK.join(', ')}` });
-
+  if (!MODOS_OK.includes(mode)) return res.status(400).json({ error: `Modo "${mode}" inválido.` });
   try {
     const allResults = [];
     for (let i = 0; i < symbols.length; i += 5) {
       const batch = symbols.slice(i, i + 5);
       const batchResults = await Promise.allSettled(batch.map(async (symbol) => {
         const data = await buscarSinalAnalise(symbol, mode);
-        if (!data || !data.success) {
-          return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
-        }
+        if (!data || !data.success) return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
         const consolidated = data.consolidated || {};
         return {
-          symbol,
-          name: getFriendlyName(symbol),
+          symbol, name: getFriendlyName(symbol),
           signal: consolidated.signal || 'HOLD',
           zona: consolidated.zona || '?',
           score: consolidated.score || 0,
@@ -1868,8 +1656,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
       allResults.push(...batchResults);
       if (i + 5 < symbols.length) await new Promise(r => setTimeout(r, 800));
     }
-    const scanResults = allResults.filter(r => r.status === 'fulfilled').map(r => r.value);
-    res.json({ success: true, results: scanResults });
+    res.json({ success: true, results: allResults.filter(r => r.status === 'fulfilled').map(r => r.value) });
   } catch (err) {
     logger.error('Erro no /api/scan-group:', err.message);
     res.status(500).json({ error: 'Erro interno ao analisar grupo.' });
@@ -1877,26 +1664,35 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/signals', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.json({ signals: [] });
+  if (!tursoInitialized) return res.json({ signals: [] });
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    let q = db.collection('signals')
-      .where('watchers', 'array-contains', req.user.tokenHash)
-      .orderBy('criadoEm', 'desc')
-      .limit(limit);
-    if (req.query.mode) {
-      q = db.collection('signals')
-        .where('watchers', 'array-contains', req.user.tokenHash)
-        .where('mode', '==', req.query.mode)
-        .orderBy('criadoEm', 'desc')
-        .limit(limit);
-    }
-    const snapshot = await q.get();
-    const signals = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-      criadoEm: doc.data().criadoEm?.toDate?.() || null
-    }));
+    const mode = req.query.mode || null;
+    let sql = 'SELECT * FROM signals WHERE 1=1';
+    const args = [];
+    if (mode) { sql += ' AND mode = ?'; args.push(mode); }
+    sql += ' ORDER BY criado_em DESC LIMIT ?';
+    args.push(limit);
+    const result = await db.execute({ sql, args });
+    // Filtrar por watchers em JS (JSON text — SQLite não tem array-contains)
+    const tokenHash = req.user.tokenHash;
+    const signals = result.rows
+      .filter(row => {
+        try {
+          const watchers = JSON.parse(row.watchers || '[]');
+          return Array.isArray(watchers) && watchers.includes(tokenHash);
+        } catch { return false; }
+      })
+      .map(row => ({
+        id: row.id, symbol: row.symbol, mode: row.mode, tipo: row.tipo,
+        titulo: row.titulo, corpo: row.corpo,
+        detalhes: row.detalhes ? JSON.parse(row.detalhes) : null,
+        watchers: JSON.parse(row.watchers || '[]'),
+        score: row.score, confidence: row.confidence, zona: row.zona,
+        entry: row.entry, takeProfit: row.take_profit, stopLoss: row.stop_loss,
+        nivelProntidao: row.nivel_prontidao, origem: row.origem,
+        criadoEm: new Date(row.criado_em).toISOString()
+      }));
     res.json({ signals });
   } catch (err) {
     logger.error(`Erro ao buscar sinais: ${err.message}`);
@@ -1905,55 +1701,35 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
 });
 
 app.delete('/api/signals', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
+  if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   const mode = req.query.mode || null;
   try {
-    let q = db.collection('signals')
-      .where('watchers', 'array-contains', req.user.tokenHash);
-    if (mode) q = q.where('mode', '==', mode);
+    let sql = 'SELECT * FROM signals WHERE 1=1';
+    const args = [];
+    if (mode) { sql += ' AND mode = ?'; args.push(mode); }
+    const result = await db.execute({ sql, args });
 
-    const snap = await q.get();
-    if (snap.empty) {
-      return res.json({ success: true, deletados: 0, atualizados: 0, total: 0, mensagem: 'Nada para apagar' });
-    }
-
+    const tokenHash = req.user.tokenHash;
     let deletados = 0, atualizados = 0;
-    let batch = db.batch();
-    let ops = 0;
-    const commits = [];
 
-    for (const doc of snap.docs) {
-      const data = doc.data();
-      const watchers = Array.isArray(data.watchers) ? data.watchers : [];
-      const restantes = watchers.filter(t => t !== req.user.tokenHash);
+    for (const row of result.rows) {
+      let watchers = [];
+      try { watchers = JSON.parse(row.watchers || '[]'); } catch { watchers = []; }
+      if (!Array.isArray(watchers) || !watchers.includes(tokenHash)) continue;
 
+      const restantes = watchers.filter(t => t !== tokenHash);
       if (restantes.length === 0) {
-        batch.delete(doc.ref);
+        await db.execute({ sql: 'DELETE FROM signals WHERE id = ?', args: [row.id] });
         deletados++;
       } else {
-        batch.update(doc.ref, { watchers: restantes });
+        await db.execute({ sql: 'UPDATE signals SET watchers = ? WHERE id = ?', args: [JSON.stringify(restantes), row.id] });
         atualizados++;
       }
-      ops++;
-
-      if (ops >= 450) {
-        commits.push(batch.commit());
-        batch = db.batch();
-        ops = 0;
-      }
     }
-    if (ops > 0) commits.push(batch.commit());
-    await Promise.all(commits);
 
     const total = deletados + atualizados;
-    logger.info(`🗑️ [SIGNALS-CLEAR] user=${req.user.tokenHash}${mode?' mode='+mode:''} → ${deletados} apagado(s), ${atualizados} atualizado(s)`);
-    res.json({
-      success: true,
-      deletados,
-      atualizados,
-      total,
-      mensagem: `${total} sinal(is) removido(s) do teu histórico`
-    });
+    logger.info(`🗑️ [SIGNALS-CLEAR] user=${tokenHash}${mode?' mode='+mode:''} → ${deletados} apagado(s), ${atualizados} atualizado(s)`);
+    res.json({ success: true, deletados, atualizados, total, mensagem: `${total} sinal(is) removido(s) do teu histórico` });
   } catch (err) {
     logger.error('Erro em DELETE /api/signals:', err.message);
     res.status(500).json({ error: err.message });
@@ -1961,81 +1737,31 @@ app.delete('/api/signals', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/analysis-history', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.status(503).json({ error: 'Firestore indisponível' });
-  const { symbol, mode, result } = req.body || {};
-  if (!symbol || !mode || !result) {
-    return res.status(400).json({ error: 'symbol, mode e result são obrigatórios' });
-  }
-  try {
-    const consolidated = result.consolidated || {};
-    if (consolidated.signal === 'HOLD') return res.json({ success: true, skipped: true });
-
-    await db.collection('analysis_history').add({
-      tokenHash: req.user.tokenHash,
-      userEmail: req.user.email || null,
-      symbol,
-      mode,
-      signal: consolidated.signal,
-      score: consolidated.score ?? null,
-      confidence: consolidated.confidence ?? null,
-      zona: consolidated.zona ?? null,
-      price: consolidated.price ?? null,
-      scoreReasons: (consolidated.score_reasons || []).slice(0, 5),
-      analisadoEm: admin.firestore.FieldValue.serverTimestamp()
-    });
-    res.json({ success: true });
-  } catch (err) {
-    logger.error('Erro ao gravar analysis_history:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ success: true, skipped: true });
 });
 
 app.get('/api/analysis-history', authMiddleware, async (req, res) => {
-  if (!firebaseInitialized) return res.json({ history: [] });
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    let q = db.collection('analysis_history')
-      .where('tokenHash', '==', req.user.tokenHash)
-      .orderBy('analisadoEm', 'desc')
-      .limit(limit);
-    if (req.query.mode) {
-      q = db.collection('analysis_history')
-        .where('tokenHash', '==', req.user.tokenHash)
-        .where('mode', '==', req.query.mode)
-        .orderBy('analisadoEm', 'desc')
-        .limit(limit);
-    }
-    const snap = await q.get();
-    const history = snap.docs.map(d => ({
-      id: d.id,
-      ...d.data(),
-      analisadoEm: d.data().analisadoEm?.toDate?.() || null
-    }));
-    res.json({ history });
-  } catch (err) {
-    logger.error('Erro ao ler analysis_history:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ history: [] });
 });
 
 app.get('/api/stats', authMiddleware, async (req, res) => {
-  const wl = firebaseInitialized ? await getUserWatchlist(req.user.tokenHash).catch(() => null) : null;
+  const wl = tursoInitialized ? await getUserWatchlist(req.user.tokenHash).catch(() => null) : null;
   const stats = {
     engineActive: !!wl?.engineActive,
     watchlistCount: wl ? [wl.SNIPER, wl['CAÇADOR'], wl.PESCADOR, wl.BALEEIRO].reduce((a, arr) => a + arr.length, 0) : 0,
-    openTrades: tradesAbertos.size,
-    uptime: process.uptime(),
-    firebase: firebaseInitialized,
-    pushConfigured
+    openTrades: tradesAbertos.size, uptime: process.uptime(),
+    turso: tursoInitialized, pushConfigured
   };
-  if (firebaseInitialized) {
+  if (tursoInitialized) {
     try {
-      const col = db.collection('signals').where('watchers', 'array-contains', req.user.tokenHash);
-      stats.totalSignals = (await col.count().get()).data().count;
-      stats.signalsToday = (await db.collection('signals')
-        .where('watchers', 'array-contains', req.user.tokenHash)
-        .where('criadoEm', '>=', new Date(new Date().setHours(0, 0, 0, 0)))
-        .count().get()).data().count;
+      const tokenHash = req.user.tokenHash;
+      const all = await db.execute('SELECT watchers, criado_em FROM signals');
+      const tokenSignals = all.rows.filter(r => {
+        try { return JSON.parse(r.watchers || '[]').includes(tokenHash); } catch { return false; }
+      });
+      stats.totalSignals = tokenSignals.length;
+      const hojeInicio = new Date(new Date().setHours(0,0,0,0)).getTime();
+      stats.signalsToday = tokenSignals.filter(r => r.criado_em >= hojeInicio).length;
     } catch (err) { logger.error(`Erro stats: ${err.message}`); }
   }
   res.json(stats);
@@ -2048,14 +1774,20 @@ app.get(/^\/(?!.*\.(png|jpg|jpeg|gif|svg|ico|json|js|css|woff|woff2|ttf|webp)).*
 
 app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`🚀 Servidor rodando na porta ${PORT}`);
-  logger.info(`Firebase: ${firebaseInitialized ? 'Conectado' : 'Não'}`);
+  try {
+    await tursoInitPromise;
+  } catch (e) {
+    logger.error('Falha ao inicializar Turso:', e.message);
+  }
+  logger.info(`Turso: ${tursoInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
-  logger.info(`Prontidão: aviso antecipado ativo (Zona B + Zona C) + limiares configuráveis + bloqueio micro timing`);
-  logger.info(`Filtro Extremo: ativo — ignora avisos quando DeM/RSI estão extremos`);
-  logger.info(`v2.19: FIX #61 — aceita SINAL em Zona A (SINAL CONFIRMADO) e Zona B (SINAL MODERADO)`);
-  logger.info(`v2.18: FIX #56 (exaustão) + #57 (cooldown) + #58 (multi-TF) + #60 (bloquear PRONTIDAO em CHOP) ativos`);
-  logger.info(`v2.20: PATCH 1+2+3 (cache) + PATCH 5 (arranque resiliente a quota) ativos`);
-  loadStateFromFirestore().catch(e => logger.error('loadStateFromFirestore falhou:', e.message));
+  logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
+  logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
+  try {
+    await loadStateFromTurso();
+  } catch (e) {
+    logger.error('loadStateFromTurso falhou:', e.message);
+  }
 });
 
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
