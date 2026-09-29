@@ -718,15 +718,26 @@ async function loadStateFromFirestore() {
 
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
-  const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
-  if (matchNota) return matchNota[1].toUpperCase() === 'ALTA' ? 'CALL' : 'PUT';
 
+  // ⭐ ALINHAMENTO #1 — NÃO extrair direcção de notas "não confirmadas"
+  // FIX #1d do motor: quando trendState é NEUTRAL, a nota pode dizer
+  // "BAIXA FORTE mas ainda NÃO confirmada" ou "SEM DIREÇÃO DEFINIDA".
+  // Nestes casos NÃO devemos emitir PRONTIDAO direccional.
+  const notaindicaIncerteza = /NÃO confirmada|não confirmada|SEM DIREÇÃO DEFINIDA|sem direção definida|FRÁGIL|aguarda alinhamento/i.test(nota);
+
+  if (!notaindicaIncerteza) {
+    const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
+    if (matchNota) return matchNota[1].toUpperCase() === 'ALTA' ? 'CALL' : 'PUT';
+  }
+
+  // Fallback: razões de score (ignora se indicam NEUTRAL/incerteza)
   const razaoTrend = (dados.consolidated.score_reasons || []).find(r => r.includes('🧭'));
-  if (razaoTrend) {
+  if (razaoTrend && !/NEUTRAL|neutro|não confirmada|SEM DIREÇÃO/i.test(razaoTrend)) {
     if (/Tendência de fundo:\s*ALTA|Tendência assumida:\s*(UP|ALTA)|reversão para UP/i.test(razaoTrend)) return 'CALL';
     if (/Tendência de fundo:\s*BAIXA|Tendência assumida:\s*(DOWN|BAIXA)|reversão para DOWN/i.test(razaoTrend)) return 'PUT';
   }
 
+  // Fallback final: votos dos TFs (só dispara com maioria clara ≥60%)
   const sinais = [];
   for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing', 'h4_timing']) {
     const s = dados.consolidated[tf]?.sinal;
@@ -734,13 +745,25 @@ function extrairDirecaoPrep(dados) {
   }
   if (sinais.length > 0) {
     const puts = sinais.filter(s => s === 'PUT').length;
-    if (puts !== sinais.length - puts) return puts > sinais.length - puts ? 'PUT' : 'CALL';
+    const calls = sinais.length - puts;
+    const ratio = Math.max(puts, calls) / sinais.length;
+    if (ratio >= 0.6) return puts > calls ? 'PUT' : 'CALL';
   }
+
+  // Sem direcção clara → não emitir PRONTIDAO direccional
   return null;
 }
 
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
+
+  // ⭐ ALINHAMENTO #2 — reconhecer estados do motor pós-FIX #1b/#1c/#1e
+  if (/Tendência NEUTRAL.*reversão não confirmada|Reversão NÃO confirmada/i.test(texto)) {
+    return { nivel: 'LONGE', detalhe: 'motor em NEUTRAL — reversão ainda por confirmar' };
+  }
+  if (/SEM DIREÇÃO DEFINIDA|Tendência indefinida|SEM DIREÇÃO/i.test(texto)) {
+    return { nivel: 'LONGE', detalhe: 'mercado sem direção clara' };
+  }
 
   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
@@ -772,6 +795,11 @@ function diagnosticoProximidade(reasons) {
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
+
+  // ⭐ ALINHAMENTO #3 — bloqueios "SINAL ANULADO" contam como extremo ALTO
+  if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
+    return { esticado: true, nivel: 'ALTO', motivo: 'DeMarker extremo confirmado' };
+  }
 
   if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
   if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
