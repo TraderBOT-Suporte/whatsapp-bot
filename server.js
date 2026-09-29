@@ -718,11 +718,15 @@ async function loadStateFromFirestore() {
 
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
+  const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
+
+  // ⭐ ALINHAMENTO #4 — RESPIRAÇÃO activa → não emitir PRONTIDAO direccional
+  // O motor está bloqueado por respiração — não faz sentido sugerir direcção.
+  if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasonsTexto)) {
+    return null;
+  }
 
   // ⭐ ALINHAMENTO #1 — NÃO extrair direcção de notas "não confirmadas"
-  // FIX #1d do motor: quando trendState é NEUTRAL, a nota pode dizer
-  // "BAIXA FORTE mas ainda NÃO confirmada" ou "SEM DIREÇÃO DEFINIDA".
-  // Nestes casos NÃO devemos emitir PRONTIDAO direccional.
   const notaindicaIncerteza = /NÃO confirmada|não confirmada|SEM DIREÇÃO DEFINIDA|sem direção definida|FRÁGIL|aguarda alinhamento/i.test(nota);
 
   if (!notaindicaIncerteza) {
@@ -756,6 +760,11 @@ function extrairDirecaoPrep(dados) {
 
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
+
+  // ⭐ ALINHAMENTO #4 — RESPIRAÇÃO activa → BLOQUEADO (mais informativo que FORMAÇÃO)
+  if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'mercado precisa respirar — aguarda normalizar' };
+  }
 
   // ⭐ ALINHAMENTO #2 — reconhecer estados do motor pós-FIX #1b/#1c/#1e
   if (/Tendência NEUTRAL.*reversão não confirmada|Reversão NÃO confirmada/i.test(texto)) {
@@ -795,6 +804,14 @@ function diagnosticoProximidade(reasons) {
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
+
+  // ⭐ ALINHAMENTO #4 — RESPIRAÇÃO activa → classificar como ALTO
+  // Sem isto, o painel pode emitir PRONTIDAO em mercado bloqueado por extremo.
+  if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
+    const match = texto.match(/RESPIRAÇÃO\s+(SIMPLES|DUPLA)/i);
+    const tipo = match ? match[1] : 'SIMPLES';
+    return { esticado: true, nivel: 'ALTO', motivo: `Respiração ${tipo} — mercado em extremo` };
+  }
 
   // ⭐ ALINHAMENTO #3 — bloqueios "SINAL ANULADO" contam como extremo ALTO
   if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
