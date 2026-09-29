@@ -856,8 +856,15 @@ function diagnosticoProximidade(reasons) {
   if (/SEM DIREÇÃO DEFINIDA|Tendência indefinida|SEM DIREÇÃO/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'mercado sem direção clara' };
   }
-  if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
+   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
+  }
+  // ⭐ NOVO — FIX #81
+  if (/SINAL ANULADO:\s*\S+\s+DeM\s+[\d.]+\s+em\s+(fundo|topo)\s+extremo/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'exaustão nos TFs-chave — aguarda respirar' };
+  }
+  if (/Prontidão reduzida por exaustão DeMarker/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'exaustão nos TFs-chave — aguarda respirar' };
   }
   if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'micro timing contra — aguarda alinhar' };
@@ -891,8 +898,17 @@ function avaliarEsticamento(reasons) {
     const tipo = match ? match[1] : 'SIMPLES';
     return { esticado: true, nivel: 'ALTO', motivo: `Respiração ${tipo} — mercado em extremo` };
   }
-  if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
+   if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'DeMarker extremo confirmado' };
+  }
+  // ⭐ NOVO — FIX #81 (exaustão dos TFs-chave: M15/H1, H1/H4, H24/W1, W1/MN1)
+  const m81 = texto.match(/SINAL ANULADO:\s*(\S+)\s+DeM\s+([\d.]+)\s+em\s+(fundo|topo)\s+extremo/i);
+  if (m81) {
+    return { esticado: true, nivel: 'ALTO', motivo: `Exaustão ${m81[1]} DeM ${m81[2]} (${m81[3]})` };
+  }
+  // ⭐ NOVO — factor de prontidão (variações de "mercado precisa respirar")
+  if (/Prontidão reduzida por exaustão DeMarker/i.test(texto)) {
+    return { esticado: true, nivel: 'ALTO', motivo: 'Exaustão confirmada nos TFs-chave' };
   }
   if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
   if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
@@ -963,6 +979,9 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
   else if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasons)) { emoji = '🌬️'; proximidade = 'BLOQUEADO'; detalhe = 'mercado precisa respirar — aguarda normalizar'; }
   else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) { emoji = '⛔'; proximidade = 'BLOQUEADO'; detalhe = 'mercado em extremo — aguarda normalizar'; }
+  // ⭐ NOVO — FIX #81
+  else if (/SINAL ANULADO:\s*\S+\s+DeM\s+[\d.]+\s+em\s+(fundo|topo)\s+extremo/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'exaustão nos TFs-chave — aguarda respirar'; }
+  else if (/Prontidão reduzida por exaustão DeMarker/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'exaustão confirmada — aguarda respirar'; }
   else if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(reasons)) { emoji = '🚫'; proximidade = 'BLOQUEADO'; detalhe = 'micro timing contra — aguarda alinhar'; }
   else if (/\(micro timing\) está contra a tendência/i.test(reasons)) { emoji = '🚫'; proximidade = 'BLOQUEADO'; detalhe = 'micro timing contra a tendência'; }
   else if (/\[FIX #40b\]|hist a desacelerar|trigger em conflito NÃO aceite/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'momentum a desacelerar — aguarda estabilizar'; }
