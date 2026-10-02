@@ -923,6 +923,20 @@ function avaliarEsticamento(reasons) {
   return { esticado: false, nivel: 'BAIXO', motivo: 'mercado saudável' };
 }
 
+function detectarRespiracaoOuPullback(dados, trade, percentualPercorrido = 0) {
+  const reasons = (dados?.consolidated?.score_reasons || []).join(' ');
+  const nota = dados?.consolidated?.primaryTrendNote || '';
+  const texto = `${reasons} ${nota}`;
+  const indicadoPeloMotor = /RESPIRAÇÃO\\s+(SIMPLES|DUPLA)|mercado precisa respirar|pullback em curso|pullback saudável|correção saudável|reteste|aguarda alinhamento|aguarda flip/i.test(texto);
+  if (!indicadoPeloMotor || !trade) return false;
+
+  const distanciaEntrada = Math.abs((dados?.consolidated?.price ?? trade.currentPrice) - trade.entry);
+  const alvoTotal = Math.abs(trade.takeProfit - trade.entry);
+  const pertoDaEntrada = alvoTotal > 0 && distanciaEntrada <= alvoTotal * 0.18;
+  const progressoValido = percentualPercorrido >= -0.12 && percentualPercorrido < 0.35;
+  return pertoDaEntrada && progressoValido;
+}
+
 function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
   const COOLDOWN_DEFAULT = COOLDOWN_POS_TRADE_MS;
   const zona = dados?.consolidated?.zona || 'C';
@@ -1195,8 +1209,16 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
     const timeoutModo = getTimeoutModo(trade.mode);
     const timeoutExtendModo = getTimeoutExtendModo(trade.mode);
+    const emRespiracaoOuPullback = detectarRespiracaoOuPullback(dados, trade, percentualPercorrido);
     const timeoutAtual = trade.timeoutAt || (trade.timestamp + timeoutModo);
-    if (agora > timeoutAtual) {
+    if (agora > timeoutAtual && emRespiracaoOuPullback && (trade.extensoesPullback || 0) < 3) {
+      trade.timeoutAt = agora + timeoutExtendModo;
+      trade.extensoesPullback = (trade.extensoesPullback || 0) + 1;
+      trade.percentualNoUltimoCheck = percentualPercorrido;
+      persistTradeUpdate(tradeKey, trade);
+      logger.info(`↩️ [PULLBACK] ${tradeKey} mantido durante respiração (${trade.extensoesPullback}/3)`);
+    }
+    if (agora > timeoutAtual && !(emRespiracaoOuPullback && (trade.extensoesPullback || 0) < 3)) {
       const extensoes = trade.extensoes || 0;
       const progressoAnterior = trade.percentualNoUltimoCheck || 0;
       const progressoNovo = percentualPercorrido - progressoAnterior;
@@ -1240,7 +1262,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           logger.info(`⚠️ [FIX #56+#58] Exaustão CONFIRMADA em ${tradeKey}`);
         } else {
           logger.info(`💨 [FIX #58] ${tradeKey} trigger esticado mas ${confirmacao.motivo} — aguarda confirmação`);
-          if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
+          if (!emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
           else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
           else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
           else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
@@ -1248,7 +1270,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
         }
       } else {
-        if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
+        if (!emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
         else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
         else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
         else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
@@ -1256,7 +1278,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
       }
     }
-    else if (!trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
+    else if (!emRespiracaoOuPullback && !emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
     else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
     else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
     else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
