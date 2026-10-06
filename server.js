@@ -1,5 +1,6 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
 // Migração Firestore → Turso (libSQL). Todas as colecções foram convertidas em tabelas SQLite.
+// v2.22 — Cooldown PRONTIDAO por modo + persistência de ultimo_score no Turso.
 // v2.21 — Turso (libSQL) substitui Firestore. Cache em memória mantida.
 
 import express from 'express';
@@ -131,6 +132,7 @@ CREATE TABLE IF NOT EXISTS prontidao_state (
   trade_key TEXT PRIMARY KEY,
   historico TEXT NOT NULL DEFAULT '[]',
   ativa INTEGER NOT NULL DEFAULT 0,
+  ultimo_score REAL,
   atualizado_em INTEGER NOT NULL
 );
 
@@ -172,6 +174,17 @@ async function initializeTurso() {
     for (const stmt of statements) {
       await db.execute(stmt);
     }
+
+    // ⭐ Migração automática — adicionar ultimo_score se não existir (BDs antigas)
+    try {
+      await db.execute('ALTER TABLE prontidao_state ADD COLUMN ultimo_score REAL');
+      logger.info('✅ Coluna ultimo_score adicionada a prontidao_state');
+    } catch (err) {
+      if (!/duplicate column/i.test(err.message || '')) {
+        logger.warn('⚠️ Migração ultimo_score:', err.message);
+      }
+    }
+
     // Teste de ligação
     await db.execute('SELECT 1');
     tursoInitialized = true;
@@ -433,11 +446,15 @@ let cronEmExecucao = false;
 const MODOS_OK = ['SNIPER', 'CAÇADOR', 'PESCADOR', 'BALEEIRO'];
 const CADENCIAS = { SNIPER: 1, 'CAÇADOR': 3, PESCADOR: 10, BALEEIRO: 30 };
 
+// ⭐ Cooldown de PRONTIDAO por modo.
+// Regra: entre cada envio ao mesmo par+modo, tem de passar o cooldownMs
+// E o score tem de ter subido >= scoreDeltaMin desde o último envio.
+// Isto evita spam de "em formação" com o mesmo score.
 const PRONTIDAO_CONFIG = {
-  SNIPER:    { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 10 },
-  'CAÇADOR': { cooldownMs: 10 * 60 * 1000, ciclosForaParaArrefecer: 5  },
-  PESCADOR:  { cooldownMs: 30 * 60 * 1000, ciclosForaParaArrefecer: 4  },
-  BALEEIRO:  { cooldownMs: 60 * 60 * 1000, ciclosForaParaArrefecer: 3  }
+  SNIPER:    { cooldownMs: 15 * 60 * 1000,  ciclosForaParaArrefecer: 10, scoreDeltaMin: 5  },
+  'CAÇADOR': { cooldownMs: 20 * 60 * 1000,  ciclosForaParaArrefecer: 5,  scoreDeltaMin: 5  },
+  PESCADOR:  { cooldownMs: 60 * 60 * 1000,  ciclosForaParaArrefecer: 4,  scoreDeltaMin: 8  },
+  BALEEIRO:  { cooldownMs: 120 * 60 * 1000, ciclosForaParaArrefecer: 3,  scoreDeltaMin: 10 }
 };
 function getProntidaoConfig(mode) {
   return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR'];
@@ -663,6 +680,7 @@ const prontidaoAtiva = new Set();
 const prontidaoForaContagem = new Map();
 const COOLDOWN_POS_TRADE_MS = 10 * 60 * 1000;
 const prontidaoUltimoEnvio = new Map();
+const prontidaoUltimoScoreEnviado = new Map();  // ⭐ NOVO — último score enviado ao par
 const arrefecimentoUltimoEnvio = new Map();
 const prontidaoGlobalPorSymbol = new Map();
 
@@ -676,6 +694,7 @@ setInterval(() => {
       prontidaoAtiva.delete(key);
       prontidaoForaContagem.delete(key);
       prontidaoUltimoEnvio.delete(key);
+      prontidaoUltimoScoreEnviado.delete(key);  // ⭐ NOVO
       arrefecimentoUltimoEnvio.delete(key);
     }
   }
@@ -730,13 +749,25 @@ async function removePersistedCooldown(tradeKey) {
   catch (err) { logger.error('Erro removePersistedCooldown:', err.message); }
 }
 
-async function persistProntidao(tradeKey, historico, ativa) {
+// ⭐ persistProntidao — agora aceita ultimoScore
+async function persistProntidao(tradeKey, historico, ativa, ultimoScore = null) {
   if (!tursoInitialized) return;
   try {
     await db.execute({
-      sql: `INSERT INTO prontidao_state (trade_key, historico, ativa, atualizado_em) VALUES (?, ?, ?, ?)
-            ON CONFLICT(trade_key) DO UPDATE SET historico=excluded.historico, ativa=excluded.ativa, atualizado_em=excluded.atualizado_em`,
-      args: [tradeKey, JSON.stringify(historico || []), ativa ? 1 : 0, Date.now()]
+      sql: `INSERT INTO prontidao_state (trade_key, historico, ativa, ultimo_score, atualizado_em)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(trade_key) DO UPDATE SET
+              historico=excluded.historico,
+              ativa=excluded.ativa,
+              ultimo_score=excluded.ultimo_score,
+              atualizado_em=excluded.atualizado_em`,
+      args: [
+        tradeKey,
+        JSON.stringify(historico || []),
+        ativa ? 1 : 0,
+        (ultimoScore != null && Number.isFinite(Number(ultimoScore))) ? Number(ultimoScore) : null,
+        Date.now()
+      ]
     });
   } catch (err) { logger.error('Erro persistProntidao:', err.message); }
 }
@@ -800,16 +831,23 @@ async function loadStateFromTurso() {
     }
 
     // Prontidões
-    const prRes = await db.execute('SELECT trade_key, historico, ativa FROM prontidao_state');
+    const prRes = await db.execute('SELECT trade_key, historico, ativa, ultimo_score FROM prontidao_state');
     let prRestaurados = 0;
+    let scoresRestaurados = 0;
     for (const row of prRes.rows) {
       const hist = JSON.parse(row.historico || '[]');
       if (Array.isArray(hist) && hist.length > 0) prontidaoHistorico.set(row.trade_key, hist);
       if (row.ativa) prontidaoAtiva.add(row.trade_key);
+      // ⭐ NOVO — restaurar ultimo_score
+      if (row.ultimo_score != null && Number.isFinite(Number(row.ultimo_score))) {
+        prontidaoUltimoScoreEnviado.set(row.trade_key, Number(row.ultimo_score));
+        scoresRestaurados++;
+      }
+      prontRestauradosPlus = true;
       prRestaurados++;
     }
 
-    logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${cdExpirados} cooldown(s) expirado(s)`);
+    logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${scoresRestaurados} score(s) · ${cdExpirados} cooldown(s) expirado(s)`);
   } catch (err) {
     logger.error(`❌ Erro ao carregar estado do Turso: ${err.message}`);
   }
@@ -851,23 +889,18 @@ function diagnosticoProximidade(reasons) {
   // ⭐ NOVOS GATES (Issues 2 e 3 + Zone B sanity + DeMarker novo formato)
   // ═══════════════════════════════════════════════════════════════════════
 
-  // Zone B sanity POSITIVA — entrada moderada foi validada
   if (/✅ Zona B validada|mantém\s+(CALL|PUT)\s+em zona B/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'zona B validada — entrada moderada aprovada' };
   }
-  // Zone B sanity NEGATIVA — foi rebaixada para HOLD
   if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'zona B rebaixada — macro contra direção' };
   }
-  // Bug B mode-aware (Issue 2)
   if (/hist a desacelerar \d+%.*limite \d+%.*para (SNIPER|CAÇADOR|PESCADOR|BALEEIRO)/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'macro a desacelerar — aguarda estabilizar' };
   }
-  // REVERSAO_ACCEL mode-aware (Issue 3)
   if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'reversão ativa — aguarda alinhar' };
   }
-  // DeMarker bloqueio com trigger/macro explícito (novo formato)
   if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'DeMarker em extremo — aguarda normalizar' };
   }
@@ -888,7 +921,6 @@ function diagnosticoProximidade(reasons) {
   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
   }
-  // FIX #81
   if (/SINAL ANULADO:\s*\S+\s+DeM\s+[\d.]+\s+em\s+(fundo|topo)\s+extremo/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'exaustão nos TFs-chave — aguarda respirar' };
   }
@@ -923,10 +955,6 @@ function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // CASOS CRÍTICOS (retornam imediatamente)
-  // ═══════════════════════════════════════════════════════════════════════
-
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     const match = texto.match(/RESPIRAÇÃO\s+(SIMPLES|DUPLA)/i);
     const tipo = match ? match[1] : 'SIMPLES';
@@ -935,36 +963,23 @@ function avaliarEsticamento(reasons) {
   if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'DeMarker extremo confirmado' };
   }
-  // FIX #81 (exaustão dos TFs-chave)
   const m81 = texto.match(/SINAL ANULADO:\s*(\S+)\s+DeM\s+([\d.]+)\s+em\s+(fundo|topo)\s+extremo/i);
   if (m81) {
     return { esticado: true, nivel: 'ALTO', motivo: `Exaustão ${m81[1]} DeM ${m81[2]} (${m81[3]})` };
   }
-  // Fator de prontidão (variações de "mercado precisa respirar")
   if (/Prontidão reduzida por exaustão DeMarker/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Exaustão confirmada nos TFs-chave' };
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // ⭐ NOVOS GATES (Issues 2/3 + Zone B sanity)
-  // ═══════════════════════════════════════════════════════════════════════
-
-  // Bug B mode-aware → macro esticada, aguarda
   if (/hist a desacelerar \d+%.*limite \d+%.*para (SNIPER|CAÇADOR|PESCADOR|BALEEIRO)/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Macro a desacelerar — momentum fraco' };
   }
-  // REVERSAO_ACCEL mode-aware → reversão em curso
   if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Reversão ativa — TFs a virar contra' };
   }
-  // Zone B rebaixada → entrada instável
   if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
     return { esticado: true, nivel: 'MÉDIO', motivo: 'Zona B rebaixada — macro contra' };
   }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // CASOS COM ACUMULAÇÃO (≥ 2 = ALTO, 1 = MÉDIO)
-  // ═══════════════════════════════════════════════════════════════════════
 
   if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
   if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
@@ -1046,7 +1061,6 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nivel = extras.nivelProntidao || 'EARLY';
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
 
-  // ⭐ FIX — checar bloqueios ANTES de aplicar "MATURE" indiscriminado
   const proximidadeDiag = diagnosticoProximidade(dados.consolidated.score_reasons || []);
   const bloqueio = proximidadeDiag && proximidadeDiag.nivel === 'BLOQUEADO';
 
@@ -1382,6 +1396,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         prontidaoAtiva.delete(tradeKey);
         prontidaoHistorico.delete(tradeKey);
         prontidaoForaContagem.delete(tradeKey);
+        prontidaoUltimoScoreEnviado.delete(tradeKey);
         return;
       }
 
@@ -1426,12 +1441,14 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
       prontidaoUltimoEnvio.delete(tradeKey);
+      prontidaoUltimoScoreEnviado.delete(tradeKey);
       arrefecimentoUltimoEnvio.delete(tradeKey);
       removePersistedProntidao(tradeKey);
     }
   }
   else if (dados.consolidated.signal === 'HOLD' && (dados.consolidated.zona === 'B' || dados.consolidated.zona === 'C')) {
     const scoreAtual = dados.consolidated.score || 0;
+    const scoreAtualNum = Number(scoreAtual) || 0;
     const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
     if (regimeAtualPush === 'CHOP') {
       logger.info(`🔇 [FIX #60] PRONTIDAO ignorada em CHOP: ${symbol} (${mode})`);
@@ -1475,15 +1492,33 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     historico.push({ score: scoreAtual, t: agora });
     if (historico.length > 5) historico.shift();
     prontidaoHistorico.set(tradeKey, historico);
-    persistProntidao(tradeKey, historico, prontidaoAtiva.has(tradeKey));
+    // ⭐ Persiste histórico com score atual (sobrevive a restarts)
+    persistProntidao(
+      tradeKey,
+      historico,
+      prontidaoAtiva.has(tradeKey),
+      prontidaoUltimoScoreEnviado.has(tradeKey) ? prontidaoUltimoScoreEnviado.get(tradeKey) : null
+    );
 
     const cfg = getProntidaoConfig(mode);
     const ultimoEnvio = prontidaoUltimoEnvio.get(tradeKey) || 0;
-    const podeEnviarAgora = (agora - ultimoEnvio) >= cfg.cooldownMs;
+    const ultimoScoreEnviado = prontidaoUltimoScoreEnviado.get(tradeKey);
+
+    // ⭐ NOVO — para re-enviar, é preciso BOTH:
+    //   1. Ter passado o cooldownMs do modo
+    //   2. O score ter subido >= scoreDeltaMin desde o último envio
+    const primeiraVez = !prontidaoUltimoEnvio.has(tradeKey);
+    const passouCooldown = (agora - ultimoEnvio) >= cfg.cooldownMs;
+    const scoreSubiuOSuficiente =
+      ultimoScoreEnviado === undefined
+      || (scoreAtualNum - ultimoScoreEnviado) >= (cfg.scoreDeltaMin || 5);
+
+    const podeEnviarAgora = primeiraVez || (passouCooldown && scoreSubiuOSuficiente);
+
     const ultimoGlobal = prontidaoGlobalPorSymbol.get(symbol) || 0;
     const podeEnviarGlobal = (agora - ultimoGlobal) >= PRONTIDAO_GLOBAL_COOLDOWN_MS;
 
-    if ((!prontidaoAtiva.has(tradeKey) || podeEnviarAgora) && podeEnviarGlobal) {
+    if (podeEnviarAgora && podeEnviarGlobal) {
       const direcaoPrep = extrairDirecaoPrep(dados);
       if (direcaoPrep) {
         const subindo = historico.length >= 3 && historico[historico.length - 1].score > historico[0].score;
@@ -1509,11 +1544,15 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         if (matureTks.length > 0 || earlyTks.length > 0) {
           prontidaoAtiva.add(tradeKey);
           prontidaoUltimoEnvio.set(tradeKey, agora);
+          prontidaoUltimoScoreEnviado.set(tradeKey, scoreAtualNum);  // ⭐ NOVO
           prontidaoGlobalPorSymbol.set(symbol, agora);
           prontidaoForaContagem.set(tradeKey, 0);
-          persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true);
+          // ⭐ Persiste com o score atual
+          persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true, scoreAtualNum);
         }
       }
+    } else if (!primeiraVez && passouCooldown && !scoreSubiuOSuficiente) {
+      logger.info(`⏭️ [PRONTIDAO-COOLDOWN] ${symbol} (${mode}) score ${scoreAtualNum} vs último ${ultimoScoreEnviado} — delta < ${cfg.scoreDeltaMin}`);
     }
   }
   else if (dados.consolidated.signal === 'HOLD' && prontidaoAtiva.has(tradeKey)) {
@@ -1531,6 +1570,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
+      prontidaoUltimoScoreEnviado.delete(tradeKey);  // ⭐ NOVO
       removePersistedProntidao(tradeKey);
     }
   }
@@ -1763,7 +1803,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
         const zona = consolidated.zona || '?';
         const signal = consolidated.signal || 'HOLD';
 
-        // ⭐ NOVO — calcular mensagem amigável + distância para zona B/A
         const ZONA_B_MIN = { 'SNIPER': 45, 'CAÇADOR': 50, 'PESCADOR': 55, 'BALEEIRO': 60 };
         const zonaBMin = ZONA_B_MIN[mode] || 50;
         const zonaAMin = zonaBMin + 10;
@@ -1787,7 +1826,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           mensagemProntidao = `⚪ Aguarda — ${distZonaB} pts p/ Zona B`;
         }
 
-        // Extra: se esticado, avisar
         const estic = avaliarEsticamento(consolidated.score_reasons);
         if (estic.esticado && estic.nivel === 'ALTO') {
           mensagemProntidao = `🔥 ESTICADO — ${estic.motivo}`;
@@ -1933,6 +1971,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   }
   logger.info(`Turso: ${tursoInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
+  logger.info(`v2.22: Cooldown PRONTIDAO por modo + persistência de ultimo_score.`);
   logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
   logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
   logger.info(`FIX-PRONTIDAO: Bloqueio activo impede MATURE enganador.`);
