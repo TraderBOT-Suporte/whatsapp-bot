@@ -274,7 +274,6 @@ async function sendPushToWatchers(watchers, payload) {
 }
 
 // ========== MAPEAMENTO DE ATIVOS (nomes amigáveis) ==========
-// (copia do teu arquivo actual — inalterado)
 const assetGroups = {
   'Cestas de Moedas': ['WLDAUD', 'WLDEUR', 'WLDGBP', 'WLDXAU', 'WLDUSD'],
   'Forex': ['frxAUDCAD', 'frxAUDCHF', 'frxAUDJPY', 'frxAUDNZD', 'frxAUDUSD', 'frxEURCAD', 'frxEURCHF', 'frxEURAUD', 'frxEURGBP', 'frxEURJPY', 'frxEURNZD', 'frxEURUSD', 'frxGBPAUD', 'frxGBPCAD', 'frxGBPCHF', 'frxGBPJPY', 'frxGBPNOK', 'frxGBPNZD', 'frxGBPUSD', 'frxNZDJPY', 'frxNZDUSD', 'frxUSDCAD', 'frxUSDCHF', 'frxUSDJPY', 'frxUSDMXN', 'frxUSDNOK', 'frxUSDPLN', 'frxUSDSEK', 'frxGBPPLN'],
@@ -816,7 +815,7 @@ async function loadStateFromTurso() {
   }
 }
 
-// ========== HELPERS (inalterados) ==========
+// ========== HELPERS ==========
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
@@ -1047,18 +1046,15 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nivel = extras.nivelProntidao || 'EARLY';
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
 
-    let proximidade, detalhe, emoji;
   // ⭐ FIX — checar bloqueios ANTES de aplicar "MATURE" indiscriminado
-  const proximidadeDiag = diagnosticoProximidade(reasons);
+  const proximidadeDiag = diagnosticoProximidade(dados.consolidated.score_reasons || []);
   const bloqueio = proximidadeDiag && proximidadeDiag.nivel === 'BLOQUEADO';
 
-  if (bloqueio) {
-    emoji = '⏸️'; proximidade = 'BLOQUEADO'; detalhe = proximidadeDiag.detalhe || 'bloqueio ativo — aguarda normalizar';
-  }
+  let proximidade, detalhe, emoji;
+  if (bloqueio) { emoji = '⏸️'; proximidade = 'BLOQUEADO'; detalhe = proximidadeDiag.detalhe || 'bloqueio ativo — aguarda normalizar'; }
   else if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
   else if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasons)) { emoji = '🌬️'; proximidade = 'BLOQUEADO'; detalhe = 'mercado precisa respirar — aguarda normalizar'; }
   else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) { emoji = '⛔'; proximidade = 'BLOQUEADO'; detalhe = 'mercado em extremo — aguarda normalizar'; }
-  // ⭐ NOVO — FIX #81
   else if (/SINAL ANULADO:\s*\S+\s+DeM\s+[\d.]+\s+em\s+(fundo|topo)\s+extremo/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'exaustão nos TFs-chave — aguarda respirar'; }
   else if (/Prontidão reduzida por exaustão DeMarker/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'exaustão confirmada — aguarda respirar'; }
   else if (/micro timing bloqueou|Micro timing.*BLOQUEOU|DeM.*contra (CALL|PUT)|sobrecompra micro|sobrevenda micro/i.test(reasons)) { emoji = '🚫'; proximidade = 'BLOQUEADO'; detalhe = 'micro timing contra — aguarda alinhar'; }
@@ -1070,7 +1066,10 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(reasons)) { emoji = '👀'; proximidade = 'EM FORMAÇÃO'; detalhe = 'gatilho em ajuste — prepara-te'; }
   else { emoji = '📊'; proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento'; }
 
-  const prefixoTitulo = nivel === 'MATURE' ? `🔥 Perto de entrar: ${nomeAmigavel}` : `👀 Em formação: ${nomeAmigavel}`;
+  const prefixoTitulo = bloqueio
+    ? `⏸️ Em formação: ${nomeAmigavel}`
+    : (nivel === 'MATURE' ? `🔥 Perto de entrar: ${nomeAmigavel}` : `👀 Em formação: ${nomeAmigavel}`);
+
   return {
     titulo: prefixoTitulo,
     corpo: `${dirLabel} · ${nomeAmigavel}\n⚡ Score ${score}/100 · ${proximidade}\n💡 ${detalhe}`,
@@ -1446,6 +1445,16 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       return;
     }
 
+    // ⭐ FIX-PRONTIDAO — Se há bloqueio ativo nos reasons (DeMarker extremo, reversão,
+    //   respiração, etc.), não enviar MATURE ("setup quase confirmado"). Só EARLY.
+    const proximidadePront = diagnosticoProximidade(dados.consolidated.score_reasons);
+    const bloqueioAtivo = proximidadePront && proximidadePront.nivel === 'BLOQUEADO';
+    let _forcarSomenteEarly = false;
+    if (bloqueioAtivo) {
+      logger.info(`⛔ [FIX-PRONTIDAO] ${symbol} (${mode}) bloqueio ativo (${proximidadePront.detalhe}) — a enviar apenas EARLY informativo`);
+      _forcarSomenteEarly = true;
+    }
+
     const prefsPorWatcher = new Map();
     for (const tk of watchers) {
       const prefs = await getUserPreferences(tk);
@@ -1482,7 +1491,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         for (const tk of watchers) {
           const p = prefsPorWatcher.get(tk) || DEFAULT_PREFS[mode];
           if (scoreAtual < p.scoreEarly) continue;
-          if (scoreAtual >= p.scoreMature) matureTks.push(tk);
+          // ⭐ FIX — se há bloqueio ativo, força EARLY mesmo que o score chegue para MATURE
+          if (!_forcarSomenteEarly && scoreAtual >= p.scoreMature) matureTks.push(tk);
           else earlyTks.push(tk);
         }
 
@@ -1748,7 +1758,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
       const batchResults = await Promise.allSettled(batch.map(async (symbol) => {
         const data = await buscarSinalAnalise(symbol, mode);
         if (!data || !data.success) return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
-                const consolidated = data.consolidated || {};
+        const consolidated = data.consolidated || {};
         const score = consolidated.score || 0;
         const zona = consolidated.zona || '?';
         const signal = consolidated.signal || 'HOLD';
@@ -1817,7 +1827,6 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
     sql += ' ORDER BY criado_em DESC LIMIT ?';
     args.push(limit);
     const result = await db.execute({ sql, args });
-    // Filtrar por watchers em JS (JSON text — SQLite não tem array-contains)
     const tokenHash = req.user.tokenHash;
     const signals = result.rows
       .filter(row => {
@@ -1926,6 +1935,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
   logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
   logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
+  logger.info(`FIX-PRONTIDAO: Bloqueio activo impede MATURE enganador.`);
   try {
     await loadStateFromTurso();
   } catch (e) {
