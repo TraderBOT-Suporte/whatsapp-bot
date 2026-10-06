@@ -1767,7 +1767,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
         } else if (score >= zonaBMin - 20) {
           mensagemProntidao = `🔵 Em formação — score ${score} (faltam ${distZonaB} pts p/ Zona B)`;
         } else {
-          mensagemProntidao = `⚪ Longe — score ${score} (${distZonaB > 0 ? `faltam ${distZonaB} p/ B` : 'aguarda'})`;
+          mensagemProntidao = `⚪ Aguarda — ${distZonaB} pts p/ Zona B`;
         }
 
         // Extra: se esticado, avisar
