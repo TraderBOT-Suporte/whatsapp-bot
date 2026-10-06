@@ -1047,8 +1047,15 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nivel = extras.nivelProntidao || 'EARLY';
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
 
-  let proximidade, detalhe, emoji;
-  if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
+    let proximidade, detalhe, emoji;
+  // ⭐ FIX — checar bloqueios ANTES de aplicar "MATURE" indiscriminado
+  const proximidadeDiag = diagnosticoProximidade(reasons);
+  const bloqueio = proximidadeDiag && proximidadeDiag.nivel === 'BLOQUEADO';
+
+  if (bloqueio) {
+    emoji = '⏸️'; proximidade = 'BLOQUEADO'; detalhe = proximidadeDiag.detalhe || 'bloqueio ativo — aguarda normalizar';
+  }
+  else if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
   else if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasons)) { emoji = '🌬️'; proximidade = 'BLOQUEADO'; detalhe = 'mercado precisa respirar — aguarda normalizar'; }
   else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) { emoji = '⛔'; proximidade = 'BLOQUEADO'; detalhe = 'mercado em extremo — aguarda normalizar'; }
   // ⭐ NOVO — FIX #81
