@@ -843,7 +843,6 @@ async function loadStateFromTurso() {
         prontidaoUltimoScoreEnviado.set(row.trade_key, Number(row.ultimo_score));
         scoresRestaurados++;
       }
-      prontRestauradosPlus = true;
       prRestaurados++;
     }
 
