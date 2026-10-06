@@ -847,6 +847,36 @@ function extrairDirecaoPrep(dados) {
 
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ⭐ NOVOS GATES (Issues 2 e 3 + Zone B sanity + DeMarker novo formato)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // Zone B sanity POSITIVA — entrada moderada foi validada
+  if (/✅ Zona B validada|mantém\s+(CALL|PUT)\s+em zona B/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'zona B validada — entrada moderada aprovada' };
+  }
+  // Zone B sanity NEGATIVA — foi rebaixada para HOLD
+  if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'zona B rebaixada — macro contra direção' };
+  }
+  // Bug B mode-aware (Issue 2)
+  if (/hist a desacelerar \d+%.*limite \d+%.*para (SNIPER|CAÇADOR|PESCADOR|BALEEIRO)/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'macro a desacelerar — aguarda estabilizar' };
+  }
+  // REVERSAO_ACCEL mode-aware (Issue 3)
+  if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'reversão ativa — aguarda alinhar' };
+  }
+  // DeMarker bloqueio com trigger/macro explícito (novo formato)
+  if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'DeMarker em extremo — aguarda normalizar' };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CASOS ANTIGOS (mantidos na ordem original)
+  // ═══════════════════════════════════════════════════════════════════════
+
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado precisa respirar — aguarda normalizar' };
   }
@@ -856,10 +886,10 @@ function diagnosticoProximidade(reasons) {
   if (/SEM DIREÇÃO DEFINIDA|Tendência indefinida|SEM DIREÇÃO/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'mercado sem direção clara' };
   }
-   if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
+  if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado em extremo — aguarda normalizar' };
   }
-  // ⭐ NOVO — FIX #81
+  // FIX #81
   if (/SINAL ANULADO:\s*\S+\s+DeM\s+[\d.]+\s+em\s+(fundo|topo)\s+extremo/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'exaustão nos TFs-chave — aguarda respirar' };
   }
@@ -893,23 +923,50 @@ function diagnosticoProximidade(reasons) {
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CASOS CRÍTICOS (retornam imediatamente)
+  // ═══════════════════════════════════════════════════════════════════════
+
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     const match = texto.match(/RESPIRAÇÃO\s+(SIMPLES|DUPLA)/i);
     const tipo = match ? match[1] : 'SIMPLES';
     return { esticado: true, nivel: 'ALTO', motivo: `Respiração ${tipo} — mercado em extremo` };
   }
-   if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
+  if (/SINAL ANULADO: DeMarker extremo|DEMARKER EXTREMO —/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'DeMarker extremo confirmado' };
   }
-  // ⭐ NOVO — FIX #81 (exaustão dos TFs-chave: M15/H1, H1/H4, H24/W1, W1/MN1)
+  // FIX #81 (exaustão dos TFs-chave)
   const m81 = texto.match(/SINAL ANULADO:\s*(\S+)\s+DeM\s+([\d.]+)\s+em\s+(fundo|topo)\s+extremo/i);
   if (m81) {
     return { esticado: true, nivel: 'ALTO', motivo: `Exaustão ${m81[1]} DeM ${m81[2]} (${m81[3]})` };
   }
-  // ⭐ NOVO — factor de prontidão (variações de "mercado precisa respirar")
+  // Fator de prontidão (variações de "mercado precisa respirar")
   if (/Prontidão reduzida por exaustão DeMarker/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Exaustão confirmada nos TFs-chave' };
   }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ⭐ NOVOS GATES (Issues 2/3 + Zone B sanity)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // Bug B mode-aware → macro esticada, aguarda
+  if (/hist a desacelerar \d+%.*limite \d+%.*para (SNIPER|CAÇADOR|PESCADOR|BALEEIRO)/i.test(texto)) {
+    return { esticado: true, nivel: 'ALTO', motivo: 'Macro a desacelerar — momentum fraco' };
+  }
+  // REVERSAO_ACCEL mode-aware → reversão em curso
+  if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
+    return { esticado: true, nivel: 'ALTO', motivo: 'Reversão ativa — TFs a virar contra' };
+  }
+  // Zone B rebaixada → entrada instável
+  if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
+    return { esticado: true, nivel: 'MÉDIO', motivo: 'Zona B rebaixada — macro contra' };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CASOS COM ACUMULAÇÃO (≥ 2 = ALTO, 1 = MÉDIO)
+  // ═══════════════════════════════════════════════════════════════════════
+
   if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
   if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
   if (/RSI\s+(7[5-9]|8\d|9\d)\b/i.test(texto)) alertas.push('RSI extremo alto');
@@ -918,6 +975,7 @@ function avaliarEsticamento(reasons) {
   if (/RSI.*zona baixa/i.test(texto)) alertas.push('RSI zona baixa');
   if (/(DeMarker|DeM)\s+0\.6[5-9]/i.test(texto)) alertas.push('DeM a esticar');
   if (/(DeMarker|DeM)\s+0\.3[0-5]/i.test(texto)) alertas.push('DeM a esticar (baixo)');
+
   if (alertas.length >= 2) return { esticado: true, nivel: 'ALTO', motivo: alertas.slice(0, 3).join(' · ') };
   if (alertas.length === 1) return { esticado: true, nivel: 'MÉDIO', motivo: alertas[0] };
   return { esticado: false, nivel: 'BAIXO', motivo: 'mercado saudável' };
@@ -1683,15 +1741,52 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
       const batchResults = await Promise.allSettled(batch.map(async (symbol) => {
         const data = await buscarSinalAnalise(symbol, mode);
         if (!data || !data.success) return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
-        const consolidated = data.consolidated || {};
+                const consolidated = data.consolidated || {};
+        const score = consolidated.score || 0;
+        const zona = consolidated.zona || '?';
+        const signal = consolidated.signal || 'HOLD';
+
+        // ⭐ NOVO — calcular mensagem amigável + distância para zona B/A
+        const ZONA_B_MIN = { 'SNIPER': 45, 'CAÇADOR': 50, 'PESCADOR': 55, 'BALEEIRO': 60 };
+        const zonaBMin = ZONA_B_MIN[mode] || 50;
+        const zonaAMin = zonaBMin + 10;
+        const distZonaB = Math.max(0, zonaBMin - score);
+        const distZonaA = Math.max(0, zonaAMin - score);
+
+        let mensagemProntidao = null;
+        if (signal !== 'HOLD' && zona === 'A') {
+          mensagemProntidao = `🚨 Sinal CONFIRMADO ${signal} — score ${score}`;
+        } else if (signal !== 'HOLD' && zona === 'B') {
+          mensagemProntidao = `⚡ Sinal MODERADO ${signal} — score ${score} (entrada validada)`;
+        } else if (zona === 'B') {
+          const dirPrep = extrairDirecaoPrep(data);
+          const dirTxt = dirPrep ? dirPrep : 'aguarda direção';
+          mensagemProntidao = `👀 Em Zona B (${dirTxt}) — score ${score}, ${distZonaA > 0 ? `faltam ${distZonaA} pts p/ Zona A` : 'pronto p/ A'}`;
+        } else if (score >= zonaBMin - 8 && score < zonaBMin) {
+          mensagemProntidao = `🟡 Quase em Zona B — score ${score}/${zonaBMin} (faltam ${distZonaB} pts)`;
+        } else if (score >= zonaBMin - 20) {
+          mensagemProntidao = `🔵 Em formação — score ${score} (faltam ${distZonaB} pts p/ Zona B)`;
+        } else {
+          mensagemProntidao = `⚪ Longe — score ${score} (${distZonaB > 0 ? `faltam ${distZonaB} p/ B` : 'aguarda'})`;
+        }
+
+        // Extra: se esticado, avisar
+        const estic = avaliarEsticamento(consolidated.score_reasons);
+        if (estic.esticado && estic.nivel === 'ALTO') {
+          mensagemProntidao = `🔥 ESTICADO — ${estic.motivo}`;
+        }
+
         return {
           symbol, name: getFriendlyName(symbol),
-          signal: consolidated.signal || 'HOLD',
-          zona: consolidated.zona || '?',
-          score: consolidated.score || 0,
+          signal,
+          zona,
+          score,
           proximidade: diagnosticoProximidade(consolidated.score_reasons),
-          esticamento: avaliarEsticamento(consolidated.score_reasons),
-          reasons: (consolidated.score_reasons || []).slice(0, 3)
+          esticamento: estic,
+          mensagemProntidao,
+          distanciaZonaB: distZonaB,
+          distanciaZonaA: distZonaA,
+          reasons: (consolidated.score_reasons || []).slice(0, 4)
         };
       }));
       allResults.push(...batchResults);
