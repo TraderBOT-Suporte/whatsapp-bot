@@ -1985,7 +1985,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`v2.22: Cooldown PRONTIDAO por modo + persistência de ultimo_score.`);
   logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
   logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
-  logger.info(`FIX-PRONTIDAO: Bloqueio activo impede MATURE enganador.`);
+  logger.info(`FIX-PRONTIDAO v2: MATURE depende do flag mature_aprovado do motor.`);
   try {
     await loadStateFromTurso();
   } catch (e) {
