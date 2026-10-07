@@ -1461,16 +1461,28 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       return;
     }
 
-    // ⭐ FIX-PRONTIDAO — Se há bloqueio ativo nos reasons (DeMarker extremo, reversão,
-    //   respiração, etc.), não enviar MATURE ("setup quase confirmado"). Só EARLY.
+    // ⭐ FIX-PRONTIDAO v2 — MATURE agora depende do flag do motor.
+    //   O motor calcula `mature_aprovado` no analyze-handler e envia no payload.
+    //   Se o motor não aprovou MATURE, o painel envia apenas EARLY informativo.
+    //   Fallback: se o flag não vier (compatibilidade com cache antigo),
+    //   usamos o check antigo de `diagnosticoProximidade === BLOQUEADO`.
+    const matureAprovadoMotor = dados.consolidated?.mature_aprovado === true;
+    const matureMotivo = dados.consolidated?.mature_motivo_bloqueio || null;
     const proximidadePront = diagnosticoProximidade(dados.consolidated.score_reasons);
     const bloqueioAtivo = proximidadePront && proximidadePront.nivel === 'BLOQUEADO';
+
+    // Suprimir MATURE se:
+    //   - motor não aprovou (flag explícito), OU
+    //   - fallback: bloqueio ativo (cache antigo antes do deploy)
+    const deveForcarEarly = !matureAprovadoMotor || bloqueioAtivo;
+
     let _forcarSomenteEarly = false;
-    if (bloqueioAtivo) {
-      logger.info(`⛔ [FIX-PRONTIDAO] ${symbol} (${mode}) bloqueio ativo (${proximidadePront.detalhe}) — a enviar apenas EARLY informativo`);
+    if (deveForcarEarly) {
+      const motivo = matureMotivo
+        || (bloqueioAtivo ? proximidadePront.detalhe : 'motor não aprovou MATURE');
+      logger.info(`⛔ [FIX-PRONTIDAO v2] ${symbol} (${mode}) MATURE bloqueado — ${motivo}`);
       _forcarSomenteEarly = true;
     }
-
     const prefsPorWatcher = new Map();
     for (const tk of watchers) {
       const prefs = await getUserPreferences(tk);
