@@ -572,6 +572,19 @@ function getTimeoutExtendModo(mode) {
 const PROGRESSO_MINIMO_EXTENSAO = 0.05;
 const EXTENSOES_MAX = 3;
 
+// ⭐ Intervalo entre atualizações periódicas (por modo)
+// O trade recebe avisos "Atualização (Xmin)" a cada N minutos
+// enquanto estiver dentro da janela 10%-50% do alvo.
+const INTERVALO_ATUALIZACAO_POR_MODO_MS = {
+  'SNIPER':   3  * 60 * 1000,   // 3 min
+  'CAÇADOR':  10 * 60 * 1000,   // 10 min
+  'PESCADOR': 30 * 60 * 1000,   // 30 min
+  'BALEEIRO': 120 * 60 * 1000   // 2 horas
+};
+function getIntervaloAtualizacao(mode) {
+  return INTERVALO_ATUALIZACAO_POR_MODO_MS[mode] || 10 * 60 * 1000;
+}
+
 // ========== WATCHLIST POR UTILIZADOR (Turso) ==========
 async function getUserWatchlist(tokenHash) {
   if (!tursoInitialized) return null;
@@ -900,8 +913,22 @@ function diagnosticoProximidade(reasons) {
   if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'reversão ativa — aguarda alinhar' };
   }
-  if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
+   if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'DeMarker em extremo — aguarda normalizar' };
+  }
+
+  // ⭐ NOVO — Gate de força macro (TF maior domina por força composta)
+  if (/⛔ SINAL ANULADO \([^)]*\):.*força \d+\/100\) domina|A TF maior em \S+ tem força para ganhar o cabo de guerra/i.test(texto)) {
+    const m = texto.match(/TF maior em (\S+) tem força/i);
+    const tf = m ? m[1] : 'TF maior';
+    return { nivel: 'BLOQUEADO', detalhe: `${tf} domina o sinal — aguarda que perca força` };
+  }
+
+  // ⭐ NOVO — RSI Hard Block multi-TF
+  if (/⛔ SINAL ANULADO: \d+ TFs com RSI em zona (alta|baixa) — pullback iminente/i.test(texto)) {
+    const m = texto.match(/(\d+) TFs com RSI em zona (alta|baixa)/i);
+    const zona = m ? m[2] : 'extrema';
+    return { nivel: 'BLOQUEADO', detalhe: `${m ? m[1] : 'Vários'} TFs com RSI em zona ${zona} — pullback iminente` };
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -976,8 +1003,20 @@ function avaliarEsticamento(reasons) {
   if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Reversão ativa — TFs a virar contra' };
   }
-  if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
+    if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
     return { esticado: true, nivel: 'MÉDIO', motivo: 'Zona B rebaixada — macro contra' };
+  }
+
+  // ⭐ NOVO — Gate de força macro
+  if (/⛔ SINAL ANULADO \([^)]*\):.*força \d+\/100\) domina|A TF maior em \S+ tem força para ganhar o cabo de guerra/i.test(texto)) {
+    const m = texto.match(/TF maior em (\S+) tem força/i);
+    const tf = m ? m[1] : 'TF maior';
+    return { esticado: true, nivel: 'ALTO', motivo: `${tf} com dominância estrutural — entrada inviável` };
+  }
+
+  // ⭐ NOVO — RSI Hard Block multi-TF
+  if (/⛔ SINAL ANULADO: \d+ TFs com RSI em zona (alta|baixa) — pullback iminente/i.test(texto)) {
+    return { esticado: true, nivel: 'ALTO', motivo: 'RSI extremo em múltiplos TFs — pullback iminente' };
   }
 
   if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
@@ -1124,9 +1163,24 @@ function formatarMensagemSinal(symbol, dados, mode) {
   };
 }
 
-function formatarMensagem5Min(trade) {
+function formatarMensagemAtualizacao(trade, minutosDecorridos) {
   const nome = getFriendlyName(trade.symbol);
-  return { titulo: `⏱️ Atualização (5min): ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço atual ${trade.currentPrice} (entrada ${trade.entry})\n📈 Mantém a posição — trade em curso`, detalhes: { tipo: '5MIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss } };
+  const mins = minutosDecorridos || Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `⏱️ Atualização (${mins}min): ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n💵 Preço atual ${trade.currentPrice} (entrada ${trade.entry})\n📈 Mantém a posição — trade em curso`,
+    detalhes: {
+      tipo: '5MIN',
+      nomeAmigavel: nome,
+      direcao: trade.signal,
+      modo: trade.mode,
+      entry: trade.entry,
+      currentPrice: trade.currentPrice,
+      takeProfit: trade.takeProfit,
+      stopLoss: trade.stopLoss,
+      duracao: mins + 'min'
+    }
+  };
 }
 
 function formatarMensagemAceleracao(trade) {
@@ -1342,7 +1396,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           if (!emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
           else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
           else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
-          else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
+          else if ((!trade.ultimaAtualizacaoEnviada || (agora - trade.ultimaAtualizacaoEnviada) >= getIntervaloAtualizacao(trade.mode)) && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagemAtualizacao(trade, tempoDecorridoMin); tipo = '5MIN'; trade.ultimaAtualizacaoEnviada = agora; }
           else if (!trade.avisoZeroRiscoEnviado && percentualPercorrido >= 0.50) { msgObj = formatarMensagemZeroRisco(trade); tipo = 'ZERO_RISCO'; trade.avisoZeroRiscoEnviado = true; }
           else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
         }
@@ -1350,7 +1404,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         if (!emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
         else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
         else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
-        else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
+        else if ((!trade.ultimaAtualizacaoEnviada || (agora - trade.ultimaAtualizacaoEnviada) >= getIntervaloAtualizacao(trade.mode)) && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagemAtualizacao(trade, tempoDecorridoMin); tipo = '5MIN'; trade.ultimaAtualizacaoEnviada = agora; }
         else if (!trade.avisoZeroRiscoEnviado && percentualPercorrido >= 0.50) { msgObj = formatarMensagemZeroRisco(trade); tipo = 'ZERO_RISCO'; trade.avisoZeroRiscoEnviado = true; }
         else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
       }
@@ -1358,7 +1412,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     else if (!emRespiracaoOuPullback && !emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
     else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
     else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
-    else if (!trade.aviso5MinEnviado && tempoDecorridoMin >= 5 && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagem5Min(trade); tipo = '5MIN'; trade.aviso5MinEnviado = true; }
+    else if ((!trade.ultimaAtualizacaoEnviada || (agora - trade.ultimaAtualizacaoEnviada) >= getIntervaloAtualizacao(trade.mode)) && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagemAtualizacao(trade, tempoDecorridoMin); tipo = '5MIN'; trade.ultimaAtualizacaoEnviada = agora; }
     else if (!trade.avisoZeroRiscoEnviado && percentualPercorrido >= 0.50) { msgObj = formatarMensagemZeroRisco(trade); tipo = 'ZERO_RISCO'; trade.avisoZeroRiscoEnviado = true; }
     else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
 
@@ -1410,8 +1464,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         timestamp: agora,
         avisoSeguindoEnviado: false, avisoZeroRiscoEnviado: false,
         avisoQuaseLaEnviado: false, avisoAceleracaoEnviado: false,
-        avisoTempoEsgotadoEnviado: false, aviso5MinEnviado: false,
+        avisoTempoEsgotadoEnviado: false,
         avisoExaustaoEnviado: false,
+        ultimaAtualizacaoEnviada: null,
         timeoutAt: agora + getTimeoutModo(mode),
         extensoes: 0, percentualNoUltimoCheck: 0
       };
