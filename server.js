@@ -2034,9 +2034,11 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const mode = req.query.mode || null;
+    const serverFilter = req.query.server || null;
     let sql = 'SELECT * FROM signals WHERE 1=1';
     const args = [];
     if (mode) { sql += ' AND mode = ?'; args.push(mode); }
+    if (serverFilter && isValidServerId(serverFilter)) { sql += ' AND server_id = ?'; args.push(serverFilter); }
     sql += ' ORDER BY criado_em DESC LIMIT ?';
     args.push(limit);
     const result = await db.execute({ sql, args });
@@ -2069,12 +2071,13 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
 app.delete('/api/signals', authMiddleware, async (req, res) => {
   if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   const mode = req.query.mode || null;
+  const serverFilter = req.query.server || null;
   try {
     let sql = 'SELECT * FROM signals WHERE 1=1';
     const args = [];
     if (mode) { sql += ' AND mode = ?'; args.push(mode); }
+    if (serverFilter && isValidServerId(serverFilter)) { sql += ' AND server_id = ?'; args.push(serverFilter); }
     const result = await db.execute({ sql, args });
-
     const tokenHash = req.user.tokenHash;
     let deletados = 0, atualizados = 0;
 
@@ -2111,17 +2114,26 @@ app.get('/api/analysis-history', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/stats', authMiddleware, async (req, res) => {
-  const wl = tursoInitialized ? await getUserWatchlist(req.user.tokenHash).catch(() => null) : null;
+  const sid = resolveServerId(req.query.server);
+  const wl = tursoInitialized ? await getUserWatchlist(req.user.tokenHash, sid).catch(() => null) : null;
+  let openTradesServer = 0;
+  for (const key of tradesAbertos.keys()) {
+    if (key.startsWith(`${sid}_`)) openTradesServer++;
+  }
   const stats = {
+    serverId: sid,
     engineActive: !!wl?.engineActive,
     watchlistCount: wl ? [wl.SNIPER, wl['CAÇADOR'], wl.PESCADOR, wl.BALEEIRO].reduce((a, arr) => a + arr.length, 0) : 0,
-    openTrades: tradesAbertos.size, uptime: process.uptime(),
+    openTrades: openTradesServer, uptime: process.uptime(),
     turso: tursoInitialized, pushConfigured
   };
   if (tursoInitialized) {
     try {
       const tokenHash = req.user.tokenHash;
-      const all = await db.execute('SELECT watchers, criado_em FROM signals');
+      const all = await db.execute({
+        sql: 'SELECT watchers, criado_em FROM signals WHERE server_id = ?',
+        args: [sid]
+      });
       const tokenSignals = all.rows.filter(r => {
         try { return JSON.parse(r.watchers || '[]').includes(tokenHash); } catch { return false; }
       });
