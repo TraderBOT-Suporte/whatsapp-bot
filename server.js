@@ -1,4 +1,5 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.25 — Normalização automática de URL dos servidores de análise (fix 404 /analyze).
 // v2.24 — Atualizações periódicas por modo + novos gates (GATE FORÇA MACRO, RSI HARD BLOCK).
 // v2.23 — Multi-servidor de análise (watchlist/engine por servidor, push combinado).
 // v2.22 — Cooldown PRONTIDAO por modo + persistência de ultimo_score no Turso.
@@ -73,13 +74,29 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 
+// ========== ⭐ NORMALIZAÇÃO DE URL DOS SERVIDORES ==========
+// Garante que qualquer URL termina sempre em /api (sem barra final).
+// Aceita tanto "https://host.com" como "https://host.com/api" e
+// devolve sempre "https://host.com/api". Isto resolve o erro 404
+// quando as env vars do Render vêm sem o sufixo /api.
+function normalizeApiUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  if (/\/api$/i.test(trimmed)) return trimmed;
+  return trimmed + '/api';
+}
+
 // ========== SERVIDORES DE ANÁLISE ==========
 const ANALYSIS_SERVERS = (() => {
   const servers = {};
   servers['server1'] = {
     id: 'server1',
     name: process.env.ANALYSIS_SERVER_1_NAME || 'Servidor 1',
-    url: process.env.ANALYSIS_API_URL_1 || process.env.ANALYSIS_API_URL || 'http://localhost:3001'
+    url: normalizeApiUrl(
+      process.env.ANALYSIS_API_URL_1
+      || process.env.ANALYSIS_API_URL
+      || 'http://localhost:3001'
+    )
   };
   for (let i = 2; i <= 6; i++) {
     const url = process.env[`ANALYSIS_API_URL_${i}`];
@@ -87,7 +104,7 @@ const ANALYSIS_SERVERS = (() => {
     servers[`server${i}`] = {
       id: `server${i}`,
       name: process.env[`ANALYSIS_SERVER_${i}_NAME`] || `Servidor ${i}`,
-      url
+      url: normalizeApiUrl(url)
     };
   }
   return servers;
@@ -658,7 +675,6 @@ function getTimeoutExtendModo(mode) {
 const PROGRESSO_MINIMO_EXTENSAO = 0.05;
 const EXTENSOES_MAX = 3;
 
-// ⭐ Intervalo entre atualizações periódicas (por modo)
 const INTERVALO_ATUALIZACAO_POR_MODO_MS = {
   'SNIPER':   3  * 60 * 1000,
   'CAÇADOR':  10 * 60 * 1000,
@@ -1024,14 +1040,12 @@ function diagnosticoProximidade(reasons) {
     return { nivel: 'BLOQUEADO', detalhe: 'DeMarker em extremo — aguarda normalizar' };
   }
 
-  // ⭐ NOVO — Gate de força macro (TF maior domina por força composta)
   if (/⛔ SINAL ANULADO \([^)]*\):.*força \d+\/100\) domina|A TF maior em \S+ tem força para ganhar o cabo de guerra/i.test(texto)) {
     const m = texto.match(/TF maior em (\S+) tem força/i);
     const tf = m ? m[1] : 'TF maior';
     return { nivel: 'BLOQUEADO', detalhe: `${tf} domina o sinal — aguarda que perca força` };
   }
 
-  // ⭐ NOVO — RSI Hard Block multi-TF
   if (/⛔ SINAL ANULADO: \d+ TFs com RSI em zona (alta|baixa) — pullback iminente/i.test(texto)) {
     const m = texto.match(/(\d+) TFs com RSI em zona (alta|baixa)/i);
     const zona = m ? m[2] : 'extrema';
@@ -1110,14 +1124,12 @@ function avaliarEsticamento(reasons) {
     return { esticado: true, nivel: 'MÉDIO', motivo: 'Zona B rebaixada — macro contra' };
   }
 
-  // ⭐ NOVO — Gate de força macro
   if (/⛔ SINAL ANULADO \([^)]*\):.*força \d+\/100\) domina|A TF maior em \S+ tem força para ganhar o cabo de guerra/i.test(texto)) {
     const m = texto.match(/TF maior em (\S+) tem força/i);
     const tf = m ? m[1] : 'TF maior';
     return { esticado: true, nivel: 'ALTO', motivo: `${tf} com dominância estrutural — entrada inviável` };
   }
 
-  // ⭐ NOVO — RSI Hard Block multi-TF
   if (/⛔ SINAL ANULADO: \d+ TFs com RSI em zona (alta|baixa) — pullback iminente/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'RSI extremo em múltiplos TFs — pullback iminente' };
   }
@@ -1266,7 +1278,6 @@ function formatarMensagemSinal(symbol, dados, mode) {
   };
 }
 
-// ⭐ Atualização periódica — minutos corretos por modo
 function formatarMensagemAtualizacao(trade, minutosDecorridos) {
   const nome = getFriendlyName(trade.symbol);
   const mins = minutosDecorridos || Math.floor((Date.now() - trade.timestamp) / 60000);
@@ -1392,12 +1403,12 @@ async function buscarSinalAnalise(symbol, mode, serverId = DEFAULT_SERVER_ID) {
     });
     if (!response.ok) {
       const texto = await response.text();
-      logger.error(`❌ Erro HTTP ${response.status} ao buscar ${symbol} [${server.id}]: ${texto}`);
+      logger.error(`❌ Erro HTTP ${response.status} ao buscar ${symbol} [${server.id}] (${API_URL}/analyze): ${texto}`);
       return null;
     }
     return await response.json();
   } catch (err) {
-    logger.error(`❌ Erro de conexão ao buscar análise para ${symbol} [${server.id}]:`, err.message);
+    logger.error(`❌ Erro de conexão ao buscar análise para ${symbol} [${server.id}] (${API_URL}/analyze):`, err.message);
     return null;
   }
 }
@@ -2159,13 +2170,17 @@ app.listen(PORT, '0.0.0.0', async () => {
   }
   logger.info(`Turso: ${tursoInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
+  logger.info(`🌐 Servidores de análise (URLs normalizadas com /api):`);
+  for (const id of VALID_SERVER_IDS) {
+    logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
+  }
+  logger.info(`v2.25: Normalização automática de URL (fix 404 /analyze).`);
   logger.info(`v2.24: Atualizações por modo (SNIPER 3min | CAÇADOR 10min | PESCADOR 30min | BALEEIRO 2h).`);
   logger.info(`v2.23: Multi-servidor de análise (watchlist/engine por servidor, push combinado).`);
   logger.info(`v2.22: Cooldown PRONTIDAO por modo + persistência de ultimo_score.`);
   logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
   logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
   logger.info(`FIX-PRONTIDAO v2: MATURE depende do flag mature_aprovado do motor.`);
-  logger.info(`🌐 Servidores de análise: ${getAllServersPublic().map(s => `${s.id}(${s.name})`).join(', ')}`);
   try {
     await loadStateFromTurso();
   } catch (e) {
