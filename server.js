@@ -1,5 +1,6 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
-// Migração Firestore → Turso (libSQL). Todas as colecções foram convertidas em tabelas SQLite.
+// v2.24 — Atualizações periódicas por modo + novos gates (GATE FORÇA MACRO, RSI HARD BLOCK).
+// v2.23 — Multi-servidor de análise (watchlist/engine por servidor, push combinado).
 // v2.22 — Cooldown PRONTIDAO por modo + persistência de ultimo_score no Turso.
 // v2.21 — Turso (libSQL) substitui Firestore. Cache em memória mantida.
 
@@ -43,7 +44,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// Rotas PWA explícitas ANTES do static
 app.get('/service-worker.js', (req, res) => {
   res.set('Content-Type', 'application/javascript; charset=utf-8');
   res.set('Service-Worker-Allowed', '/');
@@ -73,11 +73,60 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 
+// ========== SERVIDORES DE ANÁLISE ==========
+const ANALYSIS_SERVERS = (() => {
+  const servers = {};
+  servers['server1'] = {
+    id: 'server1',
+    name: process.env.ANALYSIS_SERVER_1_NAME || 'Servidor 1',
+    url: process.env.ANALYSIS_API_URL_1 || process.env.ANALYSIS_API_URL || 'http://localhost:3001'
+  };
+  for (let i = 2; i <= 6; i++) {
+    const url = process.env[`ANALYSIS_API_URL_${i}`];
+    if (!url) continue;
+    servers[`server${i}`] = {
+      id: `server${i}`,
+      name: process.env[`ANALYSIS_SERVER_${i}_NAME`] || `Servidor ${i}`,
+      url
+    };
+  }
+  return servers;
+})();
+
+const DEFAULT_SERVER_ID = 'server1';
+const VALID_SERVER_IDS = Object.keys(ANALYSIS_SERVERS);
+function isValidServerId(id) { return typeof id === 'string' && VALID_SERVER_IDS.includes(id); }
+function resolveServerId(id) { return isValidServerId(id) ? id : DEFAULT_SERVER_ID; }
+function getServer(id) { return ANALYSIS_SERVERS[resolveServerId(id)]; }
+function getAllServersPublic() {
+  return VALID_SERVER_IDS.map(id => ({ id, name: ANALYSIS_SERVERS[id].name }));
+}
+
+function buildTradeKey(serverId, symbol, mode) {
+  return `${resolveServerId(serverId)}_${symbol}_${mode}`;
+}
+function parseTradeKey(tradeKey) {
+  if (!tradeKey || typeof tradeKey !== 'string') return null;
+  const parts = tradeKey.split('_');
+  if (parts.length < 3) {
+    const idx = tradeKey.lastIndexOf('_');
+    if (idx <= 0) return null;
+    return { serverId: DEFAULT_SERVER_ID, symbol: tradeKey.slice(0, idx), mode: tradeKey.slice(idx + 1) };
+  }
+  const serverId = parts[0];
+  const mode = parts[parts.length - 1];
+  const symbol = parts.slice(1, -1).join('_');
+  if (!isValidServerId(serverId)) {
+    const idx = tradeKey.lastIndexOf('_');
+    return { serverId: DEFAULT_SERVER_ID, symbol: tradeKey.slice(0, idx), mode: tradeKey.slice(idx + 1) };
+  }
+  return { serverId, symbol, mode };
+}
+
 // ========== TURSO (libSQL) ==========
 let db = null;
 let tursoInitialized = false;
 
-// ⭐ Cache em memória — mantido das optimizações anteriores
 let _watchlistsCache = null;
 let _watchlistsCacheExpira = 0;
 const WATCHLISTS_CACHE_TTL = 5 * 60 * 1000;
@@ -93,14 +142,16 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
 CREATE INDEX IF NOT EXISTS idx_push_sub_token ON push_subscriptions(token_hash);
 
 CREATE TABLE IF NOT EXISTS user_watchlists (
-  token_hash TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL,
+  server_id TEXT NOT NULL DEFAULT 'server1',
   email TEXT,
   engine_active INTEGER NOT NULL DEFAULT 0,
   sniper TEXT NOT NULL DEFAULT '[]',
   cacador TEXT NOT NULL DEFAULT '[]',
   pescador TEXT NOT NULL DEFAULT '[]',
   baleeiro TEXT NOT NULL DEFAULT '[]',
-  atualizado_em INTEGER NOT NULL
+  atualizado_em INTEGER NOT NULL,
+  PRIMARY KEY (token_hash, server_id)
 );
 
 CREATE TABLE IF NOT EXISTS user_preferences (
@@ -152,6 +203,7 @@ CREATE TABLE IF NOT EXISTS signals (
   take_profit REAL,
   stop_loss REAL,
   nivel_prontidao TEXT,
+  server_id TEXT DEFAULT 'server1',
   origem TEXT DEFAULT 'motor',
   criado_em INTEGER NOT NULL
 );
@@ -169,13 +221,11 @@ async function initializeTurso() {
   }
   try {
     db = createClient({ url, authToken });
-    // Aplicar schema — idempotente (IF NOT EXISTS)
     const statements = SCHEMA_SQL.split(';').map(s => s.trim()).filter(s => s.length > 0);
     for (const stmt of statements) {
       await db.execute(stmt);
     }
 
-    // ⭐ Migração automática — adicionar ultimo_score se não existir (BDs antigas)
     try {
       await db.execute('ALTER TABLE prontidao_state ADD COLUMN ultimo_score REAL');
       logger.info('✅ Coluna ultimo_score adicionada a prontidao_state');
@@ -185,7 +235,48 @@ async function initializeTurso() {
       }
     }
 
-    // Teste de ligação
+    try {
+      const info = await db.execute("PRAGMA table_info(user_watchlists)");
+      const hasServerId = info.rows.some(r => r.name === 'server_id');
+      if (!hasServerId) {
+        logger.info('🔄 Migrando user_watchlists para multi-servidor...');
+        await db.execute(`
+          CREATE TABLE IF NOT EXISTS user_watchlists_new (
+            token_hash TEXT NOT NULL,
+            server_id TEXT NOT NULL DEFAULT 'server1',
+            email TEXT,
+            engine_active INTEGER NOT NULL DEFAULT 0,
+            sniper TEXT NOT NULL DEFAULT '[]',
+            cacador TEXT NOT NULL DEFAULT '[]',
+            pescador TEXT NOT NULL DEFAULT '[]',
+            baleeiro TEXT NOT NULL DEFAULT '[]',
+            atualizado_em INTEGER NOT NULL,
+            PRIMARY KEY (token_hash, server_id)
+          )
+        `);
+        await db.execute(`
+          INSERT INTO user_watchlists_new
+            (token_hash, server_id, email, engine_active, sniper, cacador, pescador, baleeiro, atualizado_em)
+          SELECT token_hash, 'server1', email, engine_active, sniper, cacador, pescador, baleeiro, atualizado_em
+          FROM user_watchlists
+        `);
+        await db.execute('DROP TABLE user_watchlists');
+        await db.execute('ALTER TABLE user_watchlists_new RENAME TO user_watchlists');
+        logger.info('✅ user_watchlists migrada para multi-servidor');
+      }
+    } catch (err) {
+      logger.warn('⚠️ Migração user_watchlists:', err.message);
+    }
+
+    try {
+      await db.execute("ALTER TABLE signals ADD COLUMN server_id TEXT DEFAULT 'server1'");
+      logger.info('✅ Coluna server_id adicionada a signals');
+    } catch (err) {
+      if (!/duplicate column/i.test(err.message || '')) {
+        logger.warn('⚠️ Migração signals.server_id:', err.message);
+      }
+    }
+
     await db.execute('SELECT 1');
     tursoInitialized = true;
     logger.info('✅ Turso inicializado + schema aplicado.');
@@ -196,7 +287,6 @@ async function initializeTurso() {
   }
 }
 
-// Inicializa Turso no arranque (mas o app.listen espera pela conclusão)
 const tursoInitPromise = initializeTurso();
 
 // ========== WEB PUSH (VAPID) ==========
@@ -218,7 +308,6 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado.');
 }
 
-// ⭐ Cache de subscrições em memória
 const _subsCache = new Map();
 const SUBS_CACHE_TTL = 5 * 60 * 1000;
 
@@ -286,7 +375,7 @@ async function sendPushToWatchers(watchers, payload) {
   }
 }
 
-// ========== MAPEAMENTO DE ATIVOS (nomes amigáveis) ==========
+// ========== MAPEAMENTO DE ATIVOS ==========
 const assetGroups = {
   'Cestas de Moedas': ['WLDAUD', 'WLDEUR', 'WLDGBP', 'WLDXAU', 'WLDUSD'],
   'Forex': ['frxAUDCAD', 'frxAUDCHF', 'frxAUDJPY', 'frxAUDNZD', 'frxAUDUSD', 'frxEURCAD', 'frxEURCHF', 'frxEURAUD', 'frxEURGBP', 'frxEURJPY', 'frxEURNZD', 'frxEURUSD', 'frxGBPAUD', 'frxGBPCAD', 'frxGBPCHF', 'frxGBPJPY', 'frxGBPNOK', 'frxGBPNZD', 'frxGBPUSD', 'frxNZDJPY', 'frxNZDUSD', 'frxUSDCAD', 'frxUSDCHF', 'frxUSDJPY', 'frxUSDMXN', 'frxUSDNOK', 'frxUSDPLN', 'frxUSDSEK', 'frxGBPPLN'],
@@ -347,6 +436,7 @@ const PLANO_DEFAULT = { nome: 'Sem plano', maxAtivosPorModo: 0, prioridade: fals
 function getPlano(periodDays) {
   return PLANOS[periodDays] || PLANO_DEFAULT;
 }
+
 // ========== MIDDLEWARE DE AUTENTICAÇÃO ==========
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 const tokenValidationCache = new Map();
@@ -364,7 +454,7 @@ app.post('/api/validate-token', async (req, res) => {
   if (!token || typeof token !== 'string') {
     return res.status(400).json({ valid: false, message: 'Token não fornecido' });
   }
-  const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
+  const API_URL = ANALYSIS_SERVERS[DEFAULT_SERVER_ID].url;
   try {
     const r = await fetch(`${API_URL}/validate-token`, {
       method: 'POST',
@@ -409,7 +499,7 @@ async function authMiddleware(req, res, next) {
     return next();
   }
 
-  const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
+  const API_URL = ANALYSIS_SERVERS[DEFAULT_SERVER_ID].url;
   try {
     const response = await fetch(`${API_URL}/validate-token`, {
       method: 'POST',
@@ -446,10 +536,6 @@ let cronEmExecucao = false;
 const MODOS_OK = ['SNIPER', 'CAÇADOR', 'PESCADOR', 'BALEEIRO'];
 const CADENCIAS = { SNIPER: 1, 'CAÇADOR': 3, PESCADOR: 10, BALEEIRO: 30 };
 
-// ⭐ Cooldown de PRONTIDAO por modo.
-// Regra: entre cada envio ao mesmo par+modo, tem de passar o cooldownMs
-// E o score tem de ter subido >= scoreDeltaMin desde o último envio.
-// Isto evita spam de "em formação" com o mesmo score.
 const PRONTIDAO_CONFIG = {
   SNIPER:    { cooldownMs: 15 * 60 * 1000,  ciclosForaParaArrefecer: 10, scoreDeltaMin: 5  },
   'CAÇADOR': { cooldownMs: 20 * 60 * 1000,  ciclosForaParaArrefecer: 5,  scoreDeltaMin: 5  },
@@ -491,7 +577,7 @@ function sanitizePrefs(raw) {
   return out;
 }
 
-// ========== PREFERÊNCIAS DE UTILIZADOR (Turso) ==========
+// ========== PREFERÊNCIAS DE UTILIZADOR ==========
 async function getUserPreferences(tokenHash) {
   if (!tokenHash) return sanitizePrefs({});
   if (!tursoInitialized) return sanitizePrefs({});
@@ -573,35 +659,34 @@ const PROGRESSO_MINIMO_EXTENSAO = 0.05;
 const EXTENSOES_MAX = 3;
 
 // ⭐ Intervalo entre atualizações periódicas (por modo)
-// O trade recebe avisos "Atualização (Xmin)" a cada N minutos
-// enquanto estiver dentro da janela 10%-50% do alvo.
 const INTERVALO_ATUALIZACAO_POR_MODO_MS = {
-  'SNIPER':   3  * 60 * 1000,   // 3 min
-  'CAÇADOR':  10 * 60 * 1000,   // 10 min
-  'PESCADOR': 30 * 60 * 1000,   // 30 min
-  'BALEEIRO': 120 * 60 * 1000   // 2 horas
+  'SNIPER':   3  * 60 * 1000,
+  'CAÇADOR':  10 * 60 * 1000,
+  'PESCADOR': 30 * 60 * 1000,
+  'BALEEIRO': 120 * 60 * 1000
 };
 function getIntervaloAtualizacao(mode) {
   return INTERVALO_ATUALIZACAO_POR_MODO_MS[mode] || 10 * 60 * 1000;
 }
 
-// ========== WATCHLIST POR UTILIZADOR (Turso) ==========
-async function getUserWatchlist(tokenHash) {
+// ========== WATCHLIST POR UTILIZADOR + SERVIDOR ==========
+async function getUserWatchlist(tokenHash, serverId = DEFAULT_SERVER_ID) {
   if (!tursoInitialized) return null;
+  const sid = resolveServerId(serverId);
   try {
     const res = await db.execute({
-      sql: 'SELECT email, engine_active, sniper, cacador, pescador, baleeiro FROM user_watchlists WHERE token_hash = ?',
-      args: [tokenHash]
+      sql: 'SELECT email, engine_active, sniper, cacador, pescador, baleeiro FROM user_watchlists WHERE token_hash = ? AND server_id = ?',
+      args: [tokenHash, sid]
     });
     const row = res.rows[0];
     if (!row) {
       return {
-        tokenHash, email: null, engineActive: false,
+        tokenHash, serverId: sid, email: null, engineActive: false,
         SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: []
       };
     }
     return {
-      tokenHash,
+      tokenHash, serverId: sid,
       email: row.email || null,
       engineActive: !!row.engine_active,
       SNIPER: JSON.parse(row.sniper || '[]'),
@@ -615,9 +700,10 @@ async function getUserWatchlist(tokenHash) {
   }
 }
 
-async function saveUserWatchlist(tokenHash, patch) {
+async function saveUserWatchlist(tokenHash, patch, serverId = DEFAULT_SERVER_ID) {
   if (!tursoInitialized) return;
-  const current = await getUserWatchlist(tokenHash) || {};
+  const sid = resolveServerId(serverId);
+  const current = await getUserWatchlist(tokenHash, sid) || {};
   const merged = {
     email: patch.email !== undefined ? patch.email : (current.email || null),
     engineActive: patch.engineActive !== undefined ? patch.engineActive : (current.engineActive || false),
@@ -628,15 +714,15 @@ async function saveUserWatchlist(tokenHash, patch) {
   };
   await db.execute({
     sql: `INSERT INTO user_watchlists (
-      token_hash, email, engine_active, sniper, cacador, pescador, baleeiro, atualizado_em
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(token_hash) DO UPDATE SET
+      token_hash, server_id, email, engine_active, sniper, cacador, pescador, baleeiro, atualizado_em
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(token_hash, server_id) DO UPDATE SET
       email=excluded.email, engine_active=excluded.engine_active,
       sniper=excluded.sniper, cacador=excluded.cacador,
       pescador=excluded.pescador, baleeiro=excluded.baleeiro,
       atualizado_em=excluded.atualizado_em`,
     args: [
-      tokenHash,
+      tokenHash, sid,
       merged.email,
       merged.engineActive ? 1 : 0,
       JSON.stringify(merged.SNIPER),
@@ -648,7 +734,6 @@ async function saveUserWatchlist(tokenHash, patch) {
   });
 }
 
-// ⭐ Cache em memória (5 min TTL)
 async function getAllUserWatchlists() {
   if (!tursoInitialized) return [];
   const agora = Date.now();
@@ -658,6 +743,7 @@ async function getAllUserWatchlists() {
     const res = await db.execute('SELECT * FROM user_watchlists');
     const resultado = res.rows.map(row => ({
       tokenHash: row.token_hash,
+      serverId: row.server_id || DEFAULT_SERVER_ID,
       email: row.email || null,
       engineActive: !!row.engine_active,
       SNIPER: JSON.parse(row.sniper || '[]'),
@@ -693,7 +779,7 @@ const prontidaoAtiva = new Set();
 const prontidaoForaContagem = new Map();
 const COOLDOWN_POS_TRADE_MS = 10 * 60 * 1000;
 const prontidaoUltimoEnvio = new Map();
-const prontidaoUltimoScoreEnviado = new Map();  // ⭐ NOVO — último score enviado ao par
+const prontidaoUltimoScoreEnviado = new Map();
 const arrefecimentoUltimoEnvio = new Map();
 const prontidaoGlobalPorSymbol = new Map();
 
@@ -707,7 +793,7 @@ setInterval(() => {
       prontidaoAtiva.delete(key);
       prontidaoForaContagem.delete(key);
       prontidaoUltimoEnvio.delete(key);
-      prontidaoUltimoScoreEnviado.delete(key);  // ⭐ NOVO
+      prontidaoUltimoScoreEnviado.delete(key);
       arrefecimentoUltimoEnvio.delete(key);
     }
   }
@@ -762,7 +848,6 @@ async function removePersistedCooldown(tradeKey) {
   catch (err) { logger.error('Erro removePersistedCooldown:', err.message); }
 }
 
-// ⭐ persistProntidao — agora aceita ultimoScore
 async function persistProntidao(tradeKey, historico, ativa, ultimoScore = null) {
   if (!tursoInitialized) return;
   try {
@@ -791,23 +876,22 @@ async function removePersistedProntidao(tradeKey) {
   catch (err) { logger.error('Erro removePersistedProntidao:', err.message); }
 }
 
-// ⭐ Arranque resiliente — adaptado para Turso
 async function loadStateFromTurso() {
   if (!tursoInitialized) {
     logger.warn('⏭️ loadStateFromTurso: Turso indisponível, a saltar.');
     return;
   }
   try {
-    // Anti-duplicado (últimos 5min)
     try {
       const cincoMinAtras = Date.now() - 5 * 60 * 1000;
       const res = await db.execute({
-        sql: "SELECT symbol, mode, criado_em FROM signals WHERE tipo = 'SINAL_CONFIRMADO' AND criado_em >= ?",
+        sql: "SELECT symbol, mode, server_id, criado_em FROM signals WHERE tipo = 'SINAL_CONFIRMADO' AND criado_em >= ?",
         args: [cincoMinAtras]
       });
       res.rows.forEach(row => {
         if (row.symbol && row.mode) {
-          ultimoSinalPorPar.set(`${row.symbol}_${row.mode}`, row.criado_em);
+          const sid = row.server_id || DEFAULT_SERVER_ID;
+          ultimoSinalPorPar.set(buildTradeKey(sid, row.symbol, row.mode), row.criado_em);
         }
       });
       logger.info(`♻️ Anti-duplicado restaurado: ${res.rows.length} sinal(is) recente(s)`);
@@ -815,27 +899,44 @@ async function loadStateFromTurso() {
       logger.warn(`⚠️ Falha ao restaurar anti-duplicado: ${e.message}`);
     }
 
-    // Trades abertos
     const tradesRes = await db.execute('SELECT trade_key, data FROM open_trades');
     const agora = Date.now();
     let tradesRestaurados = 0;
+    let tradesMigrados = 0;
     for (const row of tradesRes.rows) {
+      const parsed = parseTradeKey(row.trade_key);
+      if (!parsed) continue;
+      const newKey = buildTradeKey(parsed.serverId, parsed.symbol, parsed.mode);
+      if (newKey !== row.trade_key) {
+        tradesMigrados++;
+        await removePersistedTrade(row.trade_key).catch(() => {});
+      }
       const t = JSON.parse(row.data);
       const timestampTrade = t.timestamp || 0;
       const timeoutModo = getTimeoutModo(t.mode);
       const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
       if (agora > timeoutAt) t.timeoutAt = agora + 60 * 1000;
       if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
-      tradesAbertos.set(row.trade_key, t);
+      tradesAbertos.set(newKey, t);
+      if (newKey !== row.trade_key) {
+        await persistTradeOpen(newKey, t).catch(() => {});
+      }
       tradesRestaurados++;
     }
 
-    // Cooldowns
     const cdRes = await db.execute('SELECT trade_key, expires_at FROM cooldowns');
-    let cdRestaurados = 0, cdExpirados = 0;
+    let cdRestaurados = 0, cdExpirados = 0, cdMigrados = 0;
     for (const row of cdRes.rows) {
+      const parsed = parseTradeKey(row.trade_key);
+      if (!parsed) continue;
+      const newKey = buildTradeKey(parsed.serverId, parsed.symbol, parsed.mode);
+      if (newKey !== row.trade_key) cdMigrados++;
       if (row.expires_at && row.expires_at > agora) {
-        cooldownPosTrade.set(row.trade_key, row.expires_at);
+        cooldownPosTrade.set(newKey, row.expires_at);
+        if (newKey !== row.trade_key) {
+          await persistCooldown(newKey, row.expires_at).catch(() => {});
+          await removePersistedCooldown(row.trade_key).catch(() => {});
+        }
         cdRestaurados++;
       } else {
         await db.execute({ sql: 'DELETE FROM cooldowns WHERE trade_key = ?', args: [row.trade_key] });
@@ -843,23 +944,33 @@ async function loadStateFromTurso() {
       }
     }
 
-    // Prontidões
     const prRes = await db.execute('SELECT trade_key, historico, ativa, ultimo_score FROM prontidao_state');
     let prRestaurados = 0;
     let scoresRestaurados = 0;
+    let prMigrados = 0;
     for (const row of prRes.rows) {
+      const parsed = parseTradeKey(row.trade_key);
+      if (!parsed) continue;
+      const newKey = buildTradeKey(parsed.serverId, parsed.symbol, parsed.mode);
+      if (newKey !== row.trade_key) prMigrados++;
       const hist = JSON.parse(row.historico || '[]');
-      if (Array.isArray(hist) && hist.length > 0) prontidaoHistorico.set(row.trade_key, hist);
-      if (row.ativa) prontidaoAtiva.add(row.trade_key);
-      // ⭐ NOVO — restaurar ultimo_score
+      if (Array.isArray(hist) && hist.length > 0) prontidaoHistorico.set(newKey, hist);
+      if (row.ativa) prontidaoAtiva.add(newKey);
       if (row.ultimo_score != null && Number.isFinite(Number(row.ultimo_score))) {
-        prontidaoUltimoScoreEnviado.set(row.trade_key, Number(row.ultimo_score));
+        prontidaoUltimoScoreEnviado.set(newKey, Number(row.ultimo_score));
         scoresRestaurados++;
+      }
+      if (newKey !== row.trade_key) {
+        await persistProntidao(newKey, hist, !!row.ativa, row.ultimo_score).catch(() => {});
+        await removePersistedProntidao(row.trade_key).catch(() => {});
       }
       prRestaurados++;
     }
 
     logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${scoresRestaurados} score(s) · ${cdExpirados} cooldown(s) expirado(s)`);
+    if (tradesMigrados || cdMigrados || prMigrados) {
+      logger.info(`🔀 Migração multi-servidor: ${tradesMigrados} trade(s), ${cdMigrados} cooldown(s), ${prMigrados} prontidão(ões) prefixados com server1_`);
+    }
   } catch (err) {
     logger.error(`❌ Erro ao carregar estado do Turso: ${err.message}`);
   }
@@ -897,10 +1008,6 @@ function extrairDirecaoPrep(dados) {
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // ⭐ NOVOS GATES (Issues 2 e 3 + Zone B sanity + DeMarker novo formato)
-  // ═══════════════════════════════════════════════════════════════════════
-
   if (/✅ Zona B validada|mantém\s+(CALL|PUT)\s+em zona B/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'zona B validada — entrada moderada aprovada' };
   }
@@ -913,7 +1020,7 @@ function diagnosticoProximidade(reasons) {
   if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'reversão ativa — aguarda alinhar' };
   }
-   if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
+  if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'DeMarker em extremo — aguarda normalizar' };
   }
 
@@ -930,10 +1037,6 @@ function diagnosticoProximidade(reasons) {
     const zona = m ? m[2] : 'extrema';
     return { nivel: 'BLOQUEADO', detalhe: `${m ? m[1] : 'Vários'} TFs com RSI em zona ${zona} — pullback iminente` };
   }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // CASOS ANTIGOS (mantidos na ordem original)
-  // ═══════════════════════════════════════════════════════════════════════
 
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado precisa respirar — aguarda normalizar' };
@@ -1003,7 +1106,7 @@ function avaliarEsticamento(reasons) {
   if (/opõe-se com hist a ACELERAR|Reversão ativa detectada em/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Reversão ativa — TFs a virar contra' };
   }
-    if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
+  if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
     return { esticado: true, nivel: 'MÉDIO', motivo: 'Zona B rebaixada — macro contra' };
   }
 
@@ -1089,8 +1192,8 @@ function confirmaExaustaoMultiTF(dados, trade) {
   }
   return { confirmado: false, motivo: `${cfg.confirm} ainda suporta (RSI ${confRSI.toFixed(0)})` };
 }
-// ========== FORMATAÇÃO DE MENSAGENS ==========
 
+// ========== FORMATAÇÃO DE MENSAGENS ==========
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
@@ -1163,6 +1266,7 @@ function formatarMensagemSinal(symbol, dados, mode) {
   };
 }
 
+// ⭐ Atualização periódica — minutos corretos por modo
 function formatarMensagemAtualizacao(trade, minutosDecorridos) {
   const nome = getFriendlyName(trade.symbol);
   const mins = minutosDecorridos || Math.floor((Date.now() - trade.timestamp) / 60000);
@@ -1236,15 +1340,16 @@ function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo)
 }
 
 // ========== REGISTAR SINAL (Turso) ==========
-async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watchers = []) {
+async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watchers = [], serverId = DEFAULT_SERVER_ID) {
+  const sid = resolveServerId(serverId);
   const { titulo, corpo, detalhes } = msg;
-  logger.info(`[SINAL] ${symbol} (${mode}) [${tipo}] ${titulo} — ${corpo} · ${watchers.length} watcher(s)`);
+  logger.info(`[SINAL][${sid}] ${symbol} (${mode}) [${tipo}] ${titulo} — ${corpo} · ${watchers.length} watcher(s)`);
 
   if (tursoInitialized) {
     try {
       await db.execute({
-        sql: `INSERT INTO signals (symbol, mode, tipo, titulo, corpo, detalhes, watchers, score, confidence, zona, entry, take_profit, stop_loss, nivel_prontidao, origem, criado_em)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT INTO signals (symbol, mode, tipo, titulo, corpo, detalhes, watchers, score, confidence, zona, entry, take_profit, stop_loss, nivel_prontidao, server_id, origem, criado_em)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           symbol, mode, tipo, titulo, corpo,
           detalhes ? JSON.stringify(detalhes) : null,
@@ -1256,6 +1361,7 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
           extra.takeProfit ?? detalhes?.takeProfit ?? null,
           extra.stopLoss ?? detalhes?.stopLoss ?? null,
           extra.nivelProntidao ?? detalhes?.nivelProntidao ?? null,
+          sid,
           'motor',
           Date.now()
         ]
@@ -1267,14 +1373,15 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
     ? '/?open=signals' : '/';
   await sendPushToWatchers(watchers, {
     title: titulo, body: corpo,
-    tag: `${symbol}_${mode}_${tipo}`,
-    data: { symbol, mode, tipo, url: _openUrl }
+    tag: `${symbol}_${mode}_${tipo}_${sid}`,
+    data: { symbol, mode, tipo, serverId: sid, url: _openUrl }
   });
 }
 
 // ========== ANÁLISE ==========
-async function buscarSinalAnalise(symbol, mode) {
-  const API_URL = process.env.ANALYSIS_API_URL || 'http://localhost:3001';
+async function buscarSinalAnalise(symbol, mode, serverId = DEFAULT_SERVER_ID) {
+  const server = getServer(serverId);
+  const API_URL = server.url;
   const adminKey = process.env.ADMIN_SECRET;
   if (!adminKey) { logger.error('❌ ADMIN_SECRET não configurado!'); return null; }
   try {
@@ -1285,43 +1392,45 @@ async function buscarSinalAnalise(symbol, mode) {
     });
     if (!response.ok) {
       const texto = await response.text();
-      logger.error(`❌ Erro HTTP ${response.status} ao buscar ${symbol}: ${texto}`);
+      logger.error(`❌ Erro HTTP ${response.status} ao buscar ${symbol} [${server.id}]: ${texto}`);
       return null;
     }
     return await response.json();
   } catch (err) {
-    logger.error(`❌ Erro de conexão ao buscar análise para ${symbol}:`, err.message);
+    logger.error(`❌ Erro de conexão ao buscar análise para ${symbol} [${server.id}]:`, err.message);
     return null;
   }
 }
 
-async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers) {
+async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers, serverId = DEFAULT_SERVER_ID) {
   setTimeout(async () => {
     try {
       const t = tradesAbertos.get(tradeKey);
       if (!t) return;
       if (Date.now() - t.timestamp > 2 * 60 * 1000) return;
+      const sid = resolveServerId(serverId);
       const nomeAmigavel = getFriendlyName(symbol);
       await sendPushToWatchers(watchers, {
         title: `🚨 Lembrete: ${nomeAmigavel}`,
         body: `Sinal ${t.signal} ainda ativo — entrada ${t.entry} · TP ${t.takeProfit} · SL ${t.stopLoss}\n⚡ Se não recebeste o sinal anterior, entra agora`,
-        tag: `${symbol}_${mode}_SINAL_CONFIRMADO_RETRY`,
-        data: { symbol, mode, tipo: 'SINAL_CONFIRMADO_RETRY', url: '/' }
+        tag: `${symbol}_${mode}_SINAL_CONFIRMADO_RETRY_${sid}`,
+        data: { symbol, mode, tipo: 'SINAL_CONFIRMADO_RETRY', serverId: sid, url: '/' }
       });
-      logger.info(`🔁 [SINAL_CONFIRMADO_RETRY] ${symbol} (${mode}) reenviado após 30s`);
+      logger.info(`🔁 [SINAL_CONFIRMADO_RETRY][${sid}] ${symbol} (${mode}) reenviado após 30s`);
     } catch (err) { logger.error('Erro no retry do SINAL_CONFIRMADO:', err.message); }
   }, 30 * 1000);
 }
 
-async function analisarEEnviarSinais(symbol, mode, watchers = []) {
-  const dados = await buscarSinalAnalise(symbol, mode);
+async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEFAULT_SERVER_ID) {
+  const sid = resolveServerId(serverId);
+  const dados = await buscarSinalAnalise(symbol, mode, sid);
   if (!dados || !dados.success) return;
 
-  logger.info(`🔬 [RX] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} suggestion=${dados.suggestion?.action}`);
+  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} suggestion=${dados.suggestion?.action}`);
 
   const agora = Date.now();
   const currentPrice = dados.consolidated.price;
-  const tradeKey = `${symbol}_${mode}`;
+  const tradeKey = buildTradeKey(sid, symbol, mode);
 
   if (cooldownPosTrade.has(tradeKey)) {
     if (agora < cooldownPosTrade.get(tradeKey)) return;
@@ -1347,7 +1456,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       trade.extensoesPullback = (trade.extensoesPullback || 0) + 1;
       trade.percentualNoUltimoCheck = percentualPercorrido;
       persistTradeUpdate(tradeKey, trade);
-      logger.info(`↩️ [PULLBACK] ${tradeKey} mantido durante respiração (${trade.extensoesPullback}/3)`);
+      logger.info(`↩️ [PULLBACK][${sid}] ${tradeKey} mantido durante respiração (${trade.extensoesPullback}/3)`);
     }
     if (agora > timeoutAtual && !(emRespiracaoOuPullback && (trade.extensoesPullback || 0) < 3)) {
       const extensoes = trade.extensoes || 0;
@@ -1363,13 +1472,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         persistTradeUpdate(tradeKey, trade);
       } else {
         const motivo = extensoes >= EXTENSOES_MAX ? `limite de ${EXTENSOES_MAX} extensões atingido` : `sem avanço suficiente`;
-        await registrarEEnviarSinal(symbol, mode, 'TIMEOUT', formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo), { score: dados.consolidated.score }, watchers);
+        await registrarEEnviarSinal(symbol, mode, 'TIMEOUT', formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo), { score: dados.consolidated.score }, watchers, sid);
         tradesAbertos.delete(tradeKey);
         removePersistedTrade(tradeKey);
         const cdMsTimeout = calcularCooldownDinamico('TIMEOUT', dados, esticTradeCache);
         cooldownPosTrade.set(tradeKey, agora + cdMsTimeout);
         persistCooldown(tradeKey, agora + cdMsTimeout);
-        logger.info(`⏱️ [FIX #57] Cooldown TIMEOUT → ${Math.round(cdMsTimeout/60000)}min | ${symbol} (${mode})`);
+        logger.info(`⏱️ [FIX #57][${sid}] Cooldown TIMEOUT → ${Math.round(cdMsTimeout/60000)}min | ${symbol} (${mode})`);
         return;
       }
     }
@@ -1422,20 +1531,19 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       const cdMs = calcularCooldownDinamico(tipo, dados, esticTradeCache);
       cooldownPosTrade.set(tradeKey, agora + cdMs);
       persistCooldown(tradeKey, agora + cdMs);
-      logger.info(`⏱️ [FIX #57] Cooldown ${tipo} → ${Math.round(cdMs/60000)}min | ${symbol} (${mode})`);
+      logger.info(`⏱️ [FIX #57][${sid}] Cooldown ${tipo} → ${Math.round(cdMs/60000)}min | ${symbol} (${mode})`);
     } else {
       persistTradeUpdate(tradeKey, trade);
     }
 
-    if (msgObj) await registrarEEnviarSinal(symbol, mode, tipo, msgObj, { score: dados.consolidated.score }, watchers);
+    if (msgObj) await registrarEEnviarSinal(symbol, mode, tipo, msgObj, { score: dados.consolidated.score }, watchers, sid);
     return;
   }
 
-  // Anti-duplicado em memória
   const ultimoTs = ultimoSinalPorPar.get(tradeKey) || 0;
   const CINCO_MIN_MS = 5 * 60 * 1000;
   if (Date.now() - ultimoTs < CINCO_MIN_MS) {
-    logger.info(`⏭️ Anti-duplicado (memória): sinal há ${Math.round((Date.now() - ultimoTs)/1000)}s para ${symbol}/${mode} — saltar`);
+    logger.info(`⏭️ Anti-duplicado (memória): sinal há ${Math.round((Date.now() - ultimoTs)/1000)}s para ${symbol}/${mode} [${sid}] — saltar`);
     return;
   }
 
@@ -1445,7 +1553,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
       const esticSinal = avaliarEsticamento(dados.consolidated.score_reasons);
       if (esticSinal.esticado && esticSinal.nivel === 'ALTO') {
-        logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) SINAL ignorado — ${esticSinal.motivo}`);
+        logger.info(`⛔ [FILTRO EXTREMO][${sid}] ${symbol} (${mode}) SINAL ignorado — ${esticSinal.motivo}`);
         prontidaoAtiva.delete(tradeKey);
         prontidaoHistorico.delete(tradeKey);
         prontidaoForaContagem.delete(tradeKey);
@@ -1454,7 +1562,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       }
 
       const novoTrade = {
-        symbol, mode,
+        symbol, mode, serverId: sid,
         signal: dados.consolidated.signal,
         entry: dados.suggestion.entry,
         takeProfit: dados.suggestion.takeProfit,
@@ -1476,7 +1584,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       ultimoSinalPorPar.set(tradeKey, agora);
 
       const zonaTxt = dados.consolidated.zona === 'A' ? 'SINAL CONFIRMADO' : 'SINAL MODERADO';
-      logger.info(`🚀 [${zonaTxt}] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry}`);
+      logger.info(`🚀 [${zonaTxt}][${sid}] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry}`);
 
       try {
         const msgSinal = formatarMensagemSinal(symbol, dados, mode);
@@ -1484,13 +1592,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
           score: dados.consolidated.score, confidence: dados.consolidated.confidence,
           zona: dados.consolidated.zona,
           entry: dados.suggestion.entry, takeProfit: dados.suggestion.takeProfit, stopLoss: dados.suggestion.stopLoss
-        }, watchers);
-        logger.info(`✅ [PUSH ENVIADO] ${symbol} (${mode}) → SINAL_CONFIRMADO`);
+        }, watchers, sid);
+        logger.info(`✅ [PUSH ENVIADO][${sid}] ${symbol} (${mode}) → SINAL_CONFIRMADO`);
       } catch (errSinal) {
-        logger.error(`❌ FALHA AO ENVIAR SINAL_CONFIRMADO ${symbol}: ${errSinal.message}`);
+        logger.error(`❌ FALHA AO ENVIAR SINAL_CONFIRMADO ${symbol} [${sid}]: ${errSinal.message}`);
       }
 
-      _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers);
+      _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers, sid);
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
@@ -1505,37 +1613,29 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const scoreAtualNum = Number(scoreAtual) || 0;
     const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
     if (regimeAtualPush === 'CHOP') {
-      logger.info(`🔇 [FIX #60] PRONTIDAO ignorada em CHOP: ${symbol} (${mode})`);
+      logger.info(`🔇 [FIX #60][${sid}] PRONTIDAO ignorada em CHOP: ${symbol} (${mode})`);
       prontidaoForaContagem.delete(tradeKey);
       return;
     }
     const estic = avaliarEsticamento(dados.consolidated.score_reasons);
     if (estic.esticado && estic.nivel === 'ALTO') {
-      logger.info(`⛔ [FILTRO EXTREMO] ${symbol} (${mode}) PRONTIDAO ignorada — ${estic.motivo}`);
+      logger.info(`⛔ [FILTRO EXTREMO][${sid}] ${symbol} (${mode}) PRONTIDAO ignorada — ${estic.motivo}`);
       prontidaoForaContagem.delete(tradeKey);
       return;
     }
 
-    // ⭐ FIX-PRONTIDAO v2 — MATURE agora depende do flag do motor.
-    //   O motor calcula `mature_aprovado` no analyze-handler e envia no payload.
-    //   Se o motor não aprovou MATURE, o painel envia apenas EARLY informativo.
-    //   Fallback: se o flag não vier (compatibilidade com cache antigo),
-    //   usamos o check antigo de `diagnosticoProximidade === BLOQUEADO`.
     const matureAprovadoMotor = dados.consolidated?.mature_aprovado === true;
     const matureMotivo = dados.consolidated?.mature_motivo_bloqueio || null;
     const proximidadePront = diagnosticoProximidade(dados.consolidated.score_reasons);
     const bloqueioAtivo = proximidadePront && proximidadePront.nivel === 'BLOQUEADO';
 
-    // Suprimir MATURE se:
-    //   - motor não aprovou (flag explícito), OU
-    //   - fallback: bloqueio ativo (cache antigo antes do deploy)
     const deveForcarEarly = !matureAprovadoMotor || bloqueioAtivo;
 
     let _forcarSomenteEarly = false;
     if (deveForcarEarly) {
       const motivo = matureMotivo
         || (bloqueioAtivo ? proximidadePront.detalhe : 'motor não aprovou MATURE');
-      logger.info(`⛔ [FIX-PRONTIDAO v2] ${symbol} (${mode}) MATURE bloqueado — ${motivo}`);
+      logger.info(`⛔ [FIX-PRONTIDAO v2][${sid}] ${symbol} (${mode}) MATURE bloqueado — ${motivo}`);
       _forcarSomenteEarly = true;
     }
     const prefsPorWatcher = new Map();
@@ -1558,7 +1658,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     historico.push({ score: scoreAtual, t: agora });
     if (historico.length > 5) historico.shift();
     prontidaoHistorico.set(tradeKey, historico);
-    // ⭐ Persiste histórico com score atual (sobrevive a restarts)
     persistProntidao(
       tradeKey,
       historico,
@@ -1570,9 +1669,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
     const ultimoEnvio = prontidaoUltimoEnvio.get(tradeKey) || 0;
     const ultimoScoreEnviado = prontidaoUltimoScoreEnviado.get(tradeKey);
 
-    // ⭐ NOVO — para re-enviar, é preciso BOTH:
-    //   1. Ter passado o cooldownMs do modo
-    //   2. O score ter subido >= scoreDeltaMin desde o último envio
     const primeiraVez = !prontidaoUltimoEnvio.has(tradeKey);
     const passouCooldown = (agora - ultimoEnvio) >= cfg.cooldownMs;
     const scoreSubiuOSuficiente =
@@ -1581,7 +1677,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
 
     const podeEnviarAgora = primeiraVez || (passouCooldown && scoreSubiuOSuficiente);
 
-    const ultimoGlobal = prontidaoGlobalPorSymbol.get(symbol) || 0;
+    const globalKey = `${sid}_${symbol}`;
+    const ultimoGlobal = prontidaoGlobalPorSymbol.get(globalKey) || 0;
     const podeEnviarGlobal = (agora - ultimoGlobal) >= PRONTIDAO_GLOBAL_COOLDOWN_MS;
 
     if (podeEnviarAgora && podeEnviarGlobal) {
@@ -1592,7 +1689,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         for (const tk of watchers) {
           const p = prefsPorWatcher.get(tk) || DEFAULT_PREFS[mode];
           if (scoreAtual < p.scoreEarly) continue;
-          // ⭐ FIX — se há bloqueio ativo, força EARLY mesmo que o score chegue para MATURE
           if (!_forcarSomenteEarly && scoreAtual >= p.scoreMature) matureTks.push(tk);
           else earlyTks.push(tk);
         }
@@ -1600,25 +1696,24 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
         if (matureTks.length > 0) {
           await registrarEEnviarSinal(symbol, mode, 'PRONTIDAO',
             formatarMensagemPrep(symbol, direcaoPrep, dados, { subindo, historico, mode, nivelProntidao: 'MATURE', scoreAtual, scoreQuase: scoreAtual }),
-            { score: scoreAtual, nivelProntidao: 'MATURE' }, matureTks);
+            { score: scoreAtual, nivelProntidao: 'MATURE' }, matureTks, sid);
         }
         if (earlyTks.length > 0) {
           await registrarEEnviarSinal(symbol, mode, 'PRONTIDAO',
             formatarMensagemPrep(symbol, direcaoPrep, dados, { subindo, historico, mode, nivelProntidao: 'EARLY', scoreAtual, scoreQuase: 999 }),
-            { score: scoreAtual, nivelProntidao: 'EARLY' }, earlyTks);
+            { score: scoreAtual, nivelProntidao: 'EARLY' }, earlyTks, sid);
         }
         if (matureTks.length > 0 || earlyTks.length > 0) {
           prontidaoAtiva.add(tradeKey);
           prontidaoUltimoEnvio.set(tradeKey, agora);
-          prontidaoUltimoScoreEnviado.set(tradeKey, scoreAtualNum);  // ⭐ NOVO
-          prontidaoGlobalPorSymbol.set(symbol, agora);
+          prontidaoUltimoScoreEnviado.set(tradeKey, scoreAtualNum);
+          prontidaoGlobalPorSymbol.set(globalKey, agora);
           prontidaoForaContagem.set(tradeKey, 0);
-          // ⭐ Persiste com o score atual
           persistProntidao(tradeKey, prontidaoHistorico.get(tradeKey), true, scoreAtualNum);
         }
       }
     } else if (!primeiraVez && passouCooldown && !scoreSubiuOSuficiente) {
-      logger.info(`⏭️ [PRONTIDAO-COOLDOWN] ${symbol} (${mode}) score ${scoreAtualNum} vs último ${ultimoScoreEnviado} — delta < ${cfg.scoreDeltaMin}`);
+      logger.info(`⏭️ [PRONTIDAO-COOLDOWN][${sid}] ${symbol} (${mode}) score ${scoreAtualNum} vs último ${ultimoScoreEnviado} — delta < ${cfg.scoreDeltaMin}`);
     }
   }
   else if (dados.consolidated.signal === 'HOLD' && prontidaoAtiva.has(tradeKey)) {
@@ -1630,13 +1725,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = []) {
       if ((agora - ultimoArref) >= cfg.cooldownMs) {
         await registrarEEnviarSinal(symbol, mode, 'ARREFECIMENTO',
           formatarMensagemArrefecimento(symbol, dados.consolidated.score, dados),
-          { score: dados.consolidated.score }, watchers);
+          { score: dados.consolidated.score }, watchers, sid);
         arrefecimentoUltimoEnvio.set(tradeKey, agora);
       }
       prontidaoAtiva.delete(tradeKey);
       prontidaoHistorico.delete(tradeKey);
       prontidaoForaContagem.delete(tradeKey);
-      prontidaoUltimoScoreEnviado.delete(tradeKey);  // ⭐ NOVO
+      prontidaoUltimoScoreEnviado.delete(tradeKey);
       removePersistedProntidao(tradeKey);
     }
   }
@@ -1649,41 +1744,43 @@ cron.schedule('* * * * *', async () => {
   try {
     const allUsers = await getAllUserWatchlists();
     const activeUsers = allUsers.filter(u => u.engineActive);
+
     const queue = new Map();
 
     for (const tradeKey of tradesAbertos.keys()) {
-      const idx = tradeKey.lastIndexOf('_');
-      if (idx > 0) {
-        queue.set(`${tradeKey.slice(0, idx)}|${tradeKey.slice(idx + 1)}`, {
-          symbol: tradeKey.slice(0, idx), mode: tradeKey.slice(idx + 1)
-        });
-      }
+      const parsed = parseTradeKey(tradeKey);
+      if (!parsed) continue;
+      queue.set(`${parsed.serverId}|${parsed.symbol}|${parsed.mode}`, parsed);
     }
 
     const minutoAtual = Math.floor(Date.now() / 60000);
     for (const u of activeUsers) {
+      const sid = u.serverId || DEFAULT_SERVER_ID;
       for (const mode of MODOS_OK) {
         const cad = CADENCIAS[mode] || 3;
         if (minutoAtual % cad !== 0) continue;
         for (const symbol of u[mode] || []) {
-          queue.set(`${symbol}|${mode}`, { symbol, mode });
+          queue.set(`${sid}|${symbol}|${mode}`, { serverId: sid, symbol, mode });
         }
       }
     }
 
     if (queue.size === 0) return;
-    logger.info(`📦 Ciclo: ${queue.size} par(es) · ${activeUsers.length} user(s) ativos`);
+    logger.info(`📦 Ciclo: ${queue.size} par(es) · ${activeUsers.length} user(s) ativos · ${VALID_SERVER_IDS.length} servidor(es)`);
 
-    for (const { symbol, mode } of queue.values()) {
-      const tradeKey = `${symbol}_${mode}`;
+    for (const { serverId, symbol, mode } of queue.values()) {
+      const tradeKey = buildTradeKey(serverId, symbol, mode);
       const trade = tradesAbertos.get(tradeKey);
       let watchers;
       if (trade && Array.isArray(trade.watchers)) {
         watchers = trade.watchers;
       } else {
-        watchers = activeUsers.filter(u => (u[mode] || []).includes(symbol)).map(u => u.tokenHash);
+        watchers = activeUsers
+          .filter(u => (u.serverId || DEFAULT_SERVER_ID) === serverId
+                    && (u[mode] || []).includes(symbol))
+          .map(u => u.tokenHash);
       }
-      await analisarEEnviarSinais(symbol, mode, watchers);
+      await analisarEEnviarSinais(symbol, mode, watchers, serverId);
       await new Promise(r => setTimeout(r, 1200));
     }
   } catch (err) {
@@ -1698,8 +1795,13 @@ cron.schedule('* * * * *', async () => {
 app.get('/health', (req, res) => res.json({
   status: 'ok', uptime: Math.floor(process.uptime()),
   tradesAbertos: tradesAbertos.size, cooldowns: cooldownPosTrade.size,
-  prontidoes: prontidaoAtiva.size, turso: tursoInitialized
+  prontidoes: prontidaoAtiva.size, turso: tursoInitialized,
+  servers: getAllServersPublic()
 }));
+
+app.get('/api/servers', authMiddleware, (req, res) => {
+  res.json({ servers: getAllServersPublic(), defaultServerId: DEFAULT_SERVER_ID });
+});
 
 app.get('/api/vapid-public-key', (req, res) => {
   if (!pushConfigured) return res.status(503).json({ error: 'Push não configurado no servidor' });
@@ -1766,11 +1868,12 @@ app.get('/api/user-me', authMiddleware, (req, res) => {
 });
 
 app.get('/api/engine-config', authMiddleware, async (req, res) => {
-  if (!tursoInitialized) return res.json({ active: false, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
+  const sid = resolveServerId(req.query.server);
+  if (!tursoInitialized) return res.json({ active: false, serverId: sid, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
   try {
-    const wl = await getUserWatchlist(req.user.tokenHash);
+    const wl = await getUserWatchlist(req.user.tokenHash, sid);
     res.json({
-      active: wl.engineActive, plano: req.user.plano,
+      active: wl.engineActive, serverId: sid, plano: req.user.plano,
       maxAtivosPorModo: req.user.plano?.maxAtivosPorModo ?? 10,
       watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO }
     });
@@ -1780,32 +1883,35 @@ app.get('/api/engine-config', authMiddleware, async (req, res) => {
 app.post('/api/engine-start', authMiddleware, async (req, res) => {
   if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   try {
-    const wl = await getUserWatchlist(req.user.tokenHash);
+    const sid = resolveServerId(req.query.server);
+    const wl = await getUserWatchlist(req.user.tokenHash, sid);
     const totalAtivos = contarAtivosWatchlist(wl);
     if (totalAtivos === 0) {
       return res.status(400).json({ success: false, error: 'Adiciona pelo menos 1 ativo à watchlist antes de ativar o motor.', code: 'WATCHLIST_EMPTY', totalAtivos: 0 });
     }
-    await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null });
+    await saveUserWatchlist(req.user.tokenHash, { engineActive: true, email: req.user.email || null }, sid);
     invalidarCacheWatchlists();
-    logger.info(`✅ [ENGINE-START] user=${req.user.tokenHash} ativou motor com ${totalAtivos} ativo(s)`);
-    res.json({ success: true, active: true, totalAtivos });
+    logger.info(`✅ [ENGINE-START][${sid}] user=${req.user.tokenHash} ativou motor com ${totalAtivos} ativo(s)`);
+    res.json({ success: true, active: true, serverId: sid, totalAtivos });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/engine-stop', authMiddleware, async (req, res) => {
   if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   try {
-    await saveUserWatchlist(req.user.tokenHash, { engineActive: false });
+    const sid = resolveServerId(req.query.server);
+    await saveUserWatchlist(req.user.tokenHash, { engineActive: false }, sid);
     invalidarCacheWatchlists();
-    res.json({ success: true, active: false });
+    res.json({ success: true, active: false, serverId: sid });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get('/api/engine-watchlist', authMiddleware, async (req, res) => {
-  if (!tursoInitialized) return res.json({ watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
+  const sid = resolveServerId(req.query.server);
+  if (!tursoInitialized) return res.json({ serverId: sid, watchlist: { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] } });
   try {
-    const wl = await getUserWatchlist(req.user.tokenHash);
-    res.json({ watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO } });
+    const wl = await getUserWatchlist(req.user.tokenHash, sid);
+    res.json({ serverId: sid, watchlist: { SNIPER: wl.SNIPER, 'CAÇADOR': wl['CAÇADOR'], PESCADOR: wl.PESCADOR, BALEEIRO: wl.BALEEIRO } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1814,10 +1920,11 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
   const { watchlist } = req.body || {};
   if (!watchlist || typeof watchlist !== 'object') return res.status(400).json({ error: 'watchlist deve ser um objeto' });
   try {
+    const sid = resolveServerId(req.query.server);
     const maxAtivos = req.user.plano?.maxAtivosPorModo ?? 10;
     if (maxAtivos <= 0) return res.status(403).json({ error: 'A tua conta não tem um plano ativo.' });
 
-    const current = await getUserWatchlist(req.user.tokenHash);
+    const current = await getUserWatchlist(req.user.tokenHash, sid);
     const cortado = {
       SNIPER:    Array.isArray(watchlist.SNIPER)    && [...new Set(watchlist.SNIPER)].length    > maxAtivos,
       'CAÇADOR': Array.isArray(watchlist['CAÇADOR']) && [...new Set(watchlist['CAÇADOR'])].length > maxAtivos,
@@ -1831,11 +1938,11 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
       BALEEIRO:  Array.isArray(watchlist.BALEEIRO)  ? [...new Set(watchlist.BALEEIRO)].slice(0, maxAtivos)  : current.BALEEIRO,
       email: req.user.email || null
     };
-    await saveUserWatchlist(req.user.tokenHash, final);
+    await saveUserWatchlist(req.user.tokenHash, final, sid);
     invalidarCacheWatchlists();
     const houveCorte = Object.values(cortado).some(Boolean);
     res.json({
-      success: true, watchlist: final, plano: req.user.plano, maxAtivosPorModo: maxAtivos,
+      success: true, watchlist: final, serverId: sid, plano: req.user.plano, maxAtivosPorModo: maxAtivos,
       cortado: houveCorte ? cortado : null,
       mensagem: houveCorte ? `Plano ${req.user.plano?.nome || 'atual'} permite ${maxAtivos} por modo.` : null
     });
@@ -1845,9 +1952,10 @@ app.post('/api/engine-watchlist', authMiddleware, async (req, res) => {
 app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
   if (!tursoInitialized) return res.status(503).json({ error: 'Turso indisponível' });
   try {
-    await saveUserWatchlist(req.user.tokenHash, { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] });
+    const sid = resolveServerId(req.query.server);
+    await saveUserWatchlist(req.user.tokenHash, { SNIPER: [], 'CAÇADOR': [], PESCADOR: [], BALEEIRO: [] }, sid);
     invalidarCacheWatchlists();
-    res.json({ success: true });
+    res.json({ success: true, serverId: sid });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1857,12 +1965,13 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
   const symbols = assetGroups[group];
   if (!symbols) return res.status(400).json({ error: `Grupo "${group}" não reconhecido.` });
   if (!MODOS_OK.includes(mode)) return res.status(400).json({ error: `Modo "${mode}" inválido.` });
+  const sid = resolveServerId(req.query.server);
   try {
     const allResults = [];
     for (let i = 0; i < symbols.length; i += 5) {
       const batch = symbols.slice(i, i + 5);
       const batchResults = await Promise.allSettled(batch.map(async (symbol) => {
-        const data = await buscarSinalAnalise(symbol, mode);
+        const data = await buscarSinalAnalise(symbol, mode, sid);
         if (!data || !data.success) return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
         const consolidated = data.consolidated || {};
         const score = consolidated.score || 0;
@@ -1913,7 +2022,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
       allResults.push(...batchResults);
       if (i + 5 < symbols.length) await new Promise(r => setTimeout(r, 800));
     }
-    res.json({ success: true, results: allResults.filter(r => r.status === 'fulfilled').map(r => r.value) });
+    res.json({ success: true, serverId: sid, results: allResults.filter(r => r.status === 'fulfilled').map(r => r.value) });
   } catch (err) {
     logger.error('Erro no /api/scan-group:', err.message);
     res.status(500).json({ error: 'Erro interno ao analisar grupo.' });
@@ -1947,6 +2056,7 @@ app.get('/api/signals', authMiddleware, async (req, res) => {
         score: row.score, confidence: row.confidence, zona: row.zona,
         entry: row.entry, takeProfit: row.take_profit, stopLoss: row.stop_loss,
         nivelProntidao: row.nivel_prontidao, origem: row.origem,
+        serverId: row.server_id || DEFAULT_SERVER_ID,
         criadoEm: new Date(row.criado_em).toISOString()
       }));
     res.json({ signals });
@@ -2037,10 +2147,13 @@ app.listen(PORT, '0.0.0.0', async () => {
   }
   logger.info(`Turso: ${tursoInitialized ? 'Conectado' : 'Não'}`);
   logger.info(`Push: ${pushConfigured ? 'Configurado' : 'Não configurado'}`);
+  logger.info(`v2.24: Atualizações por modo (SNIPER 3min | CAÇADOR 10min | PESCADOR 30min | BALEEIRO 2h).`);
+  logger.info(`v2.23: Multi-servidor de análise (watchlist/engine por servidor, push combinado).`);
   logger.info(`v2.22: Cooldown PRONTIDAO por modo + persistência de ultimo_score.`);
   logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
   logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
   logger.info(`FIX-PRONTIDAO v2: MATURE depende do flag mature_aprovado do motor.`);
+  logger.info(`🌐 Servidores de análise: ${getAllServersPublic().map(s => `${s.id}(${s.name})`).join(', ')}`);
   try {
     await loadStateFromTurso();
   } catch (e) {
