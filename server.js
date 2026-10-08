@@ -1,4 +1,5 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.26 — Auto-close em 90% do alvo + Peak tracking (fecho em pullback do pico).
 // v2.25 — Normalização automática de URL dos servidores de análise (fix 404 /analyze).
 // v2.24 — Atualizações periódicas por modo + novos gates (GATE FORÇA MACRO, RSI HARD BLOCK).
 // v2.23 — Multi-servidor de análise (watchlist/engine por servidor, push combinado).
@@ -75,10 +76,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 const PORT = process.env.PORT || 3000;
 
 // ========== ⭐ NORMALIZAÇÃO DE URL DOS SERVIDORES ==========
-// Garante que qualquer URL termina sempre em /api (sem barra final).
-// Aceita tanto "https://host.com" como "https://host.com/api" e
-// devolve sempre "https://host.com/api". Isto resolve o erro 404
-// quando as env vars do Render vêm sem o sufixo /api.
 function normalizeApiUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
   const trimmed = rawUrl.trim().replace(/\/+$/, '');
@@ -650,15 +647,16 @@ async function saveUserPreferences(tokenHash, raw) {
 
 const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000;
 
+// ⭐ PATCH 3 — Timeouts reduzidos (SNIPER e CAÇADOR mais apertados)
 const TRADE_TIMEOUT_POR_MODO_MS = {
-  'SNIPER':   20 * 60 * 1000,
-  'CAÇADOR':  90 * 60 * 1000,
+  'SNIPER':   15 * 60 * 1000,   // era 20min → 15min (SNIPER é cirúrgico)
+  'CAÇADOR':  60 * 60 * 1000,   // era 90min → 60min
   'PESCADOR': 12 * 60 * 60 * 1000,
   'BALEEIRO': 72 * 60 * 60 * 1000
 };
 const TRADE_TIMEOUT_EXTEND_POR_MODO_MS = {
-  'SNIPER':   15 * 60 * 1000,
-  'CAÇADOR':  45 * 60 * 1000,
+  'SNIPER':   8 * 60 * 1000,    // era 15min → 8min
+  'CAÇADOR':  30 * 60 * 1000,   // era 45min → 30min
   'PESCADOR': 6 * 60 * 60 * 1000,
   'BALEEIRO': 48 * 60 * 60 * 1000
 };
@@ -933,6 +931,9 @@ async function loadStateFromTurso() {
       const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
       if (agora > timeoutAt) t.timeoutAt = agora + 60 * 1000;
       if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
+      // ⭐ PATCH PEAK TRACKING — inicializar campos em trades antigos
+      if (t.peakPercentual === undefined) t.peakPercentual = 0;
+      if (t.avisoPullbackDoPicoEnviado === undefined) t.avisoPullbackDoPicoEnviado = false;
       tradesAbertos.set(newKey, t);
       if (newKey !== row.trade_key) {
         await persistTradeOpen(newKey, t).catch(() => {});
@@ -1318,6 +1319,55 @@ function formatarMensagemQuaseLa(trade) {
   return { titulo: `⏳ Quase no alvo: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · 🎯 Alvo ${trade.takeProfit}\n📊 +80% percorrido — atenção máxima`, detalhes: { tipo: 'QUASE_LA', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit } };
 }
 
+// ⭐ PATCH 1 — Mensagem de auto-close em 90% do alvo
+function formatarMensagemAutoClose90(trade, currentPrice, minutos) {
+  const nome = getFriendlyName(trade.symbol);
+  const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
+  const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
+  const distanciaPercorrida = trade.signal === 'CALL'
+    ? (currentPrice - trade.entry)
+    : (trade.entry - currentPrice);
+  const pct = distanciaTotal > 0 ? ((distanciaPercorrida / distanciaTotal) * 100).toFixed(0) : '90';
+
+  return {
+    titulo: `✅ Fecho em lucro parcial: ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n💰 +${pct}% do alvo — ${currentPrice}\n⏱️ Duração: ${duracao}min · fecha a posição`,
+    detalhes: {
+      tipo: 'AUTO_CLOSE_90',
+      nomeAmigavel: nome,
+      direcao: trade.signal,
+      modo: trade.mode,
+      entry: trade.entry,
+      takeProfit: trade.takeProfit,
+      currentPrice,
+      duracao: duracao + 'min',
+      percentualPercorrido: pct + '%'
+    }
+  };
+}
+
+// ⭐ PATCH 2 — Mensagem de pullback do pico (fecho em lucro parcial após reversão)
+function formatarMensagemPullbackDoPico(trade, currentPrice, minutos, percentualAtual, picoPercentual) {
+  const nome = getFriendlyName(trade.symbol);
+  const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `📉 Pullback do pico: ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n⚠️ Pico foi ${(picoPercentual * 100).toFixed(0)}% do alvo, agora ${(percentualAtual * 100).toFixed(0)}%\n✅ Fecha em lucro parcial (${currentPrice})`,
+    detalhes: {
+      tipo: 'PULLBACK_PICO',
+      nomeAmigavel: nome,
+      direcao: trade.signal,
+      modo: trade.mode,
+      entry: trade.entry,
+      takeProfit: trade.takeProfit,
+      currentPrice,
+      duracao: duracao + 'min',
+      percentualPercorrido: (percentualAtual * 100).toFixed(1) + '%',
+      picoPercentual: (picoPercentual * 100).toFixed(1) + '%'
+    }
+  };
+}
+
 function formatarMensagemWin(trade) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
@@ -1458,6 +1508,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     const percentualPercorrido = distanciaTotal > 0 ? (distanciaPercorrida / distanciaTotal) : 0;
     const tempoDecorridoMin = Math.floor((agora - trade.timestamp) / 60000);
 
+    // ⭐ PATCH 2 — Peak tracking
+    if (percentualPercorrido > (trade.peakPercentual || 0)) {
+      trade.peakPercentual = percentualPercorrido;
+    }
+    const pullbackDoPico = (trade.peakPercentual || 0) - percentualPercorrido;
+
     const timeoutModo = getTimeoutModo(trade.mode);
     const timeoutExtendModo = getTimeoutExtendModo(trade.mode);
     const emRespiracaoOuPullback = detectarRespiracaoOuPullback(dados, trade, percentualPercorrido);
@@ -1496,8 +1552,38 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
 
     let msgObj = null, tipo = null, fecharTrade = false;
 
-    if (trade.signal === 'CALL' && currentPrice >= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
-    else if (trade.signal === 'PUT' && currentPrice <= trade.takeProfit) { msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true; }
+    // ⭐ PATCH 1 — Auto-close em 90% do alvo (aceita perder últimos 10%)
+    const LIMITE_PRATICO_TP = 0.90;
+    const tempoMinAutoClose = Math.floor((agora - trade.timestamp) / 60000);
+    const autoCloseAtivo = tempoMinAutoClose >= 3;
+
+    let tpEfetivo = null;
+    if (trade.signal === 'CALL') {
+      tpEfetivo = trade.entry + (trade.takeProfit - trade.entry) * LIMITE_PRATICO_TP;
+    } else if (trade.signal === 'PUT') {
+      tpEfetivo = trade.entry - (trade.entry - trade.takeProfit) * LIMITE_PRATICO_TP;
+    }
+
+    const tpAlvoRealmenteAtingido =
+      (trade.signal === 'CALL' && currentPrice >= trade.takeProfit) ||
+      (trade.signal === 'PUT'  && currentPrice <= trade.takeProfit);
+
+    const tpEfetivoAtingido =
+      autoCloseAtivo && tpEfetivo !== null && (
+        (trade.signal === 'CALL' && currentPrice >= tpEfetivo) ||
+        (trade.signal === 'PUT'  && currentPrice <= tpEfetivo)
+      );
+
+    if (tpAlvoRealmenteAtingido) {
+      msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true;
+    }
+    else if (tpEfetivoAtingido && !tpAlvoRealmenteAtingido) {
+      // Fecha em lucro parcial — 90% do alvo
+      msgObj = formatarMensagemAutoClose90(trade, currentPrice, tempoMinAutoClose);
+      tipo = 'WIN';
+      fecharTrade = true;
+      logger.info(`🎯 [AUTO-CLOSE 90%] ${symbol} (${mode}) fechado em ${currentPrice} (entrada ${trade.entry}, alvo ${trade.takeProfit})`);
+    }
     else if (trade.signal === 'CALL' && currentPrice <= trade.stopLoss) { msgObj = formatarMensagemStop(trade); tipo = 'STOP'; fecharTrade = true; }
     else if (trade.signal === 'PUT' && currentPrice >= trade.stopLoss) { msgObj = formatarMensagemStop(trade); tipo = 'STOP'; fecharTrade = true; }
     else if (!trade.avisoExaustaoEnviado && percentualPercorrido >= 0.10 && percentualPercorrido < 0.50) {
@@ -1529,12 +1615,25 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
       }
     }
-    else if (!emRespiracaoOuPullback && !emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
+    else if (!emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
     else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
     else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
     else if ((!trade.ultimaAtualizacaoEnviada || (agora - trade.ultimaAtualizacaoEnviada) >= getIntervaloAtualizacao(trade.mode)) && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagemAtualizacao(trade, tempoDecorridoMin); tipo = '5MIN'; trade.ultimaAtualizacaoEnviada = agora; }
     else if (!trade.avisoZeroRiscoEnviado && percentualPercorrido >= 0.50) { msgObj = formatarMensagemZeroRisco(trade); tipo = 'ZERO_RISCO'; trade.avisoZeroRiscoEnviado = true; }
     else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
+    // ⭐ PATCH 2 — Peak tracking: fechar em lucro parcial quando pico é abandonado
+    else if (
+      !trade.avisoPullbackDoPicoEnviado &&
+      (trade.peakPercentual || 0) >= 0.60 &&
+      pullbackDoPico >= 0.20 &&
+      percentualPercorrido >= 0.25
+    ) {
+      msgObj = formatarMensagemPullbackDoPico(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, trade.peakPercentual);
+      tipo = 'WIN';
+      fecharTrade = true;
+      trade.avisoPullbackDoPicoEnviado = true;
+      logger.info(`📉 [PEAK-PULLBACK] ${trade.symbol} (${trade.mode}) fechado em ${currentPrice} — pico foi ${(trade.peakPercentual * 100).toFixed(0)}%, atual ${(percentualPercorrido * 100).toFixed(0)}%`);
+    }
 
     if (fecharTrade) {
       tradesAbertos.delete(tradeKey);
@@ -1587,7 +1686,10 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         avisoExaustaoEnviado: false,
         ultimaAtualizacaoEnviada: null,
         timeoutAt: agora + getTimeoutModo(mode),
-        extensoes: 0, percentualNoUltimoCheck: 0
+        extensoes: 0, percentualNoUltimoCheck: 0,
+        // ⭐ PATCH 2 — Peak tracking
+        peakPercentual: 0,
+        avisoPullbackDoPicoEnviado: false
       };
 
       tradesAbertos.set(tradeKey, novoTrade);
@@ -2174,6 +2276,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.26: Auto-close 90% do alvo + Peak tracking (fecho em pullback do pico).`);
   logger.info(`v2.25: Normalização automática de URL (fix 404 /analyze).`);
   logger.info(`v2.24: Atualizações por modo (SNIPER 3min | CAÇADOR 10min | PESCADOR 30min | BALEEIRO 2h).`);
   logger.info(`v2.23: Multi-servidor de análise (watchlist/engine por servidor, push combinado).`);
