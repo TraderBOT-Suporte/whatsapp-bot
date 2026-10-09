@@ -1,4 +1,8 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.28 — Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE:
+//         · extrairDirecaoPrep usa _direcaoMaioria quando motor HOLD
+//         · diagnosticoProximidade reconhece razões novas (pullback não reversão, ADX fraco)
+//         · avaliarEsticamento DeMarker só em extremos críticos (evita falsos positivos)
 // v2.27 — MATURE fix: fallback quando motor não expõe mature_aprovado + readiness_score no detalhe.
 // v2.26 — Auto-close em 90% do alvo + Peak tracking (fecho em pullback do pico).
 // v2.25 — Normalização automática de URL dos servidores de análise (fix 404 /analyze).
@@ -993,6 +997,14 @@ async function loadStateFromTurso() {
 }
 
 // ========== HELPERS ==========
+
+/**
+ * ⭐ v2.28 — extrairDirecaoPrep com suporte a _direcaoMaioria
+ *
+ * Quando o motor está em HOLD (FIX #PANEL-TIMING-CONTEXT), os timings
+ * vêm marcados com `_direcaoMaioria` — a direção da maioria simples.
+ * Usamos essa direção (mais estável) em vez do `sinal` bruto do TF.
+ */
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
@@ -1009,7 +1021,10 @@ function extrairDirecaoPrep(dados) {
   }
   const sinais = [];
   for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing', 'h4_timing']) {
-    const s = dados.consolidated[tf]?.sinal;
+    const t = dados.consolidated[tf];
+    if (!t) continue;
+    // ⭐ v2.28 — preferir _direcaoMaioria (motor HOLD) sobre sinal bruto do TF
+    const s = t._direcaoMaioria || t.sinal;
     if (s === 'PUT' || s === 'CALL') sinais.push(s);
   }
   if (sinais.length > 0) {
@@ -1021,6 +1036,12 @@ function extrairDirecaoPrep(dados) {
   return null;
 }
 
+/**
+ * ⭐ v2.28 — diagnosticoProximidade com padrões adicionais
+ *
+ * Reconhece os motivos novos que o analyze-handler.js (FIX #PANEL-MATURE)
+ * produz: "pullback não reversão", "gatilho sem força", "REVERSAO_EM_CURSO".
+ */
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
 
@@ -1038,6 +1059,20 @@ function diagnosticoProximidade(reasons) {
   }
   if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'DeMarker em extremo — aguarda normalizar' };
+  }
+
+  // ⭐ v2.28 — novos padrões do motor (FIX #PANEL-MATURE / #PANEL-TIMING-CONTEXT)
+  if (/MAS ADX \d+(\.\d+)? muito forte — pullback, não reversão/i.test(texto)) {
+    return { nivel: 'LONGE', detalhe: 'macro forte mas a corrigir — aguarda TF menor virar' };
+  }
+  if (/está sem força \(ADX baixo\)/i.test(texto)) {
+    return { nivel: 'LONGE', detalhe: 'gatilho sem força (ADX baixo) — aguarda momento' };
+  }
+  if (/REVERSAO_EM_CURSO|M1=\w+.*M5=REVERSAO.*H1=REVERSAO/i.test(texto)) {
+    return { nivel: 'LONGE', detalhe: 'reversão em curso nos TFs-chave' };
+  }
+  if (/Tendência assumida (UP|DOWN).*aguarda confirmação/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'tendência assumida — aguarda confirmação do gatilho' };
   }
 
   if (/⛔ SINAL ANULADO \([^)]*\):.*força \d+\/100\) domina|A TF maior em \S+ tem força para ganhar o cabo de guerra/i.test(texto)) {
@@ -1094,6 +1129,17 @@ function diagnosticoProximidade(reasons) {
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
+/**
+ * ⭐ v2.28 — avaliarEsticamento com DeMarker conservador
+ *
+ * Antes: DeMarker 0.25 já contava como "esticado" (sobrevenda).
+ * Agora: só conta como esticado em zonas CRÍTICAS:
+ *   · Sobrecompra crítica: ≥ 0.85
+ *   · Sobrevenda crítica: ≤ 0.15
+ *
+ * Valores intermédios (0.70-0.85 / 0.15-0.30) apenas informam,
+ * não bloqueiam PRONTIDAO.
+ */
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
@@ -1134,14 +1180,17 @@ function avaliarEsticamento(reasons) {
     return { esticado: true, nivel: 'ALTO', motivo: 'RSI extremo em múltiplos TFs — pullback iminente' };
   }
 
-  if (/(DeMarker|DeM)\s+0\.[7-9]\d/i.test(texto) || /(DeMarker|DeM).*sobrecompra/i.test(texto)) alertas.push('DeM sobrecompra');
-  if (/(DeMarker|DeM)\s+0\.[0-2]\d/i.test(texto) || /(DeMarker|DeM).*sobrevenda/i.test(texto)) alertas.push('DeM sobrevenda');
-  if (/RSI\s+(7[5-9]|8\d|9\d)\b/i.test(texto)) alertas.push('RSI extremo alto');
-  if (/RSI\s+([0-9]|1\d|2[0-5])\b/i.test(texto)) alertas.push('RSI extremo baixo');
+  // ⭐ v2.28 — DeMarker conservador: só conta em extremos CRÍTICOS
+  //   Sobrecompra crítica: 0.85+   |   Sobrevenda crítica: 0.15-
+  const mDemCriticoAlto = texto.match(/(?:DeMarker|DeM)\s+(0\.(?:8[5-9]|9\d)\d*)/i);
+  if (mDemCriticoAlto) alertas.push(`DeM sobrecompra crítica (${mDemCriticoAlto[1]})`);
+  const mDemCriticoBaixo = texto.match(/(?:DeMarker|DeM)\s+(0\.(?:1[0-5]|0\d)\d*)/i);
+  if (mDemCriticoBaixo) alertas.push(`DeM sobrevenda crítica (${mDemCriticoBaixo[1]})`);
+
+  if (/RSI\s+(8[5-9]|9\d)\b/i.test(texto)) alertas.push('RSI extremo alto');
+  if (/RSI\s+([0-9]|1[0-5])\b/i.test(texto)) alertas.push('RSI extremo baixo');
   if (/RSI.*zona alta/i.test(texto)) alertas.push('RSI zona alta');
   if (/RSI.*zona baixa/i.test(texto)) alertas.push('RSI zona baixa');
-  if (/(DeMarker|DeM)\s+0\.6[5-9]/i.test(texto)) alertas.push('DeM a esticar');
-  if (/(DeMarker|DeM)\s+0\.3[0-5]/i.test(texto)) alertas.push('DeM a esticar (baixo)');
 
   if (alertas.length >= 2) return { esticado: true, nivel: 'ALTO', motivo: alertas.slice(0, 3).join(' · ') };
   if (alertas.length === 1) return { esticado: true, nivel: 'MÉDIO', motivo: alertas[0] };
@@ -1492,7 +1541,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const dados = await buscarSinalAnalise(symbol, mode, sid);
   if (!dados || !dados.success) return;
 
-  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} suggestion=${dados.suggestion?.action}`);
+  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} suggestion=${dados.suggestion?.action}`);
 
   const agora = Date.now();
   const currentPrice = dados.consolidated.price;
@@ -2303,6 +2352,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.28: Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE.`);
   logger.info(`v2.27: MATURE fallback (motor pode ou não expor mature_aprovado) + readiness_score no detalhe.`);
   logger.info(`v2.26: Auto-close 90% do alvo + Peak tracking (fecho em pullback do pico).`);
   logger.info(`v2.25: Normalização automática de URL (fix 404 /analyze).`);
