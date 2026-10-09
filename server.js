@@ -1,4 +1,5 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.27 — MATURE fix: fallback quando motor não expõe mature_aprovado + readiness_score no detalhe.
 // v2.26 — Auto-close em 90% do alvo + Peak tracking (fecho em pullback do pico).
 // v2.25 — Normalização automática de URL dos servidores de análise (fix 404 /analyze).
 // v2.24 — Atualizações periódicas por modo + novos gates (GATE FORÇA MACRO, RSI HARD BLOCK).
@@ -647,16 +648,15 @@ async function saveUserPreferences(tokenHash, raw) {
 
 const PRONTIDAO_GLOBAL_COOLDOWN_MS = 10 * 60 * 1000;
 
-// ⭐ PATCH 3 — Timeouts reduzidos (SNIPER e CAÇADOR mais apertados)
 const TRADE_TIMEOUT_POR_MODO_MS = {
-  'SNIPER':   15 * 60 * 1000,   // era 20min → 15min (SNIPER é cirúrgico)
-  'CAÇADOR':  60 * 60 * 1000,   // era 90min → 60min
+  'SNIPER':   15 * 60 * 1000,
+  'CAÇADOR':  60 * 60 * 1000,
   'PESCADOR': 12 * 60 * 60 * 1000,
   'BALEEIRO': 72 * 60 * 60 * 1000
 };
 const TRADE_TIMEOUT_EXTEND_POR_MODO_MS = {
-  'SNIPER':   8 * 60 * 1000,    // era 15min → 8min
-  'CAÇADOR':  30 * 60 * 1000,   // era 45min → 30min
+  'SNIPER':   8 * 60 * 1000,
+  'CAÇADOR':  30 * 60 * 1000,
   'PESCADOR': 6 * 60 * 60 * 1000,
   'BALEEIRO': 48 * 60 * 60 * 1000
 };
@@ -931,7 +931,6 @@ async function loadStateFromTurso() {
       const timeoutAt = t.timeoutAt || (timestampTrade + timeoutModo);
       if (agora > timeoutAt) t.timeoutAt = agora + 60 * 1000;
       if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
-      // ⭐ PATCH PEAK TRACKING — inicializar campos em trades antigos
       if (t.peakPercentual === undefined) t.peakPercentual = 0;
       if (t.avisoPullbackDoPicoEnviado === undefined) t.avisoPullbackDoPicoEnviado = false;
       tradesAbertos.set(newKey, t);
@@ -1207,6 +1206,7 @@ function confirmaExaustaoMultiTF(dados, trade) {
 }
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
+// ⭐ v2.27 — Incluir readiness_score no detalhe
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
@@ -1245,6 +1245,7 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
       tipo: 'PRONTIDAO', nomeAmigavel, direcao, modo: extras.mode || null,
       score, zona: dados.consolidated.zona, proximidade, detalhe,
       nivelProntidao: nivel, scoreQuase,
+      readinessScore: dados.consolidated.readiness_score ?? null,
       reasons: (dados.consolidated.score_reasons || []).slice(0, 14),
       price: dados.consolidated.price
     }
@@ -1269,12 +1270,18 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const conf = (Number.isFinite(confNum) ? (confNum * 100).toFixed(1) : '0.0');
   const zona = consolidated.zona === 'B' ? 'B' : 'A';
   const tituloBase = zona === 'A' ? '🚨 SINAL CONFIRMADO' : '⚡ SINAL MODERADO';
+  const confBrutaNum = Number(consolidated?.confianca_bruta);
+  const confBruta = Number.isFinite(confBrutaNum) ? (confBrutaNum * 100).toFixed(1) : null;
   return {
     titulo: `${tituloBase}: ${nomeAmigavel}`,
     corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}`,
     detalhes: { tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
       entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
-      score: consolidated.score, confidence: conf, price: consolidated.price,
+      score: consolidated.score,
+      readinessScore: consolidated.readiness_score ?? null,
+      confidence: conf,
+      confidenceBruta: confBruta,
+      price: consolidated.price,
       reasons: (consolidated.score_reasons || []).slice(0, 14), zona }
   };
 }
@@ -1319,7 +1326,6 @@ function formatarMensagemQuaseLa(trade) {
   return { titulo: `⏳ Quase no alvo: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço ${trade.currentPrice} · 🎯 Alvo ${trade.takeProfit}\n📊 +80% percorrido — atenção máxima`, detalhes: { tipo: 'QUASE_LA', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit } };
 }
 
-// ⭐ PATCH 1 — Mensagem de auto-close em 90% do alvo
 function formatarMensagemAutoClose90(trade, currentPrice, minutos) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
@@ -1346,7 +1352,6 @@ function formatarMensagemAutoClose90(trade, currentPrice, minutos) {
   };
 }
 
-// ⭐ PATCH 2 — Mensagem de pullback do pico (fecho em lucro parcial após reversão)
 function formatarMensagemPullbackDoPico(trade, currentPrice, minutos, percentualAtual, picoPercentual) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
@@ -1508,7 +1513,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     const percentualPercorrido = distanciaTotal > 0 ? (distanciaPercorrida / distanciaTotal) : 0;
     const tempoDecorridoMin = Math.floor((agora - trade.timestamp) / 60000);
 
-    // ⭐ PATCH 2 — Peak tracking
     if (percentualPercorrido > (trade.peakPercentual || 0)) {
       trade.peakPercentual = percentualPercorrido;
     }
@@ -1552,7 +1556,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
 
     let msgObj = null, tipo = null, fecharTrade = false;
 
-    // ⭐ PATCH 1 — Auto-close em 90% do alvo (aceita perder últimos 10%)
     const LIMITE_PRATICO_TP = 0.90;
     const tempoMinAutoClose = Math.floor((agora - trade.timestamp) / 60000);
     const autoCloseAtivo = tempoMinAutoClose >= 3;
@@ -1578,7 +1581,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       msgObj = formatarMensagemWin(trade); tipo = 'WIN'; fecharTrade = true;
     }
     else if (tpEfetivoAtingido && !tpAlvoRealmenteAtingido) {
-      // Fecha em lucro parcial — 90% do alvo
       msgObj = formatarMensagemAutoClose90(trade, currentPrice, tempoMinAutoClose);
       tipo = 'WIN';
       fecharTrade = true;
@@ -1621,7 +1623,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     else if ((!trade.ultimaAtualizacaoEnviada || (agora - trade.ultimaAtualizacaoEnviada) >= getIntervaloAtualizacao(trade.mode)) && percentualPercorrido > 0.10 && percentualPercorrido < 0.50) { msgObj = formatarMensagemAtualizacao(trade, tempoDecorridoMin); tipo = '5MIN'; trade.ultimaAtualizacaoEnviada = agora; }
     else if (!trade.avisoZeroRiscoEnviado && percentualPercorrido >= 0.50) { msgObj = formatarMensagemZeroRisco(trade); tipo = 'ZERO_RISCO'; trade.avisoZeroRiscoEnviado = true; }
     else if (!trade.avisoQuaseLaEnviado && percentualPercorrido >= 0.80) { msgObj = formatarMensagemQuaseLa(trade); tipo = 'QUASE_LA'; trade.avisoQuaseLaEnviado = true; }
-    // ⭐ PATCH 2 — Peak tracking: fechar em lucro parcial quando pico é abandonado
     else if (
       !trade.avisoPullbackDoPicoEnviado &&
       (trade.peakPercentual || 0) >= 0.60 &&
@@ -1687,7 +1688,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         ultimaAtualizacaoEnviada: null,
         timeoutAt: agora + getTimeoutModo(mode),
         extensoes: 0, percentualNoUltimoCheck: 0,
-        // ⭐ PATCH 2 — Peak tracking
         peakPercentual: 0,
         avisoPullbackDoPicoEnviado: false
       };
@@ -1721,8 +1721,15 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       removePersistedProntidao(tradeKey);
     }
   }
-  else if (dados.consolidated.signal === 'HOLD' && (dados.consolidated.zona === 'B' || dados.consolidated.zona === 'C')) {
-    const scoreAtual = dados.consolidated.score || 0;
+  // ⭐ FIX v2.27 — zona 'B' em HOLD é código morto (motor força 'C' na reconciliação).
+  //   Aceitamos qualquer HOLD para PRONTIDAO.
+  else if (dados.consolidated.signal === 'HOLD') {
+    // ⭐ FIX v2.27 — usar readiness_score se disponível (motor HOLD).
+    const scoreAtual = (
+      dados.consolidated.readiness_score
+      ?? dados.consolidated.score
+      ?? 0
+    );
     const scoreAtualNum = Number(scoreAtual) || 0;
     const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
     if (regimeAtualPush === 'CHOP') {
@@ -1737,20 +1744,39 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       return;
     }
 
-    const matureAprovadoMotor = dados.consolidated?.mature_aprovado === true;
+    // ⭐ FIX v2.27 — MATURE fallback robusto:
+    //   1) Se motor expõe mature_aprovado → usar direto
+    //   2) Senão, inferir por score + proximidade (fallback retrocompatível)
+    const matureAprovadoMotor = dados.consolidated?.mature_aprovado;
     const matureMotivo = dados.consolidated?.mature_motivo_bloqueio || null;
     const proximidadePront = diagnosticoProximidade(dados.consolidated.score_reasons);
     const bloqueioAtivo = proximidadePront && proximidadePront.nivel === 'BLOQUEADO';
 
-    const deveForcarEarly = !matureAprovadoMotor || bloqueioAtivo;
+    let deveForcarEarly;
+    let motivoForcarEarly = null;
+    if (matureAprovadoMotor === true) {
+      deveForcarEarly = false;
+    } else if (matureAprovadoMotor === false) {
+      deveForcarEarly = true;
+      motivoForcarEarly = matureMotivo || 'motor não aprovou MATURE';
+    } else {
+      // Fallback: motor não expõe o campo → inferir
+      const scoreQuaseEntrada = getScoreQuaseEntrada(mode);
+      deveForcarEarly = bloqueioAtivo || scoreAtualNum < scoreQuaseEntrada;
+      if (deveForcarEarly) {
+        motivoForcarEarly = matureMotivo
+          || (bloqueioAtivo
+                ? proximidadePront.detalhe
+                : `score ${scoreAtualNum} < limiar ${scoreQuaseEntrada} (fallback)`);
+      }
+    }
 
     let _forcarSomenteEarly = false;
     if (deveForcarEarly) {
-      const motivo = matureMotivo
-        || (bloqueioAtivo ? proximidadePront.detalhe : 'motor não aprovou MATURE');
-      logger.info(`⛔ [FIX-PRONTIDAO v2][${sid}] ${symbol} (${mode}) MATURE bloqueado — ${motivo}`);
+      logger.info(`⛔ [FIX-PRONTIDAO v3][${sid}] ${symbol} (${mode}) MATURE bloqueado — ${motivoForcarEarly}`);
       _forcarSomenteEarly = true;
     }
+
     const prefsPorWatcher = new Map();
     for (const tk of watchers) {
       const prefs = await getUserPreferences(tk);
@@ -2124,6 +2150,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           signal,
           zona,
           score,
+          readinessScore: consolidated.readiness_score ?? null,
           proximidade: diagnosticoProximidade(consolidated.score_reasons),
           esticamento: estic,
           mensagemProntidao,
@@ -2276,6 +2303,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.27: MATURE fallback (motor pode ou não expor mature_aprovado) + readiness_score no detalhe.`);
   logger.info(`v2.26: Auto-close 90% do alvo + Peak tracking (fecho em pullback do pico).`);
   logger.info(`v2.25: Normalização automática de URL (fix 404 /analyze).`);
   logger.info(`v2.24: Atualizações por modo (SNIPER 3min | CAÇADOR 10min | PESCADOR 30min | BALEEIRO 2h).`);
@@ -2283,7 +2311,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`v2.22: Cooldown PRONTIDAO por modo + persistência de ultimo_score.`);
   logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
   logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
-  logger.info(`FIX-PRONTIDAO v2: MATURE depende do flag mature_aprovado do motor.`);
+  logger.info(`FIX-PRONTIDAO v3: MATURE com fallback robusto.`);
   try {
     await loadStateFromTurso();
   } catch (e) {
