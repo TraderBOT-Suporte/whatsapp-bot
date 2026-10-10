@@ -1,4 +1,8 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.29 — Reconhecimento dos patches do motor:
+//         · extrairDirecaoPrep ignora direção quando MACRO-AUTHORITY-GUARD cede
+//         · diagnosticoProximidade reconhece MACRO AUTHORITY SUAVIZADA e MICRO-AGUARDA-FLIP
+//         · formatarMensagemPrep alinha emojis/texto com novos estados
 // v2.28 — Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE:
 //         · extrairDirecaoPrep usa _direcaoMaioria quando motor HOLD
 //         · diagnosticoProximidade reconhece razões novas (pullback não reversão, ADX fraco)
@@ -999,6 +1003,13 @@ async function loadStateFromTurso() {
 // ========== HELPERS ==========
 
 /**
+ * ⭐ v2.29 — extrairDirecaoPrep com guard do MACRO-AUTHORITY
+ *
+ * Quando o motor devolve `MACRO AUTHORITY SUAVIZADA` significa que o
+ * macro TF manda mas os TFs menores estão 3+ contra → o motor cedeu.
+ * Nesse caso NÃO devemos extrair direção da maioria simples, porque
+ * seria inventar uma direção que o motor rejeitou explicitamente.
+ *
  * ⭐ v2.28 — extrairDirecaoPrep com suporte a _direcaoMaioria
  *
  * Quando o motor está em HOLD (FIX #PANEL-TIMING-CONTEXT), os timings
@@ -1008,6 +1019,19 @@ async function loadStateFromTurso() {
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
+
+  // ⭐ PATCH v2.29 — guard do MACRO-AUTHORITY (motor cedeu → sem direção)
+  if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(reasonsTexto)) {
+    return null;
+  }
+
+  // ⭐ PATCH v2.29 — MICRO-AGUARDA-FLIP: direção segue a do macro, não do micro
+  //   (o micro está contra mas a virar; a direção fidedigna é a do motor)
+  if (/MICRO-AGUARDA-FLIP/i.test(reasonsTexto)) {
+    if (/\bUP\b/.test(reasonsTexto))   return 'CALL';
+    if (/\bDOWN\b/.test(reasonsTexto)) return 'PUT';
+  }
+
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasonsTexto)) return null;
   const notaindicaIncerteza = /NÃO confirmada|não confirmada|SEM DIREÇÃO DEFINIDA|sem direção definida|FRÁGIL|aguarda alinhamento/i.test(nota);
   if (!notaindicaIncerteza) {
@@ -1037,13 +1061,21 @@ function extrairDirecaoPrep(dados) {
 }
 
 /**
- * ⭐ v2.28 — diagnosticoProximidade com padrões adicionais
+ * ⭐ v2.29 — diagnosticoProximidade com MACRO-AUTHORITY + MICRO-AGUARDA-FLIP
  *
- * Reconhece os motivos novos que o analyze-handler.js (FIX #PANEL-MATURE)
+ * ⭐ v2.28 — Reconhece os motivos novos que o analyze-handler.js (FIX #PANEL-MATURE)
  * produz: "pullback não reversão", "gatilho sem força", "REVERSAO_EM_CURSO".
  */
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
+
+  // ⭐ PATCH v2.29 — novos estados do motor (patches #MACRO-AUTHORITY-GUARD e #MICRO-AGUARDA-FLIP)
+  if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(texto)) {
+    return { nivel: 'LONGE', detalhe: 'macro manda mas TFs menores contra — aguarda alinhamento' };
+  }
+  if (/MICRO-AGUARDA-FLIP/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'micro contra mas a virar — prepara entrada' };
+  }
 
   if (/✅ Zona B validada|mantém\s+(CALL|PUT)\s+em zona B/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'zona B validada — entrada moderada aprovada' };
@@ -1255,6 +1287,7 @@ function confirmaExaustaoMultiTF(dados, trade) {
 }
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
+// ⭐ v2.29 — Reconhecer MACRO AUTHORITY SUAVIZADA e MICRO-AGUARDA-FLIP
 // ⭐ v2.27 — Incluir readiness_score no detalhe
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
@@ -1270,6 +1303,9 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   let proximidade, detalhe, emoji;
   if (bloqueio) { emoji = '⏸️'; proximidade = 'BLOQUEADO'; detalhe = proximidadeDiag.detalhe || 'bloqueio ativo — aguarda normalizar'; }
   else if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
+  // ⭐ v2.29 — novos estados
+  else if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(reasons)) { emoji = '🧭'; proximidade = 'LONGE'; detalhe = 'macro manda mas TFs menores contra — aguarda alinhamento'; }
+  else if (/MICRO-AGUARDA-FLIP/i.test(reasons)) { emoji = '🟡'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'micro contra mas a virar — prepara entrada'; }
   else if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasons)) { emoji = '🌬️'; proximidade = 'BLOQUEADO'; detalhe = 'mercado precisa respirar — aguarda normalizar'; }
   else if (/SINAL ANULADO.*DeMarker extremo|DEMARKER EXTREMO/i.test(reasons)) { emoji = '⛔'; proximidade = 'BLOQUEADO'; detalhe = 'mercado em extremo — aguarda normalizar'; }
   else if (/SINAL ANULADO:\s*\S+\s+DeM\s+[\d.]+\s+em\s+(fundo|topo)\s+extremo/i.test(reasons)) { emoji = '🛑'; proximidade = 'BLOQUEADO'; detalhe = 'exaustão nos TFs-chave — aguarda respirar'; }
@@ -2360,6 +2396,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.29: Reconhecimento MACRO-AUTHORITY-GUARD e MICRO-AGUARDA-FLIP no painel.`);
   logger.info(`v2.28: Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE.`);
   logger.info(`v2.27: MATURE fallback (motor pode ou não expor mature_aprovado) + readiness_score no detalhe.`);
   logger.info(`v2.26: Auto-close 90% do alvo + Peak tracking (fecho em pullback do pico).`);
