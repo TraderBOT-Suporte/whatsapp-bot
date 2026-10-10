@@ -1541,7 +1541,15 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const dados = await buscarSinalAnalise(symbol, mode, sid);
   if (!dados || !dados.success) return;
 
-  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} suggestion=${dados.suggestion?.action}`);
+  // ⭐ v2.29 — Debug: expõe contexto dos timings quando motor HOLD
+const _t = dados.consolidated?.m1_timing
+  || dados.consolidated?.m5_timing
+  || dados.consolidated?.m15_timing
+  || dados.consolidated?.h1_timing
+  || dados.consolidated?.h4_timing;
+const _contexto = _t?._contexto || 'NONE';
+const _dirMaioria = _t?._direcaoMaioria || '--';
+logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}`);
 
   const agora = Date.now();
   const currentPrice = dados.consolidated.price;
