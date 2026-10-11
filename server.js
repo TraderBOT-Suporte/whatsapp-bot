@@ -1,4 +1,8 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.31 — Reconhecimento da ORIGEM do sinal (motor / limiar / pullback):
+//         · formatarMensagemSinal mostra a origem no título e no corpo do push
+//         · extrairDirecaoPrep reconhece PULLBACK RESUM como última opção (shadow mode)
+//         · log de debug [RX] expõe limiar_aplicado / pullback_aplicado / origem
 // v2.30 — Reconhecimento dos estados novos do motor (Patch A v3, EXAUSTÃO MULTI-TF,
 //         validarPerdendoForca, correção real, veredictos RESPIRACAO_DOMINANTE /
 //         TENDENCIA_EXAUSTA):
@@ -1011,7 +1015,7 @@ async function loadStateFromTurso() {
 // ========== HELPERS ==========
 
 /**
- * ⭐ v2.30 — extrairDirecaoPrep com reconhecimento dos novos estados do motor
+ * ⭐ v2.31 — extrairDirecaoPrep com reconhecimento de PULLBACK RESUM
  *
  * Estados que devolvem null (motor declarou "não sei a direção"):
  *   · MACRO AUTHORITY SUAVIZADA (motor cedeu)
@@ -1023,34 +1027,34 @@ async function loadStateFromTurso() {
  *   · MICRO-AGUARDA-FLIP (direção do macro)
  *   · em correção real (pullback a terminar → direção do motor)
  *   · Tendência de fundo: ALTA/BAIXA
+ *   · PULLBACK RESUM (shadow mode) — última opção
  */
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
 
   // ⭐ PATCH v2.30 — REVERSÃO CONFIRMADA (Patch A v3 do entry-engine)
-  //   Motor já declarou que não sabe a direção — está a aguardar cruzamento do MACD.
   if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(reasonsTexto)) {
     return null;
   }
 
-  // ⭐ PATCH v2.30 — EXAUSTÃO MULTI-TF: mercado em topo/fundo, aguarda correção
+  // ⭐ PATCH v2.30 — EXAUSTÃO MULTI-TF
   if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(reasonsTexto)) {
     return null;
   }
 
-  // ⭐ PATCH v2.29 — guard do MACRO-AUTHORITY (motor cedeu → sem direção)
+  // ⭐ PATCH v2.29 — MACRO-AUTHORITY (motor cedeu)
   if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(reasonsTexto)) {
     return null;
   }
 
-  // ⭐ PATCH v2.29 — MICRO-AGUARDA-FLIP: direção segue a do macro, não do micro
+  // ⭐ PATCH v2.29 — MICRO-AGUARDA-FLIP: direção segue a do macro
   if (/MICRO-AGUARDA-FLIP/i.test(reasonsTexto)) {
     if (/\bUP\b/.test(reasonsTexto))   return 'CALL';
     if (/\bDOWN\b/.test(reasonsTexto)) return 'PUT';
   }
 
-  // ⭐ PATCH v2.30 — Correção real (pullback a terminar) → direção do motor
+  // ⭐ PATCH v2.30 — Correção real (pullback a terminar)
   if (/em correção real|em correcao real/i.test(reasonsTexto)) {
     if (/\bUP\b/.test(reasonsTexto))   return 'CALL';
     if (/\bDOWN\b/.test(reasonsTexto)) return 'PUT';
@@ -1071,7 +1075,6 @@ function extrairDirecaoPrep(dados) {
   for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing', 'h4_timing']) {
     const t = dados.consolidated[tf];
     if (!t) continue;
-    // ⭐ v2.28 — preferir _direcaoMaioria (motor HOLD) sobre sinal bruto do TF
     const s = t._direcaoMaioria || t.sinal;
     if (s === 'PUT' || s === 'CALL') sinais.push(s);
   }
@@ -1081,52 +1084,44 @@ function extrairDirecaoPrep(dados) {
     const ratio = Math.max(puts, calls) / sinais.length;
     if (ratio >= 0.6) return puts > calls ? 'PUT' : 'CALL';
   }
+
+  // ⭐ PATCH v2.31 — PULLBACK RESUM (shadow mode): última opção
+  //   Se o motor aditivo detetou padrão mas o motor principal ainda está
+  //   em HOLD, usa a direção do PULLBACK como hint de preparação no painel.
+  if (dados.consolidated?._pullbackResumption?.ativo === true) {
+    const dir = dados.consolidated._pullbackResumption.direcao;
+    if (dir === 'CALL' || dir === 'PUT') return dir;
+  }
+
   return null;
 }
 
 /**
  * ⭐ v2.30 — diagnosticoProximidade com reconhecimento dos novos estados
- *
- * Reconhece (por ordem de prioridade):
- *   · REVERSÃO CONFIRMADA (Patch A v3) → LONGE
- *   · EXAUSTÃO MULTI-TF → BLOQUEADO
- *   · em correção real → LONGE
- *   · validarPerdendoForca (H1 perde força mas M15 CALL) → LONGE
- *   · RESPIRACAO_DOMINANTE → BLOQUEADO
- *   · TENDENCIA_EXAUSTA → BLOQUEADO
- *   · MACRO AUTHORITY SUAVIZADA → LONGE
- *   · MICRO-AGUARDA-FLIP → PERTO
- *   · RESPIRAÇÃO → BLOQUEADO
- *   · (restantes estados mantidos)
  */
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
 
-  // ⭐ PATCH v2.30 — REVERSÃO CONFIRMADA (Patch A v3)
+  // ⭐ PATCH v2.30 — REVERSÃO CONFIRMADA
   if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'reversão confirmada — aguarda cruzamento do MACD' };
   }
-
-  // ⭐ PATCH v2.30 — EXAUSTÃO MULTI-TF (motor bloqueia por exaustão)
+  // ⭐ PATCH v2.30 — EXAUSTÃO MULTI-TF
   if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'exaustão multi-TF — mercado esticado, aguarda correção' };
   }
-
-  // ⭐ PATCH v2.30 — Correção real (pullback a terminar)
+  // ⭐ PATCH v2.30 — Correção real
   if (/em correção real|em correcao real/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'pullback a terminar — motor cede, aguarda alinhamento' };
   }
-
-  // ⭐ PATCH v2.30 — validarPerdendoForca (H1 perde força mas M15 ainda CALL)
+  // ⭐ PATCH v2.30 — validarPerdendoForca
   if (/perder força mas \S+ ainda (CALL|PUT)|reversão NÃO confirmada, aguardar \S+ virar/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'macro perde força — aguarda TF menor virar' };
   }
-
   // ⭐ PATCH v2.29 — MACRO AUTHORITY SUAVIZADA
   if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'macro manda mas TFs menores contra — aguarda alinhamento' };
   }
-
   // ⭐ PATCH v2.29 — MICRO-AGUARDA-FLIP
   if (/MICRO-AGUARDA-FLIP/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'micro contra mas a virar — prepara entrada' };
@@ -1147,7 +1142,6 @@ function diagnosticoProximidade(reasons) {
   if (/CALL BLOQUEADO.*DeMarker|PUT BLOQUEADO.*DeMarker/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'DeMarker em extremo — aguarda normalizar' };
   }
-
   if (/MAS ADX \d+(\.\d+)? muito forte — pullback, não reversão/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'macro forte mas a corrigir — aguarda TF menor virar' };
   }
@@ -1160,19 +1154,16 @@ function diagnosticoProximidade(reasons) {
   if (/Tendência assumida (UP|DOWN).*aguarda confirmação/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'tendência assumida — aguarda confirmação do gatilho' };
   }
-
   if (/⛔ SINAL ANULADO \([^)]*\):.*força \d+\/100\) domina|A TF maior em \S+ tem força para ganhar o cabo de guerra/i.test(texto)) {
     const m = texto.match(/TF maior em (\S+) tem força/i);
     const tf = m ? m[1] : 'TF maior';
     return { nivel: 'BLOQUEADO', detalhe: `${tf} domina o sinal — aguarda que perca força` };
   }
-
   if (/⛔ SINAL ANULADO: \d+ TFs com RSI em zona (alta|baixa) — pullback iminente/i.test(texto)) {
     const m = texto.match(/(\d+) TFs com RSI em zona (alta|baixa)/i);
     const zona = m ? m[2] : 'extrema';
     return { nivel: 'BLOQUEADO', detalhe: `${m ? m[1] : 'Vários'} TFs com RSI em zona ${zona} — pullback iminente` };
   }
-
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'mercado precisa respirar — aguarda normalizar' };
   }
@@ -1212,8 +1203,6 @@ function diagnosticoProximidade(reasons) {
   if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'gatilho em ajuste' };
   }
-
-  // ⭐ PATCH v2.30 — novos veredictos do tensao classifier
   if (/RESPIRACAO_DOMINANTE/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'respiração dominante — mercado exausto nos TFs' };
   }
@@ -1226,14 +1215,6 @@ function diagnosticoProximidade(reasons) {
 
 /**
  * ⭐ v2.28 — avaliarEsticamento com DeMarker conservador
- *
- * Antes: DeMarker 0.25 já contava como "esticado" (sobrevenda).
- * Agora: só conta como esticado em zonas CRÍTICAS:
- *   · Sobrecompra crítica: ≥ 0.85
- *   · Sobrevenda crítica: ≤ 0.15
- *
- * Valores intermédios (0.70-0.85 / 0.15-0.30) apenas informam,
- * não bloqueiam PRONTIDAO.
  */
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
@@ -1254,7 +1235,6 @@ function avaliarEsticamento(reasons) {
   if (/Prontidão reduzida por exaustão DeMarker/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Exaustão confirmada nos TFs-chave' };
   }
-
   if (/hist a desacelerar \d+%.*limite \d+%.*para (SNIPER|CAÇADOR|PESCADOR|BALEEIRO)/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Macro a desacelerar — momentum fraco' };
   }
@@ -1264,13 +1244,11 @@ function avaliarEsticamento(reasons) {
   if (/⛔ Entrada\s+(CALL|PUT)\s+em zona B rebaixada/i.test(texto)) {
     return { esticado: true, nivel: 'MÉDIO', motivo: 'Zona B rebaixada — macro contra' };
   }
-
   if (/⛔ SINAL ANULADO \([^)]*\):.*força \d+\/100\) domina|A TF maior em \S+ tem força para ganhar o cabo de guerra/i.test(texto)) {
     const m = texto.match(/TF maior em (\S+) tem força/i);
     const tf = m ? m[1] : 'TF maior';
     return { esticado: true, nivel: 'ALTO', motivo: `${tf} com dominância estrutural — entrada inviável` };
   }
-
   if (/⛔ SINAL ANULADO: \d+ TFs com RSI em zona (alta|baixa) — pullback iminente/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'RSI extremo em múltiplos TFs — pullback iminente' };
   }
@@ -1362,11 +1340,9 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   let proximidade, detalhe, emoji;
   if (bloqueio) { emoji = '⏸️'; proximidade = 'BLOQUEADO'; detalhe = proximidadeDiag.detalhe || 'bloqueio ativo — aguarda normalizar'; }
   else if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
-  // ⭐ v2.30 — novos estados
   else if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(reasons)) { emoji = '🔄'; proximidade = 'LONGE'; detalhe = 'reversão confirmada — aguarda cruzamento do MACD'; }
   else if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(reasons)) { emoji = '⛔'; proximidade = 'BLOQUEADO'; detalhe = 'exaustão multi-TF — aguarda correção'; }
   else if (/em correção real|em correcao real/i.test(reasons)) { emoji = '📊'; proximidade = 'LONGE'; detalhe = 'pullback a terminar — aguarda alinhamento'; }
-  // ⭐ v2.29 — estados
   else if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(reasons)) { emoji = '🧭'; proximidade = 'LONGE'; detalhe = 'macro manda mas TFs menores contra — aguarda alinhamento'; }
   else if (/MICRO-AGUARDA-FLIP/i.test(reasons)) { emoji = '🟡'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'micro contra mas a virar — prepara entrada'; }
   else if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasons)) { emoji = '🌬️'; proximidade = 'BLOQUEADO'; detalhe = 'mercado precisa respirar — aguarda normalizar'; }
@@ -1409,6 +1385,7 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   };
 }
 
+// ⭐ v2.31 — Detetar origem do sinal e mostrar no push
 function formatarMensagemSinal(symbol, dados, mode) {
   const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
@@ -1420,9 +1397,16 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const tituloBase = zona === 'A' ? '🚨 SINAL CONFIRMADO' : '⚡ SINAL MODERADO';
   const confBrutaNum = Number(consolidated?.confianca_bruta);
   const confBruta = Number.isFinite(confBrutaNum) ? (confBrutaNum * 100).toFixed(1) : null;
+
+  // ⭐ v2.31 — Detetar origem do sinal (motor / limiar / pullback)
+  const origem = consolidated?._origemSinal || 'motor';
+  const origemLabel = origem === 'PULLBACK_RESUMPTION' ? '🔄 Pullback Resumption' :
+                      origem === 'LIMIAR_TENDENCIA'    ? '🚀 Limiar Tendência' :
+                                                         '🧠 Motor 3 Camadas';
+
   return {
-    titulo: `${tituloBase}: ${nomeAmigavel}`,
-    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}`,
+    titulo: `${tituloBase}: ${nomeAmigavel} · ${origemLabel}`,
+    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}\n🔎 Origem: ${origemLabel}`,
     detalhes: { tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
       entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
       score: consolidated.score,
@@ -1430,6 +1414,8 @@ function formatarMensagemSinal(symbol, dados, mode) {
       confidence: conf,
       confidenceBruta: confBruta,
       price: consolidated.price,
+      origem,
+      origemLabel,
       reasons: (consolidated.score_reasons || []).slice(0, 14), zona }
   };
 }
@@ -1640,14 +1626,15 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const dados = await buscarSinalAnalise(symbol, mode, sid);
   if (!dados || !dados.success) return;
 
-const _t = dados.consolidated?.m1_timing
-  || dados.consolidated?.m5_timing
-  || dados.consolidated?.m15_timing
-  || dados.consolidated?.h1_timing
-  || dados.consolidated?.h4_timing;
-const _contexto = _t?._contexto || 'NONE';
-const _dirMaioria = _t?._direcaoMaioria || '--';
-logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}`);
+  const _t = dados.consolidated?.m1_timing
+    || dados.consolidated?.m5_timing
+    || dados.consolidated?.m15_timing
+    || dados.consolidated?.h1_timing
+    || dados.consolidated?.h4_timing;
+  const _contexto = _t?._contexto || 'NONE';
+  const _dirMaioria = _t?._direcaoMaioria || '--';
+  // ⭐ v2.31 — log RX com origem + limiar + pullback
+  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false} pullback=${dados.consolidated?.pullback_aplicado ?? false} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}`);
 
   const agora = Date.now();
   const currentPrice = dados.consolidated.price;
@@ -2262,7 +2249,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
         if (!data || !data.success) return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro ao obter análise'], error: true };
         const consolidated = data.consolidated || {};
 
-        // ⭐ PATCH v2.30 — usar readiness_score quando disponível (motor HOLD)
         const score = (consolidated.readiness_score ?? consolidated.score ?? 0) || 0;
         const zona = consolidated.zona || '?';
         const signal = consolidated.signal || 'HOLD';
@@ -2297,7 +2283,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
 
         const proximidade = diagnosticoProximidade(consolidated.score_reasons);
 
-        // ⭐ PATCH v2.30 — debug do scan
         logger.info(`🔍 [SCAN][${sid}] ${symbol} (${mode}) → signal=${signal} zona=${zona} score=${score} readiness=${consolidated.readiness_score ?? '--'} mature=${consolidated.mature_aprovado ?? '--'} proximidade=${proximidade.nivel}`);
 
         return {
@@ -2306,11 +2291,14 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           zona,
           score,
           readinessScore: consolidated.readiness_score ?? null,
-          // ⭐ PATCH v2.30 — novos campos do motor
           matureAprovado: consolidated.mature_aprovado ?? false,
           matureMotivoBloqueio: consolidated.mature_motivo_bloqueio ?? null,
           pullbackEscalonado: consolidated.pullback_escalonado_detectado === true,
           trendStatePullbackScaling: consolidated.trendState_pullbackScaling === true,
+          // ⭐ v2.31 — expor origem do sinal no scan
+          origem: consolidated._origemSinal || 'motor',
+          limiarAplicado: consolidated.limiar_aplicado === true,
+          pullbackAplicado: consolidated.pullback_aplicado === true,
           proximidade,
           esticamento: estic,
           mensagemProntidao,
@@ -2463,6 +2451,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.31: Reconhecimento da ORIGEM do sinal (motor / limiar / pullback).`);
   logger.info(`v2.30: Reconhecimento REVERSÃO CONFIRMADA + EXAUSTÃO MULTI-TF + validarPerdendoForca.`);
   logger.info(`v2.29: Reconhecimento MACRO-AUTHORITY-GUARD e MICRO-AGUARDA-FLIP no painel.`);
   logger.info(`v2.28: Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE.`);
