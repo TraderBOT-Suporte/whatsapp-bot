@@ -1,4 +1,10 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.32 — Reconhecimento de autorizações do motor no painel (FIX #DEM-TREND-EXPLOSIVO):
+//         · avaliarEsticamento reconhece "ADX ≥ 35 explosivo" e "DeMarker lock a favor"
+//           (rebaixa nivel ALTO → MÉDIO para não bloquear push silenciosamente)
+//         · diagnosticoProximidade reconhece novos motivos (DeMarker Multi-TF + ADX,
+//           DeMarker lock, REVERSAO-A-FAVOR, Sizing reduzido, pullback validado)
+//         · extrairDirecaoPrep reconhece REVERSAO-A-FAVOR como hint de direção
 // v2.31 — Reconhecimento da ORIGEM do sinal (motor / limiar / pullback):
 //         · formatarMensagemSinal mostra a origem no título e no corpo do push
 //         · extrairDirecaoPrep reconhece PULLBACK RESUM como última opção (shadow mode)
@@ -1015,6 +1021,7 @@ async function loadStateFromTurso() {
 // ========== HELPERS ==========
 
 /**
+ * ⭐ v2.32 — extrairDirecaoPrep com reconhecimento de REVERSAO-A-FAVOR
  * ⭐ v2.31 — extrairDirecaoPrep com reconhecimento de PULLBACK RESUM
  *
  * Estados que devolvem null (motor declarou "não sei a direção"):
@@ -1024,6 +1031,7 @@ async function loadStateFromTurso() {
  *   · RESPIRAÇÃO (mercado precisa normalizar)
  *
  * Estados que devolvem direção:
+ *   · REVERSAO-A-FAVOR (v2.32) — usar a direção da reversão como hint
  *   · MICRO-AGUARDA-FLIP (direção do macro)
  *   · em correção real (pullback a terminar → direção do motor)
  *   · Tendência de fundo: ALTA/BAIXA
@@ -1066,6 +1074,15 @@ function extrairDirecaoPrep(dados) {
     const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
     if (matchNota) return matchNota[1].toUpperCase() === 'ALTA' ? 'CALL' : 'PUT';
   }
+
+  // ⭐ PATCH v2.32 — REVERSAO-A-FAVOR: usar a direção da reversão como hint
+  const reversaoAFavorMatch = (dados.consolidated.score_reasons || [])
+    .find(r => /REVERSAO-A-FAVOR.*para\s+(UP|DOWN)/i.test(r));
+  if (reversaoAFavorMatch) {
+    const m = reversaoAFavorMatch.match(/para\s+(UP|DOWN)/i);
+    if (m) return m[1].toUpperCase() === 'UP' ? 'CALL' : 'PUT';
+  }
+
   const razaoTrend = (dados.consolidated.score_reasons || []).find(r => r.includes('🧭'));
   if (razaoTrend && !/NEUTRAL|neutro|não confirmada|SEM DIREÇÃO/i.test(razaoTrend)) {
     if (/Tendência de fundo:\s*ALTA|Tendência assumida:\s*(UP|ALTA)|reversão para UP/i.test(razaoTrend)) return 'CALL';
@@ -1097,6 +1114,7 @@ function extrairDirecaoPrep(dados) {
 }
 
 /**
+ * ⭐ v2.32 — diagnosticoProximidade com reconhecimento de autorizações do motor
  * ⭐ v2.30 — diagnosticoProximidade com reconhecimento dos novos estados
  */
 function diagnosticoProximidade(reasons) {
@@ -1125,6 +1143,23 @@ function diagnosticoProximidade(reasons) {
   // ⭐ PATCH v2.29 — MICRO-AGUARDA-FLIP
   if (/MICRO-AGUARDA-FLIP/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'micro contra mas a virar — prepara entrada' };
+  }
+
+  // ⭐ PATCH v2.32 — Novos motivos do motor
+  if (/⚡ DeMarker Multi-TF esticado MAS ADX ≥ 35 explosivo|sobrecompra é continuação, não exaustão/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'DeMarker esticado mas ADX explosivo — autorizado pelo motor' };
+  }
+  if (/✅ DeMarker lock trend_lock_(alta|baixa) a favor/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'DeMarker em lock a favor da tendência — autorizado' };
+  }
+  if (/🔄 REVERSAO-A-FAVOR/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'reversão a favor da tendência — entrada permitida' };
+  }
+  if (/🔧 Sizing reduzido para 0\.5×/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'sizing flexível ativo — entrada moderada aprovada' };
+  }
+  if (/entrada em pullback validada/i.test(texto)) {
+    return { nivel: 'PERTO', detalhe: 'pullback validado — entrada em zona B' };
   }
 
   if (/✅ Zona B validada|mantém\s+(CALL|PUT)\s+em zona B/i.test(texto)) {
@@ -1214,12 +1249,23 @@ function diagnosticoProximidade(reasons) {
 }
 
 /**
- * ⭐ v2.28 — avaliarEsticamento com DeMarker conservador
+ * ⭐ v2.32 — avaliarEsticamento reconhece autorizações explícitas do motor
+ *   (DeMarker alto + ADX explosivo / DeMarker lock a favor)
+ * ⭐ v2.28 — avaliarEsticamento DeMarker conservador
  */
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
 
+  // ⭐ FIX v2.32 — Reconhecer autorizações explícitas do motor
+  //   Quando o analyzer relaxou por ADX explosivo, não tratar como esticado.
+  const motorAutorizouPorExplosao =
+    /ADX\s*≥\s*35 explosivo|sobrecompra é continuação, não exaustão|DeMarker Multi-TF esticado MAS ADX/i.test(texto);
+
+  const motorAutorizouPorLock =
+    /✅ DeMarker lock trend_lock_(alta|baixa) a favor do/i.test(texto);
+
+  // Bloqueios DUROS do motor continuam a contar (motor disse explicitamente "anulado")
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     const match = texto.match(/RESPIRAÇÃO\s+(SIMPLES|DUPLA)/i);
     const tipo = match ? match[1] : 'SIMPLES';
@@ -1232,6 +1278,19 @@ function avaliarEsticamento(reasons) {
   if (m81) {
     return { esticado: true, nivel: 'ALTO', motivo: `Exaustão ${m81[1]} DeM ${m81[2]} (${m81[3]})` };
   }
+
+  // ⭐ NOVO — Se o motor autorizou explicitamente, não bloquear
+  if (motorAutorizouPorExplosao || motorAutorizouPorLock) {
+    return {
+      esticado: true,
+      nivel: 'MÉDIO',
+      motivo: motorAutorizouPorLock
+        ? 'DeMarker em lock a favor da tendência (autorizado pelo motor)'
+        : 'ADX explosivo — sobrecompra é continuação (autorizado pelo motor)'
+    };
+  }
+
+  // Restantes verificações (inalteradas)
   if (/Prontidão reduzida por exaustão DeMarker/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Exaustão confirmada nos TFs-chave' };
   }
@@ -2451,6 +2510,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.32: Reconhecimento de autorizações do motor (FIX #DEM-TREND-EXPLOSIVO).`);
   logger.info(`v2.31: Reconhecimento da ORIGEM do sinal (motor / limiar / pullback).`);
   logger.info(`v2.30: Reconhecimento REVERSÃO CONFIRMADA + EXAUSTÃO MULTI-TF + validarPerdendoForca.`);
   logger.info(`v2.29: Reconhecimento MACRO-AUTHORITY-GUARD e MICRO-AGUARDA-FLIP no painel.`);
