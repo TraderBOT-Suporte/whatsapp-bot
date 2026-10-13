@@ -1,37 +1,25 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.33 — PUSH-CONTEXTO v2 (Respiração / Correção Real / Reversão):
+//         · 3 avisos durante trade aberto com anti-spam por timeframe
+//         · Cooldown por tipo (12/18/30 min) + Limite por trade (4/3/2)
+//         · Histerese de 2 ciclos + persistência no Turso
+//         · Nenhum destes push fecha a posição — só informam contexto
 // v2.32 — Reconhecimento de autorizações do motor no painel (FIX #DEM-TREND-EXPLOSIVO):
 //         · avaliarEsticamento reconhece "ADX ≥ 35 explosivo" e "DeMarker lock a favor"
-//           (rebaixa nivel ALTO → MÉDIO para não bloquear push silenciosamente)
 //         · diagnosticoProximidade reconhece novos motivos (DeMarker Multi-TF + ADX,
 //           DeMarker lock, REVERSAO-A-FAVOR, Sizing reduzido, pullback validado)
 //         · extrairDirecaoPrep reconhece REVERSAO-A-FAVOR como hint de direção
-// v2.31 — Reconhecimento da ORIGEM do sinal (motor / limiar / pullback):
-//         · formatarMensagemSinal mostra a origem no título e no corpo do push
-//         · extrairDirecaoPrep reconhece PULLBACK RESUM como última opção (shadow mode)
-//         · log de debug [RX] expõe limiar_aplicado / pullback_aplicado / origem
-// v2.30 — Reconhecimento dos estados novos do motor (Patch A v3, EXAUSTÃO MULTI-TF,
-//         validarPerdendoForca, correção real, veredictos RESPIRACAO_DOMINANTE /
-//         TENDENCIA_EXAUSTA):
-//         · extrairDirecaoPrep devolve null quando motor declarou reversão/exaustão
-//         · diagnosticoProximidade reconhece todos os novos motivos
-//         · /api/scan-group usa readiness_score e devolve mature_aprovado,
-//           mature_motivo_bloqueio, pullback_escalonado, trendState_pullbackScaling
-//         · log de debug do scan (SCAN)
-// v2.29 — Reconhecimento dos patches do motor:
-//         · extrairDirecaoPrep ignora direção quando MACRO-AUTHORITY-GUARD cede
-//         · diagnosticoProximidade reconhece MACRO AUTHORITY SUAVIZADA e MICRO-AGUARDA-FLIP
-//         · formatarMensagemPrep alinha emojis/texto com novos estados
-// v2.28 — Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE:
-//         · extrairDirecaoPrep usa _direcaoMaioria quando motor HOLD
-//         · diagnosticoProximidade reconhece razões novas (pullback não reversão, ADX fraco)
-//         · avaliarEsticamento DeMarker só em extremos críticos (evita falsos positivos)
-// v2.27 — MATURE fix: fallback quando motor não expõe mature_aprovado + readiness_score no detalhe.
-// v2.26 — Auto-close em 90% do alvo + Peak tracking (fecho em pullback do pico).
-// v2.25 — Normalização automática de URL dos servidores de análise (fix 404 /analyze).
-// v2.24 — Atualizações periódicas por modo + novos gates (GATE FORÇA MACRO, RSI HARD BLOCK).
-// v2.23 — Multi-servidor de análise (watchlist/engine por servidor, push combinado).
-// v2.22 — Cooldown PRONTIDAO por modo + persistência de ultimo_score no Turso.
-// v2.21 — Turso (libSQL) substitui Firestore. Cache em memória mantida.
+// v2.31 — Reconhecimento da ORIGEM do sinal (motor / limiar / pullback)
+// v2.30 — Reconhecimento dos estados novos do motor
+// v2.29 — Reconhecimento MACRO-AUTHORITY-GUARD e MICRO-AGUARDA-FLIP
+// v2.28 — Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE
+// v2.27 — MATURE fallback
+// v2.26 — Auto-close em 90% do alvo + Peak tracking
+// v2.25 — Normalização automática de URL
+// v2.24 — Atualizações periódicas por modo + novos gates
+// v2.23 — Multi-servidor de análise
+// v2.22 — Cooldown PRONTIDAO por modo + persistência de ultimo_score
+// v2.21 — Turso (libSQL) substitui Firestore
 
 import express from 'express';
 import cors from 'cors';
@@ -959,6 +947,11 @@ async function loadStateFromTurso() {
       if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
       if (t.peakPercentual === undefined) t.peakPercentual = 0;
       if (t.avisoPullbackDoPicoEnviado === undefined) t.avisoPullbackDoPicoEnviado = false;
+      // ⭐ PATCH #PUSH-CONTEXTO v2 — restaurar estado persistido
+      if (t._ctxEstado === undefined) t._ctxEstado = null;
+      if (!t._ctxUltimoEnvio) t._ctxUltimoEnvio = {};
+      if (!t._ctxContagem) t._ctxContagem = {};
+      if (t._ctxCiclosSemEstado === undefined) t._ctxCiclosSemEstado = 0;
       tradesAbertos.set(newKey, t);
       if (newKey !== row.trade_key) {
         await persistTradeOpen(newKey, t).catch(() => {});
@@ -1023,46 +1016,28 @@ async function loadStateFromTurso() {
 /**
  * ⭐ v2.32 — extrairDirecaoPrep com reconhecimento de REVERSAO-A-FAVOR
  * ⭐ v2.31 — extrairDirecaoPrep com reconhecimento de PULLBACK RESUM
- *
- * Estados que devolvem null (motor declarou "não sei a direção"):
- *   · MACRO AUTHORITY SUAVIZADA (motor cedeu)
- *   · REVERSÃO CONFIRMADA (Patch A v3)
- *   · EXAUSTÃO MULTI-TF (mercado em extremo)
- *   · RESPIRAÇÃO (mercado precisa normalizar)
- *
- * Estados que devolvem direção:
- *   · REVERSAO-A-FAVOR (v2.32) — usar a direção da reversão como hint
- *   · MICRO-AGUARDA-FLIP (direção do macro)
- *   · em correção real (pullback a terminar → direção do motor)
- *   · Tendência de fundo: ALTA/BAIXA
- *   · PULLBACK RESUM (shadow mode) — última opção
  */
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
 
-  // ⭐ PATCH v2.30 — REVERSÃO CONFIRMADA (Patch A v3 do entry-engine)
   if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(reasonsTexto)) {
     return null;
   }
 
-  // ⭐ PATCH v2.30 — EXAUSTÃO MULTI-TF
   if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(reasonsTexto)) {
     return null;
   }
 
-  // ⭐ PATCH v2.29 — MACRO-AUTHORITY (motor cedeu)
   if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(reasonsTexto)) {
     return null;
   }
 
-  // ⭐ PATCH v2.29 — MICRO-AGUARDA-FLIP: direção segue a do macro
   if (/MICRO-AGUARDA-FLIP/i.test(reasonsTexto)) {
     if (/\bUP\b/.test(reasonsTexto))   return 'CALL';
     if (/\bDOWN\b/.test(reasonsTexto)) return 'PUT';
   }
 
-  // ⭐ PATCH v2.30 — Correção real (pullback a terminar)
   if (/em correção real|em correcao real/i.test(reasonsTexto)) {
     if (/\bUP\b/.test(reasonsTexto))   return 'CALL';
     if (/\bDOWN\b/.test(reasonsTexto)) return 'PUT';
@@ -1075,7 +1050,6 @@ function extrairDirecaoPrep(dados) {
     if (matchNota) return matchNota[1].toUpperCase() === 'ALTA' ? 'CALL' : 'PUT';
   }
 
-  // ⭐ PATCH v2.32 — REVERSAO-A-FAVOR: usar a direção da reversão como hint
   const reversaoAFavorMatch = (dados.consolidated.score_reasons || [])
     .find(r => /REVERSAO-A-FAVOR.*para\s+(UP|DOWN)/i.test(r));
   if (reversaoAFavorMatch) {
@@ -1102,9 +1076,6 @@ function extrairDirecaoPrep(dados) {
     if (ratio >= 0.6) return puts > calls ? 'PUT' : 'CALL';
   }
 
-  // ⭐ PATCH v2.31 — PULLBACK RESUM (shadow mode): última opção
-  //   Se o motor aditivo detetou padrão mas o motor principal ainda está
-  //   em HOLD, usa a direção do PULLBACK como hint de preparação no painel.
   if (dados.consolidated?._pullbackResumption?.ativo === true) {
     const dir = dados.consolidated._pullbackResumption.direcao;
     if (dir === 'CALL' || dir === 'PUT') return dir;
@@ -1113,39 +1084,28 @@ function extrairDirecaoPrep(dados) {
   return null;
 }
 
-/**
- * ⭐ v2.32 — diagnosticoProximidade com reconhecimento de autorizações do motor
- * ⭐ v2.30 — diagnosticoProximidade com reconhecimento dos novos estados
- */
 function diagnosticoProximidade(reasons) {
   const texto = (reasons || []).join(' ');
 
-  // ⭐ PATCH v2.30 — REVERSÃO CONFIRMADA
   if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'reversão confirmada — aguarda cruzamento do MACD' };
   }
-  // ⭐ PATCH v2.30 — EXAUSTÃO MULTI-TF
   if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'exaustão multi-TF — mercado esticado, aguarda correção' };
   }
-  // ⭐ PATCH v2.30 — Correção real
   if (/em correção real|em correcao real/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'pullback a terminar — motor cede, aguarda alinhamento' };
   }
-  // ⭐ PATCH v2.30 — validarPerdendoForca
   if (/perder força mas \S+ ainda (CALL|PUT)|reversão NÃO confirmada, aguardar \S+ virar/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'macro perde força — aguarda TF menor virar' };
   }
-  // ⭐ PATCH v2.29 — MACRO AUTHORITY SUAVIZADA
   if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'macro manda mas TFs menores contra — aguarda alinhamento' };
   }
-  // ⭐ PATCH v2.29 — MICRO-AGUARDA-FLIP
   if (/MICRO-AGUARDA-FLIP/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'micro contra mas a virar — prepara entrada' };
   }
 
-  // ⭐ PATCH v2.32 — Novos motivos do motor
   if (/⚡ DeMarker Multi-TF esticado MAS ADX ≥ 35 explosivo|sobrecompra é continuação, não exaustão/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'DeMarker esticado mas ADX explosivo — autorizado pelo motor' };
   }
@@ -1248,24 +1208,16 @@ function diagnosticoProximidade(reasons) {
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
-/**
- * ⭐ v2.32 — avaliarEsticamento reconhece autorizações explícitas do motor
- *   (DeMarker alto + ADX explosivo / DeMarker lock a favor)
- * ⭐ v2.28 — avaliarEsticamento DeMarker conservador
- */
 function avaliarEsticamento(reasons) {
   const texto = (reasons || []).join(' ');
   const alertas = [];
 
-  // ⭐ FIX v2.32 — Reconhecer autorizações explícitas do motor
-  //   Quando o analyzer relaxou por ADX explosivo, não tratar como esticado.
   const motorAutorizouPorExplosao =
     /ADX\s*≥\s*35 explosivo|sobrecompra é continuação, não exaustão|DeMarker Multi-TF esticado MAS ADX/i.test(texto);
 
   const motorAutorizouPorLock =
     /✅ DeMarker lock trend_lock_(alta|baixa) a favor do/i.test(texto);
 
-  // Bloqueios DUROS do motor continuam a contar (motor disse explicitamente "anulado")
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     const match = texto.match(/RESPIRAÇÃO\s+(SIMPLES|DUPLA)/i);
     const tipo = match ? match[1] : 'SIMPLES';
@@ -1279,7 +1231,6 @@ function avaliarEsticamento(reasons) {
     return { esticado: true, nivel: 'ALTO', motivo: `Exaustão ${m81[1]} DeM ${m81[2]} (${m81[3]})` };
   }
 
-  // ⭐ NOVO — Se o motor autorizou explicitamente, não bloquear
   if (motorAutorizouPorExplosao || motorAutorizouPorLock) {
     return {
       esticado: true,
@@ -1290,7 +1241,6 @@ function avaliarEsticamento(reasons) {
     };
   }
 
-  // Restantes verificações (inalteradas)
   if (/Prontidão reduzida por exaustão DeMarker/i.test(texto)) {
     return { esticado: true, nivel: 'ALTO', motivo: 'Exaustão confirmada nos TFs-chave' };
   }
@@ -1444,7 +1394,6 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   };
 }
 
-// ⭐ v2.31 — Detetar origem do sinal e mostrar no push
 function formatarMensagemSinal(symbol, dados, mode) {
   const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
@@ -1457,7 +1406,6 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const confBrutaNum = Number(consolidated?.confianca_bruta);
   const confBruta = Number.isFinite(confBrutaNum) ? (confBrutaNum * 100).toFixed(1) : null;
 
-  // ⭐ v2.31 — Detetar origem do sinal (motor / limiar / pullback)
   const origem = consolidated?._origemSinal || 'motor';
   const origemLabel = origem === 'PULLBACK_RESUMPTION' ? '🔄 Pullback Resumption' :
                       origem === 'LIMIAR_TENDENCIA'    ? '🚀 Limiar Tendência' :
@@ -1590,6 +1538,73 @@ function formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percen
   return { titulo: `⚠️ Exaustão detetada: ${nome}`, corpo: `${nome} · ${trade.signal}\n📉 Tendência a perder força — ${motivo}\n💡 Considera fechar ANTES do SL tocar (${pct}% do alvo · ${tempoDecorridoMin}min)`, detalhes: { tipo: 'EXAUSTAO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, motivo, percentualPercorrido: pct + '%', duracao: tempoDecorridoMin + 'min' } };
 }
 
+// ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 1: 3 funções de formatação
+function formatarMensagemRespiracaoSaudavel(trade, currentPrice, minutos, motivo, tf) {
+  const nome = getFriendlyName(trade.symbol);
+  const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `🌬️ Respiração saudável: ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n🌬️ ${motivo}\n✅ Tendência intacta — mantém posição (${duracao}min)`,
+    detalhes: {
+      tipo: 'RESPIRACAO_SAUDAVEL',
+      nomeAmigavel: nome,
+      direcao: trade.signal,
+      modo: trade.mode,
+      entry: trade.entry,
+      currentPrice,
+      takeProfit: trade.takeProfit,
+      stopLoss: trade.stopLoss,
+      motivo,
+      timeframe: tf || null,
+      duracao: duracao + 'min'
+    }
+  };
+}
+
+function formatarMensagemCorrecaoReal(trade, currentPrice, minutos, motivo, tf) {
+  const nome = getFriendlyName(trade.symbol);
+  const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `📊 Correção real: ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n📊 ${motivo}\n⚠️ Profundidade aumentou — aguarda o flip do ${tf || 'trigger'} (${duracao}min)`,
+    detalhes: {
+      tipo: 'CORRECAO_REAL',
+      nomeAmigavel: nome,
+      direcao: trade.signal,
+      modo: trade.mode,
+      entry: trade.entry,
+      currentPrice,
+      takeProfit: trade.takeProfit,
+      stopLoss: trade.stopLoss,
+      motivo,
+      timeframe: tf || null,
+      duracao: duracao + 'min'
+    }
+  };
+}
+
+function formatarMensagemReversaoConfirmada(trade, currentPrice, minutos, motivo, tf) {
+  const nome = getFriendlyName(trade.symbol);
+  const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
+  return {
+    titulo: `⚠️ Reversão confirmada: ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n🔄 ${motivo}\n💡 Considera SAIR antes do SL (${duracao}min)`,
+    detalhes: {
+      tipo: 'REVERSAO_CONFIRMADA',
+      nomeAmigavel: nome,
+      direcao: trade.signal,
+      modo: trade.mode,
+      entry: trade.entry,
+      currentPrice,
+      takeProfit: trade.takeProfit,
+      stopLoss: trade.stopLoss,
+      motivo,
+      timeframe: tf || null,
+      duracao: duracao + 'min'
+    }
+  };
+}
+
 function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo) {
   const nome = getFriendlyName(trade.symbol);
   const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
@@ -1628,8 +1643,12 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
     } catch (err) { logger.error('Erro ao gravar sinal:', err.message); }
   }
 
-  const _openUrl = (tipo === 'SINAL_CONFIRMADO' || tipo === 'PRONTIDAO' || tipo === 'ARREFECIMENTO' || tipo === 'EXAUSTAO')
-    ? '/?open=signals' : '/';
+  // ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 5: tipos novos abrem no histórico
+  const _TIPOS_COM_HISTORICO = [
+    'SINAL_CONFIRMADO', 'PRONTIDAO', 'ARREFECIMENTO', 'EXAUSTAO',
+    'RESPIRACAO_SAUDAVEL', 'CORRECAO_REAL', 'REVERSAO_CONFIRMADA'
+  ];
+  const _openUrl = _TIPOS_COM_HISTORICO.includes(tipo) ? '/?open=signals' : '/';
   await sendPushToWatchers(watchers, {
     title: titulo, body: corpo,
     tag: `${symbol}_${mode}_${tipo}_${sid}`,
@@ -1692,7 +1711,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     || dados.consolidated?.h4_timing;
   const _contexto = _t?._contexto || 'NONE';
   const _dirMaioria = _t?._direcaoMaioria || '--';
-  // ⭐ v2.31 — log RX com origem + limiar + pullback
   logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false} pullback=${dados.consolidated?.pullback_aplicado ?? false} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}`);
 
   const agora = Date.now();
@@ -1722,6 +1740,120 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     const timeoutModo = getTimeoutModo(trade.mode);
     const timeoutExtendModo = getTimeoutExtendModo(trade.mode);
     const emRespiracaoOuPullback = detectarRespiracaoOuPullback(dados, trade, percentualPercorrido);
+
+    // ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 2: anti-spam por timeframe
+    {
+      const PUSH_CTX_CONFIG = {
+        COOLDOWN_MIN: {
+          RESPIRACAO_SAUDAVEL: 12,
+          CORRECAO_REAL:      18,
+          REVERSAO_CONFIRMADA: 30
+        },
+        MAX_POR_TRADE: {
+          RESPIRACAO_SAUDAVEL: 4,
+          CORRECAO_REAL:      3,
+          REVERSAO_CONFIRMADA: 2
+        },
+        HYSTERESIS_CICLOS: 2
+      };
+
+      const _txt = (dados.consolidated.score_reasons || []).join(' ');
+
+      const _ehRespiracao =
+        /RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(_txt) ||
+        /pullback em curso|pullback saudável|correção saudável/i.test(_txt);
+      const _ehCorrecaoReal = /em correção real|em correcao real/i.test(_txt);
+      const _ehReversaoConf = /REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(_txt);
+
+      const _estadoAtual =
+        _ehReversaoConf ? 'REVERSAO' :
+        _ehCorrecaoReal ? 'CORRECAO' :
+        _ehRespiracao   ? 'RESPIRACAO' : null;
+
+      const _tipoPush =
+        _estadoAtual === 'REVERSAO'  ? 'REVERSAO_CONFIRMADA' :
+        _estadoAtual === 'CORRECAO'  ? 'CORRECAO_REAL' :
+        _estadoAtual === 'RESPIRACAO' ? 'RESPIRACAO_SAUDAVEL' : null;
+
+      if (!trade._ctxUltimoEnvio) trade._ctxUltimoEnvio = {};
+      if (!trade._ctxContagem)    trade._ctxContagem    = {};
+      if (trade._ctxCiclosSemEstado === undefined) trade._ctxCiclosSemEstado = 0;
+      if (trade._ctxEstado === undefined) trade._ctxEstado = null;
+
+      // Histerese: só reseta quando sai por N ciclos consecutivos
+      if (_estadoAtual === null) {
+        trade._ctxCiclosSemEstado++;
+        if (trade._ctxCiclosSemEstado >= PUSH_CTX_CONFIG.HYSTERESIS_CICLOS) {
+          trade._ctxEstado = null;
+        }
+      } else {
+        trade._ctxCiclosSemEstado = 0;
+      }
+
+      const _transicao = _estadoAtual !== null && trade._ctxEstado !== _estadoAtual;
+
+      if (_transicao) {
+        const _ultimo     = trade._ctxUltimoEnvio[_tipoPush] || 0;
+        const _contagem   = trade._ctxContagem[_tipoPush]    || 0;
+        const _cooldownMs = PUSH_CTX_CONFIG.COOLDOWN_MIN[_tipoPush] * 60 * 1000;
+        const _maxTrade   = PUSH_CTX_CONFIG.MAX_POR_TRADE[_tipoPush];
+        const _cooldownOk = (Date.now() - _ultimo) >= _cooldownMs;
+        const _limiteOk   = _contagem < _maxTrade;
+
+        if (_cooldownOk && _limiteOk) {
+          const _tfExtraido = (() => {
+            const m = _txt.match(/(RESPIRAÇÃO\s+(?:SIMPLES|DUPLA)[^|]{0,40}|M[0-9]+|H[0-9]+)/i);
+            return m ? m[1] : null;
+          })();
+
+          const _motivoCurto = (() => {
+            if (_ehReversaoConf) {
+              const m = _txt.match(/REVERS[ÃA]O CONFIRMADA[^|]*/i);
+              return m ? m[0].substring(0, 100) : 'reversão confirmada pelo motor';
+            }
+            if (_ehCorrecaoReal) {
+              const m = _txt.match(/em corre[çc][ãa]o real[^|]*/i);
+              return m ? m[0].substring(0, 100) : 'correção real detetada';
+            }
+            const m = _txt.match(/RESPIRAÇÃO\s+(?:SIMPLES|DUPLA)[^|]*/i)
+                   || _txt.match(/pullback[^|]*/i)
+                   || _txt.match(/corre[çc][ãa]o saud[áa]vel[^|]*/i);
+            return m ? m[0].substring(0, 100) : 'mercado a respirar';
+          })();
+
+          if (_estadoAtual === 'REVERSAO') {
+            await registrarEEnviarSinal(symbol, mode, 'REVERSAO_CONFIRMADA',
+              formatarMensagemReversaoConfirmada(trade, currentPrice, tempoDecorridoMin, _motivoCurto, _tfExtraido),
+              { score: dados.consolidated.score }, watchers, sid);
+            logger.info(`⚠️ [PUSH-CONTEXTO] ${symbol} (${mode}) → REVERSAO_CONFIRMADA (#${_contagem + 1})`);
+          }
+          else if (_estadoAtual === 'CORRECAO') {
+            await registrarEEnviarSinal(symbol, mode, 'CORRECAO_REAL',
+              formatarMensagemCorrecaoReal(trade, currentPrice, tempoDecorridoMin, _motivoCurto, _tfExtraido),
+              { score: dados.consolidated.score }, watchers, sid);
+            logger.info(`📊 [PUSH-CONTEXTO] ${symbol} (${mode}) → CORRECAO_REAL (#${_contagem + 1})`);
+          }
+          else if (_estadoAtual === 'RESPIRACAO') {
+            await registrarEEnviarSinal(symbol, mode, 'RESPIRACAO_SAUDAVEL',
+              formatarMensagemRespiracaoSaudavel(trade, currentPrice, tempoDecorridoMin, _motivoCurto, _tfExtraido),
+              { score: dados.consolidated.score }, watchers, sid);
+            logger.info(`🌬️ [PUSH-CONTEXTO] ${symbol} (${mode}) → RESPIRACAO_SAUDAVEL (#${_contagem + 1})`);
+          }
+
+          trade._ctxUltimoEnvio[_tipoPush] = Date.now();
+          trade._ctxContagem[_tipoPush]    = _contagem + 1;
+          trade._ctxEstado                 = _estadoAtual;
+        } else {
+          if (!_cooldownOk) {
+            const _faltaMin = Math.ceil((_cooldownMs - (Date.now() - _ultimo)) / 60000);
+            logger.debug(`⏳ [PUSH-CONTEXTO] ${symbol} (${mode}) ${_tipoPush} em cooldown (faltam ${_faltaMin}min)`);
+          } else {
+            logger.debug(`🚫 [PUSH-CONTEXTO] ${symbol} (${mode}) ${_tipoPush} limite por trade atingido (${_contagem}/${_maxTrade})`);
+          }
+        }
+      }
+    }
+
     const timeoutAtual = trade.timeoutAt || (trade.timestamp + timeoutModo);
     if (agora > timeoutAtual && emRespiracaoOuPullback && (trade.extensoesPullback || 0) < 3) {
       trade.timeoutAt = agora + timeoutExtendModo;
@@ -1873,6 +2005,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         return;
       }
 
+      // ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 3: flags iniciais
       const novoTrade = {
         symbol, mode, serverId: sid,
         signal: dados.consolidated.signal,
@@ -1890,7 +2023,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         timeoutAt: agora + getTimeoutModo(mode),
         extensoes: 0, percentualNoUltimoCheck: 0,
         peakPercentual: 0,
-        avisoPullbackDoPicoEnviado: false
+        avisoPullbackDoPicoEnviado: false,
+        // PATCH #PUSH-CONTEXTO v2
+        _ctxEstado: null,
+        _ctxUltimoEnvio: {},
+        _ctxContagem: {},
+        _ctxCiclosSemEstado: 0
       };
 
       tradesAbertos.set(tradeKey, novoTrade);
@@ -2354,7 +2492,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           matureMotivoBloqueio: consolidated.mature_motivo_bloqueio ?? null,
           pullbackEscalonado: consolidated.pullback_escalonado_detectado === true,
           trendStatePullbackScaling: consolidated.trendState_pullbackScaling === true,
-          // ⭐ v2.31 — expor origem do sinal no scan
           origem: consolidated._origemSinal || 'motor',
           limiarAplicado: consolidated.limiar_aplicado === true,
           pullbackAplicado: consolidated.pullback_aplicado === true,
@@ -2510,6 +2647,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.33: PUSH-CONTEXTO v2 (Respiração / Correção / Reversão) — anti-spam por timeframe.`);
   logger.info(`v2.32: Reconhecimento de autorizações do motor (FIX #DEM-TREND-EXPLOSIVO).`);
   logger.info(`v2.31: Reconhecimento da ORIGEM do sinal (motor / limiar / pullback).`);
   logger.info(`v2.30: Reconhecimento REVERSÃO CONFIRMADA + EXAUSTÃO MULTI-TF + validarPerdendoForca.`);
