@@ -1,7 +1,7 @@
 {
   "id": "/",
   "name": "Trader BOT Analyzer IA",
-  "short_name": "Trader BOT",
+  "short_name": "Trader BOT Signal",
   "description": "Análise de ativos, motor de sinais e notificações push em tempo real",
   "start_url": "/",
   "scope": "/",
