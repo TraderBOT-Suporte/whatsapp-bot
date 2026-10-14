@@ -12,11 +12,11 @@
 
 <div id="login-wrapper" class="login-wrapper"><div class="login-container"><div class="login-header"><div class="login-icon"><i class="ph-fill ph-lock-key"></i></div></div><div id="login-message" class="message"></div><form id="validationForm"><div class="input-group"><div class="input-field"><input type="password" id="tokenCode" placeholder="Insira o token gerado" required aria-label="Código de acesso"><div class="input-icon"><i class="ph-fill ph-key"></i></div></div></div><button type="submit" class="submit-btn" id="submitBtn">VALIDAR ACESSO</button></form><div class="features-grid"><div class="feature"><div class="feature-icon"><i class="ph-fill ph-shield-check"></i></div>Criptografia SSL</div><div class="feature"><div class="feature-icon"><i class="ph-fill ph-lightning"></i></div>Validação Instantânea</div><div class="feature"><div class="feature-icon"><i class="ph-fill ph-timer"></i></div>Token por Tempo</div></div></div></div>
 
-<button id="hamburger-btn" class="side-tab-btn" style="display:none" aria-label="Abrir menu"><i class="ph-fill ph-caret-right"></i></button>
+<button id="hamburger-btn" class="side-tab-btn" style="display:none" aria-label="Abrir menu" aria-controls="side-menu" aria-expanded="false"><i class="ph-fill ph-list"></i><span>Menu</span></button>
 <div id="clock" class="clock"></div>
 <div id="menu-overlay" class="menu-overlay"></div>
 
-<div id="side-menu" class="side-menu">
+<div id="side-menu" class="side-menu" role="dialog" aria-label="Menu principal" aria-hidden="true" inert>
 <div class="menu-header"><h3>TRADER BOT</h3><button class="close-menu-btn" id="close-menu-btn" aria-label="Fechar menu"><i class="ph-fill ph-x"></i></button></div>
 <div class="menu-content">
 <div class="menu-section"><div class="menu-section-title">Navegação</div><button class="menu-action-btn primary" onclick="goToMainView()"><i class="ph-fill ph-house"></i><span>Página Inicial</span></button><button class="menu-action-btn" onclick="openEngineModal()"><i class="ph-fill ph-gear-six"></i><span>Motor de Sinais</span></button><button class="menu-action-btn" onclick="openSignalsModal()"><i class="ph-fill ph-list-checks"></i><span>Painel de Sinais</span></button></div>
@@ -126,8 +126,8 @@ function renderServerSelect(){var wrap=document.getElementById('server-select-wr
 async function loadUserPlan(){if(_cache.userMe&&(Date.now()-_cache.userMeTs)<CACHE_TTL){var c=_cache.userMe;if(c.plano)currentPlan=c.plano;if(c.maxAtivosPorModo!=null)currentMaxAtivos=c.maxAtivosPorModo;updateManualPlanInfo();refreshScanPlanInfo();return;}try{var d=await apiMain('/api/user-me');_cache.userMe=d;_cache.userMeTs=Date.now();if(d.plano)currentPlan=d.plano;if(d.maxAtivosPorModo!=null)currentMaxAtivos=d.maxAtivosPorModo;updateManualPlanInfo();refreshScanPlanInfo();}catch(e){}}
 function updateManualPlanInfo(){var b=document.getElementById('manual-plan-limit');if(b&&currentPlan){b.textContent=currentMaxAtivos+' (plano '+currentPlan.nome+')';}}
 async function refreshScanPlanInfo(){if(!_cache.watchlist||(Date.now()-_cache.watchlistTs)>=CACHE_TTL){try{var wl=await apiMain('/api/engine-watchlist');_cache.watchlist=wl;_cache.watchlistTs=Date.now();}catch(e){}}if(_cache.watchlist&&_cache.watchlist.watchlist){['SNIPER','CAÇADOR','PESCADOR','BALEEIRO'].forEach(function(m){scanWatchlistCounts[m]=(_cache.watchlist.watchlist[m]||[]).length;});}var info=document.getElementById('scanPlanInfo');if(!info)return;var mode=scanModeSelect?scanModeSelect.getValue():'—';var ja=scanWatchlistCounts[mode]||0;var max=currentMaxAtivos>0?currentMaxAtivos:10;var nome=currentPlan?currentPlan.nome:'—';var srv=_serversList.find(function(x){return x.id===_getServerId();})||{name:'Servidor 1'};info.innerHTML='🌐 <strong style="color:var(--accent-light)">'+escapeHtml(srv.name)+'</strong> · 📋 Plano: <strong>'+escapeHtml(nome)+'</strong> · Limite: <strong>'+max+' por modo</strong> · Já tens <strong>'+ja+'</strong> em '+mode+' · Podes adicionar mais <strong>'+Math.max(0,max-ja)+'</strong>';}
-function openSideMenu(){document.getElementById('side-menu').classList.add('active');document.getElementById('menu-overlay').classList.add('active');document.body.style.overflow='hidden';updatePushButtonState();}
-function closeSideMenu(){document.getElementById('side-menu').classList.remove('active');document.getElementById('menu-overlay').classList.remove('active');document.body.style.overflow='';}
+function openSideMenu(){var menu=document.getElementById('side-menu');if(menu){menu.classList.add('active');menu.setAttribute('aria-hidden','false');menu.removeAttribute('inert');}var trigger=document.getElementById('hamburger-btn');if(trigger)trigger.setAttribute('aria-expanded','true');document.getElementById('menu-overlay').classList.add('active');document.body.style.overflow='hidden';updatePushButtonState();}
+function closeSideMenu(){var menu=document.getElementById('side-menu');if(menu){menu.classList.remove('active');menu.setAttribute('aria-hidden','true');menu.setAttribute('inert','');}var trigger=document.getElementById('hamburger-btn');if(trigger)trigger.setAttribute('aria-expanded','false');document.getElementById('menu-overlay').classList.remove('active');document.body.style.overflow='';}
 function closeAllModals(){document.querySelectorAll('.app-modal.active,.manual-modal.active').forEach(function(m){m.classList.remove('active');});_syncClockComModais();}
 function openManual(){closeAllModals();closeSideMenu();document.getElementById('manual-modal').classList.add('active');document.body.style.overflow='hidden';_syncClockComModais();}
 function closeManual(){document.getElementById('manual-modal').classList.remove('active');document.body.style.overflow='';_syncClockComModais();}
@@ -211,4 +211,29 @@ document.addEventListener('visibilitychange',_ajustarPolling);
 _ajustarPolling();
 if('serviceWorker' in navigator){navigator.serviceWorker.addEventListener('message',function(e){if(!e.data)return;if(e.data.action==='openSignals'){if(typeof window.openSignalsModal==='function')window.openSignalsModal();}if(e.data.action==='newSignal'){var sm=document.getElementById('signals-modal');if(sm&&sm.classList.contains('active')){if(typeof loadSignals==='function')loadSignals(true);}try{refreshStats();}catch(err){}try{_cache.engineConfigTs=0;_cache.watchlistTs=0;}catch(err){}}if(e.data.action==='pushSubscriptionChanged'){showToast('⚠️ Push invalidado pelo browser. Reativa em Notificações.','warning');try{updatePushButtonState();}catch(err){}}});}
 })();
-</script></body></html>
+</script><script>(function(){var style=document.createElement('style');style.id='lightweight-ui-refresh';style.textContent=`#hamburger-btn.side-tab-btn{position:fixed;top:calc(14px + env(safe-area-inset-top,0px));left:calc(14px + env(safe-area-inset-left,0px));transform:none;width:auto;min-width:54px;height:50px;padding:0 14px;gap:9px;border:1px solid var(--line-strong);border-radius:15px;background:var(--surface-solid);color:var(--t-1);box-shadow:0 6px 18px rgba(0,0,0,.18);transition:background-color .16s ease,border-color .16s ease,color .16s ease;z-index:510}
+#hamburger-btn.side-tab-btn i{font-size:19px;color:var(--accent);font-weight:400}
+#hamburger-btn.side-tab-btn span{font:700 10px/1 'Plus Jakarta Sans',system-ui,sans-serif;letter-spacing:.09em;text-transform:uppercase;color:var(--t-2)}
+#hamburger-btn.side-tab-btn:active{transform:scale(.97)}
+@media(hover:hover){#hamburger-btn.side-tab-btn:hover{background:var(--surface-2);border-color:var(--accent-border)}#hamburger-btn.side-tab-btn:hover span{color:var(--t-1)}}
+[data-theme="light"] #hamburger-btn.side-tab-btn{background:#fff;color:var(--t-1);box-shadow:0 5px 16px rgba(15,23,42,.10)}
+[data-theme="light"] #hamburger-btn.side-tab-btn span{color:var(--t-2)}
+.menu-overlay{background:rgba(5,10,20,.42);transition:opacity .18s ease,visibility .18s ease}
+.side-menu{width:min(88vw,360px);max-width:360px;height:100vh;height:100dvh;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);background:var(--bg-1);border-right:1px solid var(--line-strong);border-radius:0 22px 22px 0;box-shadow:12px 0 30px rgba(0,0,0,.20);transition:transform .23s cubic-bezier(.2,.7,.2,1)}
+[data-theme="light"] .side-menu{background:#f0f3f8;box-shadow:10px 0 26px rgba(15,23,42,.12)}
+.menu-header{padding:20px 20px 16px;background:transparent}
+.menu-content{padding:16px 16px 18px;scrollbar-width:thin;scrollbar-color:var(--line-strong) transparent}
+.menu-section{margin-bottom:18px}
+.menu-section-title{font-size:10px;letter-spacing:.12em;margin-bottom:9px}
+.menu-action-btn{min-height:48px;padding:11px 13px;border-radius:13px;background:var(--surface-2);border-color:var(--line);transition:background-color .16s ease,border-color .16s ease,color .16s ease}
+.menu-action-btn.primary{background:var(--accent-soft);border-color:var(--accent-border);color:var(--accent-light)}
+.menu-action-btn.danger{background:var(--rose-soft);border-color:var(--rose-border)}
+.close-menu-btn{width:40px;height:40px;transition:background-color .16s ease,border-color .16s ease,color .16s ease}
+.close-menu-btn:hover{transform:none}
+.menu-footer{background:transparent}
+.terminal-header,.signal-frame,.scan-form,.terminal-footer{box-shadow:var(--sh-1)}
+@media(max-width:380px){#hamburger-btn.side-tab-btn{min-width:50px;width:50px;padding:0;border-radius:15px}#hamburger-btn.side-tab-btn span{display:none}}
+@media(min-width:900px){#hamburger-btn.side-tab-btn{min-width:96px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+`;
+document.head.appendChild(style);})();</script></body></html>
