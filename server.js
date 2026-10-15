@@ -322,20 +322,11 @@ const tursoInitPromise = initializeTurso();
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
-let pushConfigured = false;
-
-if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
-  try {
-    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-    pushConfigured = true;
-    logger.info('Web Push configurado.');
-  } catch (err) {
-    logger.error('❌ Falha ao configurar Web Push:', err.message || String(err));
-    logger.error('   Push desativado — servidor continua a arrancar normalmente.');
-  }
-} else {
-  logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado.');
-}
+// Web Push/VAPID desativado durante a migração para OneSignal.
+// As credenciais antigas são mantidas apenas para compatibilidade temporária;
+// nenhum envio é habilitado enquanto ONESIGNAL_APP_ID não for configurado.
+const pushConfigured = false;
+logger.info('Web Push desativado — aguardando configuração do OneSignal.');
 
 const _subsCache = new Map();
 const SUBS_CACHE_TTL = 5 * 60 * 1000;
