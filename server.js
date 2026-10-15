@@ -1704,6 +1704,22 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const dados = await buscarSinalAnalise(symbol, mode, sid);
   if (!dados || !dados.success) return;
 
+  // O receptor nunca promove HOLD, prontidão ou análise refinada a entrada.
+  // Apenas o sinal consolidado explicitamente permitido pode gerar push de trade.
+  const consolidado = dados.consolidated || {};
+  const sinal = String(consolidado.signal || 'HOLD').toUpperCase();
+  const permitidoReal = consolidado._permitidoReal !== false &&
+    consolidado.permitido !== false &&
+    consolidado.m1_timing?._permitidoReal !== false &&
+    consolidado.m5_timing?._permitidoReal !== false;
+  const entradaConfirmada = sinal === 'CALL' || sinal === 'PUT';
+  const bloqueadoPorContexto = consolidado._contextoBloqueio || consolidado.risk_validation?.operavel === false;
+  const tradeJaAberto = tradesAbertos.has(buildTradeKey(sid, symbol, mode));
+  if ((!entradaConfirmada || !permitidoReal || bloqueadoPorContexto) && !tradeJaAberto) {
+    logger.info(`⏸️ [RX][${sid}] ${symbol} (${mode}) sem push de entrada: signal=${sinal} permitido=${permitidoReal} bloqueio=${Boolean(bloqueadoPorContexto)}`);
+    return;
+  }
+
   const _t = dados.consolidated?.m1_timing
     || dados.consolidated?.m5_timing
     || dados.consolidated?.m15_timing
