@@ -1,8 +1,0 @@
-[{
-      "relation": ["delegate_permission/common.handle_all_urls"],
-      "target": {
-        "namespace": "android_app",
-        "package_name": "com.traderbot.analyzer",
-        "sha256_cert_fingerprints": ["C5:41:E8:0E:7B:06:00:A5:06:15:80:30:67:73:78:DF:FA:92:06:8D:8D:0C:02:3F:2D:C7:02:B8:30:2B:B0:57"]
-      }
-    }]
