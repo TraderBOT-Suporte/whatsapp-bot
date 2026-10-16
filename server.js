@@ -1991,34 +1991,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     return;
   }
 
-  const consolidado = dados.consolidated || {};
-  const sinalOperacional = String(consolidado.signal || 'HOLD').toUpperCase();
-  const timingPermitido = ['m1_timing', 'm5_timing'].every((tf) => {
-    const timing = consolidado[tf];
-    return !timing || (timing.permitido !== false && timing._permitidoReal !== false);
-  });
-  const riscoOperavel = consolidado.risk_validation?.operavel !== false;
-  const permitidoReal = consolidado._permitidoReal !== false &&
-    consolidado.permitido !== false && timingPermitido && riscoOperavel;
-  const razoesBloqueio = Array.isArray(consolidado.score_reasons)
-    ? consolidado.score_reasons.join(' ')
-    : '';
-  const contextoBloqueado = /HOLD|AGUARDAR|exaust[aã]o|sobrecompra|sobrevenda|falsa?\s+(revers[aã]o|pullback)|pullback.*curso|respira[cç][aã]o|aguarda/i.test(
-    `${consolidado.primaryTrendNote || ''} ${razoesBloqueio}`
-  );
-
-  // O servidor push nunca promove prontidão, análise refinada ou score alto
-  // a entrada. Só o sinal consolidado explicitamente permitido abre trade.
-  if (sinalOperacional !== 'CALL' && sinalOperacional !== 'PUT') {
-    logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) sem entrada: signal=${sinalOperacional}`);
-    return;
-  }
-  if (!permitidoReal || contextoBloqueado) {
-    logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: permitido=${permitidoReal} contexto=${contextoBloqueado}`);
-    return;
-  }
-
-  if (sinalOperacional !== 'HOLD' && (consolidado.zona === 'A' || consolidado.zona === 'B')) {
+  if (dados.consolidated.signal !== 'HOLD' && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
 
