@@ -1,4 +1,8 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.34 — PUSH-DIAGNÓSTICO (sendPushToWatchers com logs detalhados + truncatura payload):
+//         · Log de início (📤), por watcher (·), por envio (✅ / ❌ com status)
+//         · Truncatura de payloads > 4000 bytes (limite do Chrome/Edge é 4096)
+//         · Mantém a limpeza automática de subscrições mortas (404/410)
 // v2.33 — PUSH-CONTEXTO v2 (Respiração / Correção Real / Reversão):
 //         · 3 avisos durante trade aberto com anti-spam por timeframe
 //         · Cooldown por tipo (12/18/30 min) + Limite por trade (4/3/2)
@@ -367,10 +371,33 @@ function invalidarCacheSubs(tokenHash) {
   else _subsCache.clear();
 }
 
+// ⭐ v2.34 — PUSH-DIAGNÓSTICO: logs detalhados + truncatura de payload
 async function sendPushToWatchers(watchers, payload) {
-  if (!pushConfigured || !tursoInitialized || !watchers || watchers.length === 0) return;
+  if (!pushConfigured) {
+    logger.warn('⚠️ [PUSH-SKIP] pushConfigured=false — nada enviado');
+    return;
+  }
+  if (!tursoInitialized) {
+    logger.warn('⚠️ [PUSH-SKIP] Turso indisponível — nada enviado');
+    return;
+  }
+  if (!watchers || watchers.length === 0) {
+    logger.warn('⚠️ [PUSH-SKIP] watchers vazio — nada enviado');
+    return;
+  }
+
+  logger.info(`📤 [PUSH] A enviar para ${watchers.length} watcher(s) | title="${payload.title?.slice(0,40)}"`);
+
   try {
-    const body = JSON.stringify(payload);
+    let body = JSON.stringify(payload);
+    if (body.length > 4000) {
+      logger.warn(`⚠️ [PUSH] payload ${body.length}b > 4000b — a truncar`);
+      if (payload.data && Array.isArray(payload.data.reasons)) {
+        payload.data.reasons = payload.data.reasons.slice(0, 5);
+      }
+      body = JSON.stringify(payload);
+    }
+
     const deletions = [];
 
     for (const tokenHash of watchers) {
@@ -378,22 +405,26 @@ async function sendPushToWatchers(watchers, payload) {
       try {
         subs = await _getSubsDeToken(tokenHash);
       } catch (err) {
-        logger.error(`Erro a obter subs de ${tokenHash.slice(0, 8)}:`, err.message);
+        logger.error(`❌ [PUSH] Erro a obter subs de ${tokenHash.slice(0, 8)}: ${err.message}`);
         continue;
       }
 
+      logger.info(`   · watcher ${tokenHash.slice(0, 8)} → ${subs.length} subscrição(ões)`);
+
       for (const sub of subs) {
-        if (!sub.data.subscription) continue;
+        if (!sub.data.subscription) {
+          logger.warn(`   ⚠️ subscrição vazia (id=${sub.id.slice(0, 20)})`);
+          continue;
+        }
         try {
           await webpush.sendNotification(sub.data.subscription, body);
+          logger.info(`   ✅ push OK (endpoint=${sub.data.subscription.endpoint.slice(0, 50)}...)`);
         } catch (err) {
+          logger.error(`   ❌ push falhou | status=${err.statusCode || '?'} | body=${err.body || err.message}`);
           if (err.statusCode === 404 || err.statusCode === 410) {
-            deletions.push(
-              db.execute({ sql: 'DELETE FROM push_subscriptions WHERE id = ?', args: [sub.id] })
-            );
+            logger.warn(`   🗑️ subscrição morta removida`);
+            deletions.push(db.execute({ sql: 'DELETE FROM push_subscriptions WHERE id = ?', args: [sub.id] }));
             _subsCache.delete(tokenHash);
-          } else {
-            logger.error('Erro push:', err.message);
           }
         }
       }
@@ -2301,6 +2332,7 @@ app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
       args: [docId, JSON.stringify(subscription), req.user.tokenHash, req.user.email || null, Date.now()]
     });
     invalidarCacheSubs(req.user.tokenHash);
+    logger.info(`✅ [PUSH-SUBSCRIBE] token=${req.user.tokenHash.slice(0,8)}... endpoint=${subscription.endpoint.slice(0,50)}...`);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -2318,10 +2350,22 @@ app.post('/api/push/unsubscribe', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/push/test', authMiddleware, async (req, res) => {
-  await sendPushToWatchers([req.user.tokenHash], {
-    title: '🔔 Teste', body: 'Notificações a funcionar corretamente!', tag: 'teste_' + Date.now()
-  });
-  res.json({ success: true });
+  if (!pushConfigured) {
+    logger.warn(`⚠️ [PUSH-TEST] push desativado — pedido de ${req.user.tokenHash.slice(0,8)}`);
+    return res.status(503).json({ success: false, error: 'Push não configurado no servidor' });
+  }
+  try {
+    await sendPushToWatchers([req.user.tokenHash], {
+      title: '🔔 Teste',
+      body: 'Notificações a funcionar corretamente!',
+      tag: 'teste_' + Date.now(),
+      data: { url: '/' }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    logger.error(`❌ [PUSH-TEST] falhou: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.get('/api/user-preferences', authMiddleware, async (req, res) => {
@@ -2657,6 +2701,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.34: PUSH-DIAGNÓSTICO (logs detalhados + truncatura payload).`);
   logger.info(`v2.33: PUSH-CONTEXTO v2 (Respiração / Correção / Reversão) — anti-spam por timeframe.`);
   logger.info(`v2.32: Reconhecimento de autorizações do motor (FIX #DEM-TREND-EXPLOSIVO).`);
   logger.info(`v2.31: Reconhecimento da ORIGEM do sinal (motor / limiar / pullback).`);
