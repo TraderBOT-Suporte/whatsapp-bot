@@ -322,11 +322,13 @@ const tursoInitPromise = initializeTurso();
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
-// Web Push/VAPID desativado durante a migração para OneSignal.
-// As credenciais antigas são mantidas apenas para compatibilidade temporária;
-// nenhum envio é habilitado enquanto ONESIGNAL_APP_ID não for configurado.
-const pushConfigured = false;
-logger.info('Web Push desativado — aguardando configuração do OneSignal.');
+// OneSignal Native Android/Median. As credenciais ficam apenas no Render.
+const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || '';
+const ONESIGNAL_REST_API_KEY = process.env.ONESIGNAL_REST_API_KEY || '';
+const pushConfigured = Boolean(ONESIGNAL_APP_ID && ONESIGNAL_REST_API_KEY);
+logger.info(pushConfigured
+  ? 'OneSignal configurado — Web Push/VAPID permanece desativado.'
+  : 'OneSignal não configurado — notificações desativadas.');
 
 const _subsCache = new Map();
 const SUBS_CACHE_TTL = 5 * 60 * 1000;
@@ -359,39 +361,38 @@ function invalidarCacheSubs(tokenHash) {
 }
 
 async function sendPushToWatchers(watchers, payload) {
-  if (!pushConfigured || !tursoInitialized || !watchers || watchers.length === 0) return;
+  if (!pushConfigured || !Array.isArray(watchers) || watchers.length === 0) return;
+
+  const externalIds = [...new Set(watchers.filter(value => typeof value === 'string' && value.length > 0))];
+  if (externalIds.length === 0) return;
+
   try {
-    const body = JSON.stringify(payload);
-    const deletions = [];
+    const response = await fetch('https://api.onesignal.com/notifications', {
+      method: 'POST',
+      headers: {
+        Authorization: `Key ${ONESIGNAL_REST_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        app_id: ONESIGNAL_APP_ID,
+        target_channel: 'push',
+        include_aliases: { external_id: externalIds },
+        headings: { en: String(payload.title || 'Trader BOT Signal') },
+        contents: { en: String(payload.body || '') },
+        data: payload.data || {},
+        url: payload.data?.url || '/',
+        collapse_id: payload.tag || undefined
+      })
+    });
 
-    for (const tokenHash of watchers) {
-      let subs;
-      try {
-        subs = await _getSubsDeToken(tokenHash);
-      } catch (err) {
-        logger.error(`Erro a obter subs de ${tokenHash.slice(0, 8)}:`, err.message);
-        continue;
-      }
-
-      for (const sub of subs) {
-        if (!sub.data.subscription) continue;
-        try {
-          await webpush.sendNotification(sub.data.subscription, body);
-        } catch (err) {
-          if (err.statusCode === 404 || err.statusCode === 410) {
-            deletions.push(
-              db.execute({ sql: 'DELETE FROM push_subscriptions WHERE id = ?', args: [sub.id] })
-            );
-            _subsCache.delete(tokenHash);
-          } else {
-            logger.error('Erro push:', err.message);
-          }
-        }
-      }
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      logger.error(`Erro OneSignal ${response.status}:`, result.errors || result);
+      return;
     }
-    if (deletions.length) await Promise.all(deletions);
+    logger.info(`OneSignal enviado: ${externalIds.length} destinatário(s), id=${result.id || 'n/a'}`);
   } catch (err) {
-    logger.error('sendPushToWatchers erro:', err.message);
+    logger.error('sendPushToWatchers OneSignal erro:', err.message);
   }
 }
 
