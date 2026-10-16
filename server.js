@@ -322,13 +322,20 @@ const tursoInitPromise = initializeTurso();
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@example.com';
-// OneSignal Native Android/Median. As credenciais ficam apenas no Render.
-const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || '';
-const ONESIGNAL_REST_API_KEY = process.env.ONESIGNAL_REST_API_KEY || '';
-const pushConfigured = Boolean(ONESIGNAL_APP_ID && ONESIGNAL_REST_API_KEY);
-logger.info(pushConfigured
-  ? 'OneSignal configurado — Web Push/VAPID permanece desativado.'
-  : 'OneSignal não configurado — notificações desativadas.');
+let pushConfigured = false;
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    pushConfigured = true;
+    logger.info('Web Push configurado.');
+  } catch (err) {
+    logger.error('❌ Falha ao configurar Web Push:', err.message || String(err));
+    logger.error('   Push desativado — servidor continua a arrancar normalmente.');
+  }
+} else {
+  logger.warn('VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configurados. Push desativado.');
+}
 
 const _subsCache = new Map();
 const SUBS_CACHE_TTL = 5 * 60 * 1000;
@@ -361,38 +368,39 @@ function invalidarCacheSubs(tokenHash) {
 }
 
 async function sendPushToWatchers(watchers, payload) {
-  if (!pushConfigured || !Array.isArray(watchers) || watchers.length === 0) return;
-
-  const externalIds = [...new Set(watchers.filter(value => typeof value === 'string' && value.length > 0))];
-  if (externalIds.length === 0) return;
-
+  if (!pushConfigured || !tursoInitialized || !watchers || watchers.length === 0) return;
   try {
-    const response = await fetch('https://api.onesignal.com/notifications', {
-      method: 'POST',
-      headers: {
-        Authorization: `Key ${ONESIGNAL_REST_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        app_id: ONESIGNAL_APP_ID,
-        target_channel: 'push',
-        include_aliases: { external_id: externalIds },
-        headings: { en: String(payload.title || 'Trader BOT Signal') },
-        contents: { en: String(payload.body || '') },
-        data: payload.data || {},
-        url: payload.data?.url || '/',
-        collapse_id: payload.tag || undefined
-      })
-    });
+    const body = JSON.stringify(payload);
+    const deletions = [];
 
-    const result = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      logger.error(`Erro OneSignal ${response.status}:`, result.errors || result);
-      return;
+    for (const tokenHash of watchers) {
+      let subs;
+      try {
+        subs = await _getSubsDeToken(tokenHash);
+      } catch (err) {
+        logger.error(`Erro a obter subs de ${tokenHash.slice(0, 8)}:`, err.message);
+        continue;
+      }
+
+      for (const sub of subs) {
+        if (!sub.data.subscription) continue;
+        try {
+          await webpush.sendNotification(sub.data.subscription, body);
+        } catch (err) {
+          if (err.statusCode === 404 || err.statusCode === 410) {
+            deletions.push(
+              db.execute({ sql: 'DELETE FROM push_subscriptions WHERE id = ?', args: [sub.id] })
+            );
+            _subsCache.delete(tokenHash);
+          } else {
+            logger.error('Erro push:', err.message);
+          }
+        }
+      }
     }
-    logger.info(`OneSignal enviado: ${externalIds.length} destinatário(s), id=${result.id || 'n/a'}`);
+    if (deletions.length) await Promise.all(deletions);
   } catch (err) {
-    logger.error('sendPushToWatchers OneSignal erro:', err.message);
+    logger.error('sendPushToWatchers erro:', err.message);
   }
 }
 
@@ -1696,22 +1704,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const dados = await buscarSinalAnalise(symbol, mode, sid);
   if (!dados || !dados.success) return;
 
-  // O receptor nunca promove HOLD, prontidão ou análise refinada a entrada.
-  // Apenas o sinal consolidado explicitamente permitido pode gerar push de trade.
-  const consolidado = dados.consolidated || {};
-  const sinal = String(consolidado.signal || 'HOLD').toUpperCase();
-  const permitidoReal = consolidado._permitidoReal !== false &&
-    consolidado.permitido !== false &&
-    consolidado.m1_timing?._permitidoReal !== false &&
-    consolidado.m5_timing?._permitidoReal !== false;
-  const entradaConfirmada = sinal === 'CALL' || sinal === 'PUT';
-  const bloqueadoPorContexto = consolidado._contextoBloqueio || consolidado.risk_validation?.operavel === false;
-  const tradeJaAberto = tradesAbertos.has(buildTradeKey(sid, symbol, mode));
-  if ((!entradaConfirmada || !permitidoReal || bloqueadoPorContexto) && !tradeJaAberto) {
-    logger.info(`⏸️ [RX][${sid}] ${symbol} (${mode}) sem push de entrada: signal=${sinal} permitido=${permitidoReal} bloqueio=${Boolean(bloqueadoPorContexto)}`);
-    return;
-  }
-
   const _t = dados.consolidated?.m1_timing
     || dados.consolidated?.m5_timing
     || dados.consolidated?.m15_timing
@@ -1999,7 +1991,34 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     return;
   }
 
-  if (dados.consolidated.signal !== 'HOLD' && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
+  const consolidado = dados.consolidated || {};
+  const sinalOperacional = String(consolidado.signal || 'HOLD').toUpperCase();
+  const timingPermitido = ['m1_timing', 'm5_timing'].every((tf) => {
+    const timing = consolidado[tf];
+    return !timing || (timing.permitido !== false && timing._permitidoReal !== false);
+  });
+  const riscoOperavel = consolidado.risk_validation?.operavel !== false;
+  const permitidoReal = consolidado._permitidoReal !== false &&
+    consolidado.permitido !== false && timingPermitido && riscoOperavel;
+  const razoesBloqueio = Array.isArray(consolidado.score_reasons)
+    ? consolidado.score_reasons.join(' ')
+    : '';
+  const contextoBloqueado = /HOLD|AGUARDAR|exaust[aã]o|sobrecompra|sobrevenda|falsa?\s+(revers[aã]o|pullback)|pullback.*curso|respira[cç][aã]o|aguarda/i.test(
+    `${consolidado.primaryTrendNote || ''} ${razoesBloqueio}`
+  );
+
+  // O servidor push nunca promove prontidão, análise refinada ou score alto
+  // a entrada. Só o sinal consolidado explicitamente permitido abre trade.
+  if (sinalOperacional !== 'CALL' && sinalOperacional !== 'PUT') {
+    logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) sem entrada: signal=${sinalOperacional}`);
+    return;
+  }
+  if (!permitidoReal || contextoBloqueado) {
+    logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: permitido=${permitidoReal} contexto=${contextoBloqueado}`);
+    return;
+  }
+
+  if (sinalOperacional !== 'HOLD' && (consolidado.zona === 'A' || consolidado.zona === 'B')) {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
 
