@@ -1991,7 +1991,17 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     return;
   }
 
-  if (dados.consolidated.signal !== 'HOLD' && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
+  const consolidadoPush = dados.consolidated || {};
+  const sinalPush = String(consolidadoPush.signal || 'HOLD').toUpperCase();
+  const permitidoPush = consolidadoPush.permitido !== false &&
+    consolidadoPush._permitidoReal !== false &&
+    consolidadoPush.risk_validation?.operavel !== false;
+  if ((sinalPush === 'HOLD' || !permitidoPush) && !tradesAbertos.has(tradeKey)) {
+    logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: signal=${sinalPush} permitido=${permitidoPush}`);
+    return;
+  }
+
+  if (sinalPush !== 'HOLD' && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
 
