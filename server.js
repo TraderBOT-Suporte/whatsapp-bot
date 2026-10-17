@@ -1,4 +1,12 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.35 — LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR):
+//         · Exposição de limiar_tendencia (modo, _rejeitadoEm, motivo, score, direcao)
+//         · Novos campos no /api/scan-group: limiarModo, limiarBloqueadoPor,
+//           limiarScoreOriginal, limiarRejeitadoEm, limiarMotivoRejeicao
+//         · diagnosticoProximidade reconhece "LIMIAR foi aplicado mas ANULADO por exaustão"
+//         · avaliarEsticamento classifica como ALTO quando LIMIAR tentou e foi bloqueado
+//         · extrairDirecaoPrep usa LIMIAR como fallback de direção (DIRECT/REJECTED)
+//         · RX log mostra limiar=(bloq:FIX_81 score=70) limiarModo=DIRECT
 // v2.34 — PUSH-DIAGNÓSTICO (sendPushToWatchers com logs detalhados + truncatura payload):
 //         · Log de início (📤), por watcher (·), por envio (✅ / ❌ com status)
 //         · Truncatura de payloads > 4000 bytes (limite do Chrome/Edge é 4096)
@@ -978,7 +986,6 @@ async function loadStateFromTurso() {
       if (!t.timeoutAt) t.timeoutAt = timestampTrade + timeoutModo;
       if (t.peakPercentual === undefined) t.peakPercentual = 0;
       if (t.avisoPullbackDoPicoEnviado === undefined) t.avisoPullbackDoPicoEnviado = false;
-      // ⭐ PATCH #PUSH-CONTEXTO v2 — restaurar estado persistido
       if (t._ctxEstado === undefined) t._ctxEstado = null;
       if (!t._ctxUltimoEnvio) t._ctxUltimoEnvio = {};
       if (!t._ctxContagem) t._ctxContagem = {};
@@ -1045,6 +1052,7 @@ async function loadStateFromTurso() {
 // ========== HELPERS ==========
 
 /**
+ * ⭐ v2.35 — extrairDirecaoPrep usa LIMIAR como fallback de direção
  * ⭐ v2.32 — extrairDirecaoPrep com reconhecimento de REVERSAO-A-FAVOR
  * ⭐ v2.31 — extrairDirecaoPrep com reconhecimento de PULLBACK RESUM
  */
@@ -1112,6 +1120,21 @@ function extrairDirecaoPrep(dados) {
     if (dir === 'CALL' || dir === 'PUT') return dir;
   }
 
+  // ⭐ v2.35 — LIMIAR-DIAG: fallback de direção tentada pelo LIMIAR
+  // Só chega aqui quando as camadas acima NÃO deram direção.
+  // Aceita modo DIRECT (bloqueado por FIX #81) ou REJECTED (rejeitado internamente).
+  // NÃO força entrada — o bloqueio é tratado por diagnosticoProximidade(BLOQUEADO)
+  // e pelo score threshold no PRONTIDAO.
+  const limiarTend = dados.consolidated?.limiar_tendencia;
+  if (limiarTend
+      && (limiarTend.modo === 'DIRECT' || limiarTend.modo === 'REJECTED')
+      && (limiarTend.direcao === 'CALL' || limiarTend.direcao === 'PUT')) {
+    const bloqueadoresContra = /RESPIRAÇÃO\s+(SIMPLES|DUPLA)|REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA|EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF|MACRO AUTHORITY SUAVIZADA/i;
+    if (!bloqueadoresContra.test(reasonsTexto)) {
+      return limiarTend.direcao;
+    }
+  }
+
   return null;
 }
 
@@ -1120,6 +1143,13 @@ function diagnosticoProximidade(reasons) {
 
   if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'reversão confirmada — aguarda cruzamento do MACD' };
+  }
+  // ⭐ v2.35 — LIMIAR-DIAG: "LIMIAR foi aplicado mas ANULADO por exaustão"
+  if (/🛡️ LIMIAR foi aplicado.*ANULADO por exaustão/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'LIMIAR tentou entrar mas exaustão multi-TF bloqueou — aguarda respirar' };
+  }
+  if (/🛡️ PULLBACK-RESUM foi aplicado.*ANULADO por exaustão/i.test(texto)) {
+    return { nivel: 'BLOQUEADO', detalhe: 'PULLBACK-RESUM tentou entrar mas exaustão multi-TF bloqueou' };
   }
   if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'exaustão multi-TF — mercado esticado, aguarda correção' };
@@ -1269,6 +1299,22 @@ function avaliarEsticamento(reasons) {
       motivo: motorAutorizouPorLock
         ? 'DeMarker em lock a favor da tendência (autorizado pelo motor)'
         : 'ADX explosivo — sobrecompra é continuação (autorizado pelo motor)'
+    };
+  }
+
+  // ⭐ v2.35 — LIMIAR-DIAG: LIMIAR anulado por exaustão → estado ALTO
+  if (/🛡️ LIMIAR foi aplicado.*ANULADO por exaustão/i.test(texto)) {
+    return {
+      esticado: true,
+      nivel: 'ALTO',
+      motivo: 'LIMIAR tentou entrar mas exaustão multi-TF bloqueou'
+    };
+  }
+  if (/🛡️ PULLBACK-RESUM foi aplicado.*ANULADO por exaustão/i.test(texto)) {
+    return {
+      esticado: true,
+      nivel: 'ALTO',
+      motivo: 'PULLBACK-RESUM tentou entrar mas exaustão multi-TF bloqueou'
     };
   }
 
@@ -1674,7 +1720,6 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
     } catch (err) { logger.error('Erro ao gravar sinal:', err.message); }
   }
 
-  // ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 5: tipos novos abrem no histórico
   const _TIPOS_COM_HISTORICO = [
     'SINAL_CONFIRMADO', 'PRONTIDAO', 'ARREFECIMENTO', 'EXAUSTAO',
     'RESPIRACAO_SAUDAVEL', 'CORRECAO_REAL', 'REVERSAO_CONFIRMADA'
@@ -1742,7 +1787,20 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     || dados.consolidated?.h4_timing;
   const _contexto = _t?._contexto || 'NONE';
   const _dirMaioria = _t?._direcaoMaioria || '--';
-  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false} pullback=${dados.consolidated?.pullback_aplicado ?? false} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}`);
+
+  // ⭐ v2.35 — LIMIAR-DIAG: expor rejeições e bloqueios do LIMIAR no RX log
+  const _limiarModo       = dados.consolidated?.limiar_tendencia?.modo || 'NONE';
+  const _limiarRejeitado  = dados.consolidated?.limiar_tendencia?._rejeitadoEm || null;
+  const _limiarBloqPor    = dados.consolidated?.limiar_bloqueado_por || null;
+  const _limiarScoreOrig  = dados.consolidated?.limiar_score_original ?? null;
+  const _pullbackBloqPor  = dados.consolidated?.pullback_bloqueado_por || null;
+  const _limiarBloqTxt = _limiarBloqPor
+    ? `(bloq:${_limiarBloqPor}${_limiarScoreOrig != null ? ' score=' + _limiarScoreOrig : ''})`
+    : '';
+  const _limiarRejTxt = _limiarRejeitado ? `(rej:${_limiarRejeitado})` : '';
+  const _pullbackBloqTxt = _pullbackBloqPor ? `(bloq:${_pullbackBloqPor})` : '';
+
+  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false}${_limiarBloqTxt} limiarModo=${_limiarModo}${_limiarRejTxt} pullback=${dados.consolidated?.pullback_aplicado ?? false}${_pullbackBloqTxt} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}`);
 
   const agora = Date.now();
   const currentPrice = dados.consolidated.price;
@@ -1811,7 +1869,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       if (trade._ctxCiclosSemEstado === undefined) trade._ctxCiclosSemEstado = 0;
       if (trade._ctxEstado === undefined) trade._ctxEstado = null;
 
-      // Histerese: só reseta quando sai por N ciclos consecutivos
       if (_estadoAtual === null) {
         trade._ctxCiclosSemEstado++;
         if (trade._ctxCiclosSemEstado >= PUSH_CTX_CONFIG.HYSTERESIS_CICLOS) {
@@ -2046,7 +2103,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         return;
       }
 
-      // ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 3: flags iniciais
       const novoTrade = {
         symbol, mode, serverId: sid,
         signal: dados.consolidated.signal,
@@ -2065,7 +2121,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         extensoes: 0, percentualNoUltimoCheck: 0,
         peakPercentual: 0,
         avisoPullbackDoPicoEnviado: false,
-        // PATCH #PUSH-CONTEXTO v2
         _ctxEstado: null,
         _ctxUltimoEnvio: {},
         _ctxContagem: {},
@@ -2534,7 +2589,28 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
 
         const proximidade = diagnosticoProximidade(consolidated.score_reasons);
 
-        logger.info(`🔍 [SCAN][${sid}] ${symbol} (${mode}) → signal=${signal} zona=${zona} score=${score} readiness=${consolidated.readiness_score ?? '--'} mature=${consolidated.mature_aprovado ?? '--'} proximidade=${proximidade.nivel}`);
+        // ⭐ v2.35 — LIMIAR-DIAG: expor diagnóstico completo do LIMIAR
+        const limiarInfo = consolidated.limiar_tendencia || null;
+        const limiarModo = limiarInfo?.modo || 'NONE';
+        const limiarAplicadoReal = consolidated.limiar_aplicado === true;
+        const limiarBloqueadoPor = consolidated.limiar_bloqueado_por || null;
+        const limiarScoreOriginal = consolidated.limiar_score_original ?? null;
+        const limiarRejeitadoEm = limiarInfo?.modo === 'REJECTED' ? (limiarInfo._rejeitadoEm || null) : null;
+        const limiarMotivoRejeicao = limiarInfo?.modo === 'REJECTED' ? (limiarInfo.motivo || null) : null;
+        const limiarScore = limiarInfo?.score ?? null;
+        const limiarDirecao = limiarInfo?.direcao ?? null;
+
+        const pullbackBloqueadoPor = consolidated.pullback_bloqueado_por || null;
+
+        let mensagemProntidaoEnriquecida = mensagemProntidao;
+        if (!limiarAplicadoReal && limiarBloqueadoPor === 'FIX_81' && limiarScoreOriginal != null) {
+          mensagemProntidaoEnriquecida = `🚀 LIMIAR ${limiarDirecao || ''} score ${limiarScoreOriginal} TENTOU ENTRAR, mas foi ANULADO por exaustão multi-TF`;
+        } else if (limiarModo === 'REJECTED' && limiarRejeitadoEm) {
+          const motivo = (limiarMotivoRejeicao || '').substring(0, 80);
+          mensagemProntidaoEnriquecida = `🔍 LIMIAR ${limiarDirecao || ''} rejeitado [${limiarRejeitadoEm}]${motivo ? ': ' + motivo : ''}`;
+        }
+
+        logger.info(`🔍 [SCAN][${sid}] ${symbol} (${mode}) → signal=${signal} zona=${zona} score=${score} readiness=${consolidated.readiness_score ?? '--'} mature=${consolidated.mature_aprovado ?? '--'} proximidade=${proximidade.nivel} limiarModo=${limiarModo}${limiarBloqueadoPor ? ' bloq:'+limiarBloqueadoPor : ''}${limiarRejeitadoEm ? ' rej:'+limiarRejeitadoEm : ''}`);
 
         return {
           symbol, name: getFriendlyName(symbol),
@@ -2547,11 +2623,23 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           pullbackEscalonado: consolidated.pullback_escalonado_detectado === true,
           trendStatePullbackScaling: consolidated.trendState_pullbackScaling === true,
           origem: consolidated._origemSinal || 'motor',
-          limiarAplicado: consolidated.limiar_aplicado === true,
+
+          // ⭐ v2.35 — LIMIAR-DIAG: campos adicionais
+          limiarAplicado: limiarAplicadoReal,
+          limiarModo,
+          limiarBloqueadoPor,
+          limiarScoreOriginal,
+          limiarRejeitadoEm,
+          limiarMotivoRejeicao,
+          limiarScore,
+          limiarDirecao,
+
           pullbackAplicado: consolidated.pullback_aplicado === true,
+          pullbackBloqueadoPor,
+
           proximidade,
           esticamento: estic,
-          mensagemProntidao,
+          mensagemProntidao: mensagemProntidaoEnriquecida,
           distanciaZonaB: distZonaB,
           distanciaZonaA: distZonaA,
           reasons: (consolidated.score_reasons || []).slice(0, 4)
@@ -2701,6 +2789,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.35: LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR).`);
   logger.info(`v2.34: PUSH-DIAGNÓSTICO (logs detalhados + truncatura payload).`);
   logger.info(`v2.33: PUSH-CONTEXTO v2 (Respiração / Correção / Reversão) — anti-spam por timeframe.`);
   logger.info(`v2.32: Reconhecimento de autorizações do motor (FIX #DEM-TREND-EXPLOSIVO).`);
