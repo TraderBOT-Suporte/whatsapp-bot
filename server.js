@@ -1,4 +1,22 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.36 — PUSH-DIAG-FIX + CONFIRM-FRESHNESS (retificações críticas):
+//         · FIX #PUSH-HOLD-NEVER-FIRED (v1) — guard `sinalPush === 'HOLD'`
+//           removido do early-return; PRONTIDAO e ARREFECIMENTO deixam de
+//           ser código morto. Só bloqueia com `!permitidoPush`.
+//         · FIX #PUSH-ARREFECIMENTO-DEAD (v1) — branch inalcançável
+//           removido; lógica de arrefecimento movida para dentro do
+//           `else if (signal === 'HOLD')` principal, disparando quando a
+//           prontidão cai fora da Zona B por N ciclos.
+//         · PATCH #PANEL-CONFIRM-FRESHNESS (v1) — reconhecer nos
+//           `score_reasons` o bloqueio "M15 exausto (score X/30)" do novo
+//           CONFIRM-FRESHNESS em analyze-handler.js. Classifica como
+//           BLOQUEADO em diagnosticoProximidade + ALTO em avaliarEsticamento.
+//         · PATCH #PANEL-EFF-DIRECTION (v1) — `extrairDirecaoPrep` passa a
+//           usar `consolidated.effectiveDirection` como fallback primário
+//           estruturado (antes do parsing de strings e do LIMIAR fallback).
+//         · PATCH #PANEL-GUARDS-DISCORDANTES (v1) — RX log expõe
+//           `consolidated.guards_discordantes`; log WARN quando o motor
+//           emite sinal mas os guards internos discordam.
 // v2.35 — LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR):
 //         · Exposição de limiar_tendencia (modo, _rejeitadoEm, motivo, score, direcao)
 //         · Novos campos no /api/scan-group: limiarModo, limiarBloqueadoPor,
@@ -1052,6 +1070,7 @@ async function loadStateFromTurso() {
 // ========== HELPERS ==========
 
 /**
+ * ⭐ v2.36 — extrairDirecaoPrep usa `effectiveDirection` como fallback primário
  * ⭐ v2.35 — extrairDirecaoPrep usa LIMIAR como fallback de direção
  * ⭐ v2.32 — extrairDirecaoPrep com reconhecimento de REVERSAO-A-FAVOR
  * ⭐ v2.31 — extrairDirecaoPrep com reconhecimento de PULLBACK RESUM
@@ -1120,6 +1139,16 @@ function extrairDirecaoPrep(dados) {
     if (dir === 'CALL' || dir === 'PUT') return dir;
   }
 
+  // ⭐ v2.36 — PATCH #PANEL-EFF-DIRECTION (v1)
+  // Usar `effectiveDirection` do servidor de análise como fallback primário
+  // estruturado (antes do parsing de strings e do LIMIAR fallback). O campo
+  // existe desde o FIX #EFFECTIVE-DIRECTION em analyze-handler.js.
+  const _effDir = dados.consolidated?.effectiveDirection;
+  const _effSrc = dados.consolidated?.effectiveDirectionSource;
+  if ((_effDir === 'CALL' || _effDir === 'PUT') && _effSrc !== 'none') {
+    return _effDir;
+  }
+
   // ⭐ v2.35 — LIMIAR-DIAG: fallback de direção tentada pelo LIMIAR
   // Só chega aqui quando as camadas acima NÃO deram direção.
   // Aceita modo DIRECT (bloqueado por FIX #81) ou REJECTED (rejeitado internamente).
@@ -1153,6 +1182,20 @@ function diagnosticoProximidade(reasons) {
   }
   if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'exaustão multi-TF — mercado esticado, aguarda correção' };
+  }
+  // ⭐ v2.36 — PATCH #PANEL-CONFIRM-FRESHNESS (v1)
+  // Reconhecer o gate novo do analyze-handler. Quando o M15/H1/H24/W1
+  // (confirmTF) está exausto (hist a cair ≥15%, DeM extremo, RSI extremo,
+  // score ≥ 30) o motor força NEUTRAL com a razão explícita.
+  if (/⏸️\s*\S+\s+exausto\s+\(score \d+\/\d+\)/i.test(texto)) {
+    const m = texto.match(/⏸️\s*(\S+)\s+exausto\s+\(score (\d+)\/(\d+)\)/i);
+    const tf = m ? m[1] : 'TF';
+    const sc = m ? m[2] : '--';
+    const th = m ? m[3] : '--';
+    return {
+      nivel: 'BLOQUEADO',
+      detalhe: `confirm ${tf} exausto (${sc}/${th}) — aguarda recuperar momentum`
+    };
   }
   if (/em correção real|em correcao real/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'pullback a terminar — motor cede, aguarda alinhamento' };
@@ -1279,6 +1322,16 @@ function avaliarEsticamento(reasons) {
   const motorAutorizouPorLock =
     /✅ DeMarker lock trend_lock_(alta|baixa) a favor do/i.test(texto);
 
+  // ⭐ v2.36 — PATCH #PANEL-CONFIRM-FRESHNESS (v1) — ver diagnosticoProximidade
+  if (/⏸️\s*\S+\s+exausto\s+\(score \d+\/\d+\)/i.test(texto)) {
+    const m = texto.match(/⏸️\s*(\S+)\s+exausto\s+\(score (\d+)\/(\d+)\)/i);
+    const tf = m ? m[1] : 'TF';
+    return {
+      esticado: true,
+      nivel: 'ALTO',
+      motivo: `Confirm ${tf} exausto (CONFIRM-FRESHNESS)`
+    };
+  }
   if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(texto)) {
     const match = texto.match(/RESPIRAÇÃO\s+(SIMPLES|DUPLA)/i);
     const tipo = match ? match[1] : 'SIMPLES';
@@ -1800,7 +1853,22 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const _limiarRejTxt = _limiarRejeitado ? `(rej:${_limiarRejeitado})` : '';
   const _pullbackBloqTxt = _pullbackBloqPor ? `(bloq:${_pullbackBloqPor})` : '';
 
-  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false}${_limiarBloqTxt} limiarModo=${_limiarModo}${_limiarRejTxt} pullback=${dados.consolidated?.pullback_aplicado ?? false}${_pullbackBloqTxt} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}`);
+  // ⭐ v2.36 — PATCH #PANEL-GUARDS-DISCORDANTES (v1)
+  // Expor guards que discordam do sinal. Quando o motor emite CALL mas
+  // m1Timing/refined discordam, isto é um red flag. Antes ignorava-se.
+  const _guardsDisc = dados.consolidated?.guards_discordantes;
+  const _guardsDiscAtivos = _guardsDisc
+    ? Object.entries(_guardsDisc).filter(([_, v]) => v === true).map(([k]) => k)
+    : [];
+  const _guardsDiscTxt = _guardsDiscAtivos.length > 0
+    ? ` guardsDisc=[${_guardsDiscAtivos.join(',')}]`
+    : '';
+
+  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false}${_limiarBloqTxt} limiarModo=${_limiarModo}${_limiarRejTxt} pullback=${dados.consolidated?.pullback_aplicado ?? false}${_pullbackBloqTxt} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}${_guardsDiscTxt}`);
+
+  if (_guardsDiscAtivos.length > 0) {
+    logger.warn(`⚠️ [GUARDS-DISCORDANTES][${sid}] ${symbol} (${mode}) → motor diz ${dados.consolidated?.signal} mas guards contra: ${_guardsDiscAtivos.join(', ')}`);
+  }
 
   const agora = Date.now();
   const currentPrice = dados.consolidated.price;
@@ -2084,8 +2152,14 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const permitidoPush = consolidadoPush.permitido !== false &&
     consolidadoPush._permitidoReal !== false &&
     consolidadoPush.risk_validation?.operavel !== false;
-  if ((sinalPush === 'HOLD' || !permitidoPush) && !tradesAbertos.has(tradeKey)) {
-    logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: signal=${sinalPush} permitido=${permitidoPush}`);
+
+  // ⭐ v2.36 — FIX #PUSH-HOLD-NEVER-FIRED (v1)
+  // Condição anterior incluía `sinalPush === 'HOLD'`, o que retornava sempre
+  // em HOLD, tornando PRONTIDAO e ARREFECIMENTO código morto. Agora só
+  // retorna se `!permitidoPush` (risco genuíno). O sinal HOLD segue para o
+  // bloco de prontidão mais abaixo.
+  if (!permitidoPush && !tradesAbertos.has(tradeKey)) {
+    logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: permitido=false`);
     return;
   }
 
@@ -2163,6 +2237,42 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       ?? 0
     );
     const scoreAtualNum = Number(scoreAtual) || 0;
+
+    // ⭐ v2.36 — FIX #PUSH-ARREFECIMENTO-DEAD (v1)
+    // Verificar arrefecimento ANTES de qualquer outra lógica. Se uma
+    // prontidão estava ativa e o score caiu/ficou em C durante N ciclos,
+    // enviar notificação "😴 Prontidão encerrada" e limpar estado.
+    if (prontidaoAtiva.has(tradeKey)) {
+      const cfgArr = getProntidaoConfig(mode);
+      const zonaAtual = dados.consolidated.zona;
+      const scoreMinArr = getScoreProntidaoMin(mode);
+      const saiuDeProntidao = (zonaAtual === 'C' && scoreAtualNum < scoreMinArr);
+
+      if (saiuDeProntidao) {
+        const fora = (prontidaoForaContagem.get(tradeKey) || 0) + 1;
+        prontidaoForaContagem.set(tradeKey, fora);
+
+        if (fora >= cfgArr.ciclosForaParaArrefecer) {
+          const ultimoArref = arrefecimentoUltimoEnvio.get(tradeKey) || 0;
+          if ((agora - ultimoArref) >= cfgArr.cooldownMs) {
+            await registrarEEnviarSinal(symbol, mode, 'ARREFECIMENTO',
+              formatarMensagemArrefecimento(symbol, dados.consolidated.score, dados),
+              { score: dados.consolidated.score }, watchers, sid);
+            arrefecimentoUltimoEnvio.set(tradeKey, agora);
+            logger.info(`😴 [ARREFECIMENTO][${sid}] ${symbol} (${mode}) saiu de prontidão após ${fora} ciclos`);
+          }
+          prontidaoAtiva.delete(tradeKey);
+          prontidaoHistorico.delete(tradeKey);
+          prontidaoForaContagem.delete(tradeKey);
+          prontidaoUltimoScoreEnviado.delete(tradeKey);
+          removePersistedProntidao(tradeKey);
+          return;
+        }
+      } else {
+        prontidaoForaContagem.delete(tradeKey);
+      }
+    }
+
     const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
     if (regimeAtualPush === 'CHOP') {
       logger.info(`🔇 [FIX #60][${sid}] PRONTIDAO ignorada em CHOP: ${symbol} (${mode})`);
@@ -2283,25 +2393,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       logger.info(`⏭️ [PRONTIDAO-COOLDOWN][${sid}] ${symbol} (${mode}) score ${scoreAtualNum} vs último ${ultimoScoreEnviado} — delta < ${cfg.scoreDeltaMin}`);
     }
   }
-  else if (dados.consolidated.signal === 'HOLD' && prontidaoAtiva.has(tradeKey)) {
-    const cfg = getProntidaoConfig(mode);
-    const fora = (prontidaoForaContagem.get(tradeKey) || 0) + 1;
-    prontidaoForaContagem.set(tradeKey, fora);
-    if (fora >= cfg.ciclosForaParaArrefecer) {
-      const ultimoArref = arrefecimentoUltimoEnvio.get(tradeKey) || 0;
-      if ((agora - ultimoArref) >= cfg.cooldownMs) {
-        await registrarEEnviarSinal(symbol, mode, 'ARREFECIMENTO',
-          formatarMensagemArrefecimento(symbol, dados.consolidated.score, dados),
-          { score: dados.consolidated.score }, watchers, sid);
-        arrefecimentoUltimoEnvio.set(tradeKey, agora);
-      }
-      prontidaoAtiva.delete(tradeKey);
-      prontidaoHistorico.delete(tradeKey);
-      prontidaoForaContagem.delete(tradeKey);
-      prontidaoUltimoScoreEnviado.delete(tradeKey);
-      removePersistedProntidao(tradeKey);
-    }
-  }
+  // ⭐ v2.36 — FIX #PUSH-ARREFECIMENTO-DEAD (v1) — branch anterior removido
+  // (era inalcançável: o `else if (signal === 'HOLD')` acima já apanha todos
+  // os HOLD). A lógica de arrefecimento vive agora dentro desse branch.
 }
 
 // ========== CRON ==========
@@ -2789,6 +2883,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.36: PUSH-DIAG-FIX + CONFIRM-FRESHNESS (retificações críticas).`);
   logger.info(`v2.35: LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR).`);
   logger.info(`v2.34: PUSH-DIAGNÓSTICO (logs detalhados + truncatura payload).`);
   logger.info(`v2.33: PUSH-CONTEXTO v2 (Respiração / Correção / Reversão) — anti-spam por timeframe.`);
