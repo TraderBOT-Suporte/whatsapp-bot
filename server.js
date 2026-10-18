@@ -1,45 +1,35 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.37 — PANEL-DIAG-AUTHORITY (painel confia no diagnóstico do motor):
+//         · PATCH #PANEL-DIAG-AUTHORITY (v1) — 7 alterações:
+//           1) extrairDirecaoPrep() usa `diagnostico_mercado` como fonte primária
+//              estruturada. NÃO infere direção quando o motor diz "sem direção"
+//              (TENDENCIA_FRACA / INDEFINIDO), nem em topo/fundo local, nem em
+//              respiração, nem em reversão. Só prepara direção quando o motor
+//              autoriza (PULLBACK_EM_CURSO / TENDENCIA_FORTE_ALINHADA /
+//              acao_recomendada não bloqueante).
+//           2) diagnosticoProximidade(reasons, diag) mapeia estado → proximidade
+//              estruturado: TOPO_LOCAL_ALTA→PERTO, TENDENCIA_FRACA→LONGE,
+//              PULLBACK_EM_CURSO→PERTO, REVERSAO_*→LONGE, etc.
+//           3) avaliarEsticamento(reasons, diag) trata TOPO/FUNDO LOCAL como
+//              esticamento ALTO (com motivo estruturado do motor).
+//           4) Todos os call-sites passam `consolidated.diagnostico_mercado`.
+//           5) PRONTIDAO respeita `acao_recomendada`: NAO_ENTRAR_* /
+//              AGUARDAR_ALINHAMENTO / AGUARDAR_DEFINICAO → não emite push.
+//           6) `diagnosticoMercado` propagado nos `detalhes` do push (SINAL +
+//              PRONTIDAO) e no payload do /api/scan-group.
+//           7) scan-group usa `acao_recomendada` em `mensagemProntidao`.
+//         · Sem mudanças em motor de análise, Turso, Web Push, VAPID.
 // v2.36 — PUSH-DIAG-FIX + CONFIRM-FRESHNESS (retificações críticas):
-//         · FIX #PUSH-HOLD-NEVER-FIRED (v1) — guard `sinalPush === 'HOLD'`
-//           removido do early-return; PRONTIDAO e ARREFECIMENTO deixam de
-//           ser código morto. Só bloqueia com `!permitidoPush`.
-//         · FIX #PUSH-ARREFECIMENTO-DEAD (v1) — branch inalcançável
-//           removido; lógica de arrefecimento movida para dentro do
-//           `else if (signal === 'HOLD')` principal, disparando quando a
-//           prontidão cai fora da Zona B por N ciclos.
-//         · PATCH #PANEL-CONFIRM-FRESHNESS (v1) — reconhecer nos
-//           `score_reasons` o bloqueio "M15 exausto (score X/30)" do novo
-//           CONFIRM-FRESHNESS em analyze-handler.js. Classifica como
-//           BLOQUEADO em diagnosticoProximidade + ALTO em avaliarEsticamento.
-//         · PATCH #PANEL-EFF-DIRECTION (v1) — `extrairDirecaoPrep` passa a
-//           usar `consolidated.effectiveDirection` como fallback primário
-//           estruturado (antes do parsing de strings e do LIMIAR fallback).
-//         · PATCH #PANEL-GUARDS-DISCORDANTES (v1) — RX log expõe
-//           `consolidated.guards_discordantes`; log WARN quando o motor
-//           emite sinal mas os guards internos discordam.
-// v2.35 — LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR):
-//         · Exposição de limiar_tendencia (modo, _rejeitadoEm, motivo, score, direcao)
-//         · Novos campos no /api/scan-group: limiarModo, limiarBloqueadoPor,
-//           limiarScoreOriginal, limiarRejeitadoEm, limiarMotivoRejeicao
-//         · diagnosticoProximidade reconhece "LIMIAR foi aplicado mas ANULADO por exaustão"
-//         · avaliarEsticamento classifica como ALTO quando LIMIAR tentou e foi bloqueado
-//         · extrairDirecaoPrep usa LIMIAR como fallback de direção (DIRECT/REJECTED)
-//         · RX log mostra limiar=(bloq:FIX_81 score=70) limiarModo=DIRECT
-// v2.34 — PUSH-DIAGNÓSTICO (sendPushToWatchers com logs detalhados + truncatura payload):
-//         · Log de início (📤), por watcher (·), por envio (✅ / ❌ com status)
-//         · Truncatura de payloads > 4000 bytes (limite do Chrome/Edge é 4096)
-//         · Mantém a limpeza automática de subscrições mortas (404/410)
-// v2.33 — PUSH-CONTEXTO v2 (Respiração / Correção Real / Reversão):
-//         · 3 avisos durante trade aberto com anti-spam por timeframe
-//         · Cooldown por tipo (12/18/30 min) + Limite por trade (4/3/2)
-//         · Histerese de 2 ciclos + persistência no Turso
-//         · Nenhum destes push fecha a posição — só informam contexto
-// v2.32 — Reconhecimento de autorizações do motor no painel (FIX #DEM-TREND-EXPLOSIVO):
-//         · avaliarEsticamento reconhece "ADX ≥ 35 explosivo" e "DeMarker lock a favor"
-//         · diagnosticoProximidade reconhece novos motivos (DeMarker Multi-TF + ADX,
-//           DeMarker lock, REVERSAO-A-FAVOR, Sizing reduzido, pullback validado)
-//         · extrairDirecaoPrep reconhece REVERSAO-A-FAVOR como hint de direção
-// v2.31 — Reconhecimento da ORIGEM do sinal (motor / limiar / pullback)
+//         · FIX #PUSH-HOLD-NEVER-FIRED (v1)
+//         · FIX #PUSH-ARREFECIMENTO-DEAD (v1)
+//         · PATCH #PANEL-CONFIRM-FRESHNESS (v1)
+//         · PATCH #PANEL-EFF-DIRECTION (v1)
+//         · PATCH #PANEL-GUARDS-DISCORDANTES (v1)
+// v2.35 — LIMIAR-DIAG
+// v2.34 — PUSH-DIAGNÓSTICO
+// v2.33 — PUSH-CONTEXTO v2
+// v2.32 — Reconhecimento de autorizações do motor
+// v2.31 — Reconhecimento da ORIGEM do sinal
 // v2.30 — Reconhecimento dos estados novos do motor
 // v2.29 — Reconhecimento MACRO-AUTHORITY-GUARD e MICRO-AGUARDA-FLIP
 // v2.28 — Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE
@@ -397,7 +387,6 @@ function invalidarCacheSubs(tokenHash) {
   else _subsCache.clear();
 }
 
-// ⭐ v2.34 — PUSH-DIAGNÓSTICO: logs detalhados + truncatura de payload
 async function sendPushToWatchers(watchers, payload) {
   if (!pushConfigured) {
     logger.warn('⚠️ [PUSH-SKIP] pushConfigured=false — nada enviado');
@@ -1069,15 +1058,56 @@ async function loadStateFromTurso() {
 
 // ========== HELPERS ==========
 
-/**
- * ⭐ v2.36 — extrairDirecaoPrep usa `effectiveDirection` como fallback primário
- * ⭐ v2.35 — extrairDirecaoPrep usa LIMIAR como fallback de direção
- * ⭐ v2.32 — extrairDirecaoPrep com reconhecimento de REVERSAO-A-FAVOR
- * ⭐ v2.31 — extrairDirecaoPrep com reconhecimento de PULLBACK RESUM
- */
+// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 1
+// `extrairDirecaoPrep` passa a usar `consolidated.diagnostico_mercado`
+// como fonte primária. Estados que NÃO autorizam direção:
+//   · TENDENCIA_FRACA / INDEFINIDO (sem direção clara)
+//   · TOPO_LOCAL_ALTA / FUNDO_LOCAL_BAIXA (aguarda pullback)
+//   · REVERSAO_CONFIRMADA / REVERSAO_EM_CURSO (aguarda cruzamento)
+//   · RESPIRACAO_* / TENDENCIA_EXAUSTA (aguarda normalizar)
+// Estados que autorizam direção:
+//   · PULLBACK_EM_CURSO / TENDENCIA_FORTE_ALINHADA → diag.direcao
+//   · acao_recomendada não bloqueante → diag.direcao
 function extrairDirecaoPrep(dados) {
   const nota = dados.consolidated.primaryTrendNote || '';
   const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
+
+  // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — diagnotico_mercado é autoritativo
+  const _diag = dados.consolidated?.diagnostico_mercado;
+  if (_diag?.estado) {
+    const _acao = _diag.acao_recomendada;
+
+    // Topo/fundo local → aguarda pullback (não prepara entrada)
+    if (_diag.estado === 'TOPO_LOCAL_ALTA' || _diag.estado === 'FUNDO_LOCAL_BAIXA') {
+      return null;
+    }
+    // Reversão → aguarda confirmação
+    if (_diag.estado === 'REVERSAO_CONFIRMADA' || _diag.estado === 'REVERSAO_EM_CURSO') {
+      return null;
+    }
+    // Sem direção clara
+    if (_diag.estado === 'TENDENCIA_FRACA' || _diag.estado === 'INDEFINIDO') {
+      return null;
+    }
+    // Exaustão / respiração → aguarda normalizar
+    if (_diag.estado.startsWith('RESPIRACAO') || _diag.estado === 'TENDENCIA_EXAUSTA') {
+      return null;
+    }
+    // Direção explícita para estados que autorizam entrada
+    if ((_diag.estado === 'PULLBACK_EM_CURSO' || _diag.estado === 'TENDENCIA_FORTE_ALINHADA') &&
+        (_diag.direcao === 'CALL' || _diag.direcao === 'PUT')) {
+      return _diag.direcao;
+    }
+    // Fallback estruturado: direção + acção não bloqueante
+    if ((_diag.direcao === 'CALL' || _diag.direcao === 'PUT') &&
+        _acao !== 'AGUARDAR_ALINHAMENTO' &&
+        _acao !== 'AGUARDAR_DEFINICAO' &&
+        _acao !== 'NAO_ENTRAR_CALL_AGUARDAR_PULLBACK' &&
+        _acao !== 'NAO_ENTRAR_PUT_AGUARDAR_PULLBACK' &&
+        _acao !== 'NAO_ENTRAR_AGUARDAR_PULLBACK') {
+      return _diag.direcao;
+    }
+  }
 
   if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(reasonsTexto)) {
     return null;
@@ -1139,21 +1169,12 @@ function extrairDirecaoPrep(dados) {
     if (dir === 'CALL' || dir === 'PUT') return dir;
   }
 
-  // ⭐ v2.36 — PATCH #PANEL-EFF-DIRECTION (v1)
-  // Usar `effectiveDirection` do servidor de análise como fallback primário
-  // estruturado (antes do parsing de strings e do LIMIAR fallback). O campo
-  // existe desde o FIX #EFFECTIVE-DIRECTION em analyze-handler.js.
   const _effDir = dados.consolidated?.effectiveDirection;
   const _effSrc = dados.consolidated?.effectiveDirectionSource;
   if ((_effDir === 'CALL' || _effDir === 'PUT') && _effSrc !== 'none') {
     return _effDir;
   }
 
-  // ⭐ v2.35 — LIMIAR-DIAG: fallback de direção tentada pelo LIMIAR
-  // Só chega aqui quando as camadas acima NÃO deram direção.
-  // Aceita modo DIRECT (bloqueado por FIX #81) ou REJECTED (rejeitado internamente).
-  // NÃO força entrada — o bloqueio é tratado por diagnosticoProximidade(BLOQUEADO)
-  // e pelo score threshold no PRONTIDAO.
   const limiarTend = dados.consolidated?.limiar_tendencia;
   if (limiarTend
       && (limiarTend.modo === 'DIRECT' || limiarTend.modo === 'REJECTED')
@@ -1167,13 +1188,50 @@ function extrairDirecaoPrep(dados) {
   return null;
 }
 
-function diagnosticoProximidade(reasons) {
+// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 2
+// `diagnosticoProximidade` aceita o `diagnostico_mercado` como 2.º argumento
+// e mapeia o estado → proximidade estruturado ANTES de qualquer parsing de
+// strings. Isto alinha o painel com a decisão do motor.
+function diagnosticoProximidade(reasons, diag = null) {
+  // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — mapear estado → proximidade
+  if (diag?.estado) {
+    switch (diag.estado) {
+      case 'REVERSAO_CONFIRMADA':
+        return { nivel: 'LONGE', detalhe: '🔄 reversão confirmada — aguarda cruzamento MACD', estado: diag.estado };
+      case 'REVERSAO_EM_CURSO':
+        return { nivel: 'LONGE', detalhe: '🔄 reversão em curso — aguarda confirmação', estado: diag.estado };
+      case 'TOPO_LOCAL_ALTA':
+        return { nivel: 'PERTO', detalhe: '⛰️ topo local CALL — aguarda pullback p/ 2ª perna', estado: diag.estado };
+      case 'FUNDO_LOCAL_BAIXA':
+        return { nivel: 'PERTO', detalhe: '🕳️ fundo local PUT — aguarda pullback p/ 2ª perna', estado: diag.estado };
+      case 'PULLBACK_EM_CURSO':
+        return { nivel: 'PERTO', detalhe: '📉 pullback em curso — aguarda fim', estado: diag.estado };
+      case 'TENDENCIA_EXAUSTA':
+        return { nivel: 'BLOQUEADO', detalhe: '⚠️ tendência exausta — aguarda correção', estado: diag.estado };
+      case 'TENDENCIA_FORTE_ALINHADA':
+        return {
+          nivel: diag.acao_recomendada === 'ENTRADA_VALIDA' ? 'PERTO' : 'EM FORMAÇÃO',
+          detalhe: diag.acao_recomendada === 'ENTRADA_VALIDA'
+            ? '✅ tendência forte — entrada válida'
+            : '✅ tendência forte — aguarda trigger',
+          estado: diag.estado
+        };
+      case 'TENDENCIA_FRACA':
+        return { nivel: 'LONGE', detalhe: '⏸️ tendência fraca — aguarda alinhamento', estado: diag.estado };
+      case 'INDEFINIDO':
+        return { nivel: 'LONGE', detalhe: '❓ indefinido — aguarda dados', estado: diag.estado };
+      default:
+        if (diag.estado.startsWith('RESPIRACAO')) {
+          return { nivel: 'BLOQUEADO', detalhe: '🌬️ respiração — mercado exausto', estado: diag.estado };
+        }
+    }
+  }
+
   const texto = (reasons || []).join(' ');
 
   if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(texto)) {
     return { nivel: 'LONGE', detalhe: 'reversão confirmada — aguarda cruzamento do MACD' };
   }
-  // ⭐ v2.35 — LIMIAR-DIAG: "LIMIAR foi aplicado mas ANULADO por exaustão"
   if (/🛡️ LIMIAR foi aplicado.*ANULADO por exaustão/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'LIMIAR tentou entrar mas exaustão multi-TF bloqueou — aguarda respirar' };
   }
@@ -1183,10 +1241,6 @@ function diagnosticoProximidade(reasons) {
   if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(texto)) {
     return { nivel: 'BLOQUEADO', detalhe: 'exaustão multi-TF — mercado esticado, aguarda correção' };
   }
-  // ⭐ v2.36 — PATCH #PANEL-CONFIRM-FRESHNESS (v1)
-  // Reconhecer o gate novo do analyze-handler. Quando o M15/H1/H24/W1
-  // (confirmTF) está exausto (hist a cair ≥15%, DeM extremo, RSI extremo,
-  // score ≥ 30) o motor força NEUTRAL com a razão explícita.
   if (/⏸️\s*\S+\s+exausto\s+\(score \d+\/\d+\)/i.test(texto)) {
     const m = texto.match(/⏸️\s*(\S+)\s+exausto\s+\(score (\d+)\/(\d+)\)/i);
     const tf = m ? m[1] : 'TF';
@@ -1209,7 +1263,6 @@ function diagnosticoProximidade(reasons) {
   if (/MICRO-AGUARDA-FLIP/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'micro contra mas a virar — prepara entrada' };
   }
-
   if (/⚡ DeMarker Multi-TF esticado MAS ADX ≥ 35 explosivo|sobrecompra é continuação, não exaustão/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'DeMarker esticado mas ADX explosivo — autorizado pelo motor' };
   }
@@ -1225,7 +1278,6 @@ function diagnosticoProximidade(reasons) {
   if (/entrada em pullback validada/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'pullback validado — entrada em zona B' };
   }
-
   if (/✅ Zona B validada|mantém\s+(CALL|PUT)\s+em zona B/i.test(texto)) {
     return { nivel: 'PERTO', detalhe: 'zona B validada — entrada moderada aprovada' };
   }
@@ -1312,17 +1364,41 @@ function diagnosticoProximidade(reasons) {
   return { nivel: 'FORMACAO', detalhe: 'aguardando alinhamento' };
 }
 
-function avaliarEsticamento(reasons) {
+// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 3
+// `avaliarEsticamento` reconhece topo/fundo local + respiração + exaustão
+// a partir do `diagnostico_mercado`.
+function avaliarEsticamento(reasons, diag = null) {
+  // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — estados de exaustão estruturados
+  if (diag?.estado) {
+    if (diag.estado === 'TOPO_LOCAL_ALTA') {
+      return { esticado: true, nivel: 'ALTO', motivo: 'Topo local CALL — exaustão coletiva', estado: diag.estado };
+    }
+    if (diag.estado === 'FUNDO_LOCAL_BAIXA') {
+      return { esticado: true, nivel: 'ALTO', motivo: 'Fundo local PUT — exaustão coletiva', estado: diag.estado };
+    }
+    if (diag.estado.startsWith('RESPIRACAO')) {
+      return {
+        esticado: true, nivel: 'ALTO',
+        motivo: 'Respiração ' + (diag.estado.includes('DUPLA') ? 'dupla' : 'simples'),
+        estado: diag.estado
+      };
+    }
+    if (diag.estado === 'TENDENCIA_EXAUSTA') {
+      return { esticado: true, nivel: 'ALTO', motivo: 'Tendência exausta — momentum a esgotar', estado: diag.estado };
+    }
+    if (diag.estado === 'REVERSAO_CONFIRMADA') {
+      return { esticado: true, nivel: 'ALTO', motivo: 'Reversão confirmada', estado: diag.estado };
+    }
+  }
+
   const texto = (reasons || []).join(' ');
   const alertas = [];
 
   const motorAutorizouPorExplosao =
     /ADX\s*≥\s*35 explosivo|sobrecompra é continuação, não exaustão|DeMarker Multi-TF esticado MAS ADX/i.test(texto);
-
   const motorAutorizouPorLock =
     /✅ DeMarker lock trend_lock_(alta|baixa) a favor do/i.test(texto);
 
-  // ⭐ v2.36 — PATCH #PANEL-CONFIRM-FRESHNESS (v1) — ver diagnosticoProximidade
   if (/⏸️\s*\S+\s+exausto\s+\(score \d+\/\d+\)/i.test(texto)) {
     const m = texto.match(/⏸️\s*(\S+)\s+exausto\s+\(score (\d+)\/(\d+)\)/i);
     const tf = m ? m[1] : 'TF';
@@ -1355,7 +1431,6 @@ function avaliarEsticamento(reasons) {
     };
   }
 
-  // ⭐ v2.35 — LIMIAR-DIAG: LIMIAR anulado por exaustão → estado ALTO
   if (/🛡️ LIMIAR foi aplicado.*ANULADO por exaustão/i.test(texto)) {
     return {
       esticado: true,
@@ -1421,12 +1496,16 @@ function detectarRespiracaoOuPullback(dados, trade, percentualPercorrido = 0) {
   return pertoDaEntrada && progressoValido;
 }
 
+// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 4f (call-site)
 function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
   const COOLDOWN_DEFAULT = COOLDOWN_POS_TRADE_MS;
   const zona = dados?.consolidated?.zona || 'C';
   const score = dados?.consolidated?.score || 0;
   const reasons = (dados?.consolidated?.score_reasons || []).join(' ');
-  const estic = esticPreCalculado || avaliarEsticamento(dados?.consolidated?.score_reasons);
+  const estic = esticPreCalculado || avaliarEsticamento(
+    dados?.consolidated?.score_reasons,
+    dados?.consolidated?.diagnostico_mercado
+  );
   if (estic.esticado && estic.nivel === 'ALTO') return 15 * 60 * 1000;
   if (tipoFecho === 'WIN' && zona === 'A' && score >= 60 && !estic.esticado) return 3 * 60 * 1000;
   if (tipoFecho === 'STOP' && zona === 'A' && score >= 55 && !estic.esticado) return 5 * 60 * 1000;
@@ -1465,6 +1544,7 @@ function confirmaExaustaoMultiTF(dados, trade) {
 }
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
+// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 4a + PATCH 6b
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
@@ -1473,7 +1553,11 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nivel = extras.nivelProntidao || 'EARLY';
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
 
-  const proximidadeDiag = diagnosticoProximidade(dados.consolidated.score_reasons || []);
+  // ⭐ PATCH 4a — passar diagnostico_mercado ao proximidade
+  const proximidadeDiag = diagnosticoProximidade(
+    dados.consolidated.score_reasons || [],
+    dados.consolidated.diagnostico_mercado
+  );
   const bloqueio = proximidadeDiag && proximidadeDiag.nivel === 'BLOQUEADO';
 
   let proximidade, detalhe, emoji;
@@ -1509,6 +1593,8 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
       score, zona: dados.consolidated.zona, proximidade, detalhe,
       nivelProntidao: nivel, scoreQuase,
       readinessScore: dados.consolidated.readiness_score ?? null,
+      // ⭐ PATCH 6b — propagar diagnosticoMercado no push
+      diagnosticoMercado: dados.consolidated.diagnostico_mercado || null,
       reasons: (dados.consolidated.score_reasons || []).slice(0, 14),
       price: dados.consolidated.price
     }
@@ -1524,6 +1610,7 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   };
 }
 
+// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 6a
 function formatarMensagemSinal(symbol, dados, mode) {
   const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
@@ -1553,6 +1640,8 @@ function formatarMensagemSinal(symbol, dados, mode) {
       price: consolidated.price,
       origem,
       origemLabel,
+      // ⭐ PATCH 6a — propagar diagnosticoMercado
+      diagnosticoMercado: consolidated.diagnostico_mercado || null,
       reasons: (consolidated.score_reasons || []).slice(0, 14), zona }
   };
 }
@@ -1668,7 +1757,6 @@ function formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percen
   return { titulo: `⚠️ Exaustão detetada: ${nome}`, corpo: `${nome} · ${trade.signal}\n📉 Tendência a perder força — ${motivo}\n💡 Considera fechar ANTES do SL tocar (${pct}% do alvo · ${tempoDecorridoMin}min)`, detalhes: { tipo: 'EXAUSTAO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, motivo, percentualPercorrido: pct + '%', duracao: tempoDecorridoMin + 'min' } };
 }
 
-// ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 1: 3 funções de formatação
 function formatarMensagemRespiracaoSaudavel(trade, currentPrice, minutos, motivo, tf) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
@@ -1841,7 +1929,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const _contexto = _t?._contexto || 'NONE';
   const _dirMaioria = _t?._direcaoMaioria || '--';
 
-  // ⭐ v2.35 — LIMIAR-DIAG: expor rejeições e bloqueios do LIMIAR no RX log
   const _limiarModo       = dados.consolidated?.limiar_tendencia?.modo || 'NONE';
   const _limiarRejeitado  = dados.consolidated?.limiar_tendencia?._rejeitadoEm || null;
   const _limiarBloqPor    = dados.consolidated?.limiar_bloqueado_por || null;
@@ -1853,9 +1940,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const _limiarRejTxt = _limiarRejeitado ? `(rej:${_limiarRejeitado})` : '';
   const _pullbackBloqTxt = _pullbackBloqPor ? `(bloq:${_pullbackBloqPor})` : '';
 
-  // ⭐ v2.36 — PATCH #PANEL-GUARDS-DISCORDANTES (v1)
-  // Expor guards que discordam do sinal. Quando o motor emite CALL mas
-  // m1Timing/refined discordam, isto é um red flag. Antes ignorava-se.
   const _guardsDisc = dados.consolidated?.guards_discordantes;
   const _guardsDiscAtivos = _guardsDisc
     ? Object.entries(_guardsDisc).filter(([_, v]) => v === true).map(([k]) => k)
@@ -1864,7 +1948,9 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     ? ` guardsDisc=[${_guardsDiscAtivos.join(',')}]`
     : '';
 
-  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false}${_limiarBloqTxt} limiarModo=${_limiarModo}${_limiarRejTxt} pullback=${dados.consolidated?.pullback_aplicado ?? false}${_pullbackBloqTxt} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action}${_guardsDiscTxt}`);
+  const _diag = dados.consolidated?.diagnostico_mercado;
+
+  logger.info(`🔬 [RX][${sid}] ${symbol} (${mode}) → signal=${dados.consolidated?.signal} zona=${dados.consolidated?.zona} score=${dados.consolidated?.score} readiness=${dados.consolidated?.readiness_score} mature=${dados.consolidated?.mature_aprovado} limiar=${dados.consolidated?.limiar_aplicado ?? false}${_limiarBloqTxt} limiarModo=${_limiarModo}${_limiarRejTxt} pullback=${dados.consolidated?.pullback_aplicado ?? false}${_pullbackBloqTxt} origem=${dados.consolidated?._origemSinal || 'motor'} ctx=${_contexto}(${_dirMaioria}) suggestion=${dados.suggestion?.action} diagEstado=${_diag?.estado || 'NONE'} diagAcao=${_diag?.acao_recomendada || 'NONE'}${_guardsDiscTxt}`);
 
   if (_guardsDiscAtivos.length > 0) {
     logger.warn(`⚠️ [GUARDS-DISCORDANTES][${sid}] ${symbol} (${mode}) → motor diz ${dados.consolidated?.signal} mas guards contra: ${_guardsDiscAtivos.join(', ')}`);
@@ -1883,7 +1969,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const trade = tradesAbertos.get(tradeKey);
   if (trade) {
     trade.currentPrice = currentPrice;
-    const esticTradeCache = avaliarEsticamento(dados.consolidated.score_reasons);
+    // ⭐ PATCH 4e — passar diagnostico_mercado ao avaliarEsticamento
+    const esticTradeCache = avaliarEsticamento(
+      dados.consolidated.score_reasons,
+      dados.consolidated.diagnostico_mercado
+    );
     const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
     const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
     const percentualPercorrido = distanciaTotal > 0 ? (distanciaPercorrida / distanciaTotal) : 0;
@@ -1898,7 +1988,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     const timeoutExtendModo = getTimeoutExtendModo(trade.mode);
     const emRespiracaoOuPullback = detectarRespiracaoOuPullback(dados, trade, percentualPercorrido);
 
-    // ⭐ PATCH #PUSH-CONTEXTO v2 — Bloco 2: anti-spam por timeframe
     {
       const PUSH_CTX_CONFIG = {
         COOLDOWN_MIN: {
@@ -2153,11 +2242,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     consolidadoPush._permitidoReal !== false &&
     consolidadoPush.risk_validation?.operavel !== false;
 
-  // ⭐ v2.36 — FIX #PUSH-HOLD-NEVER-FIRED (v1)
-  // Condição anterior incluía `sinalPush === 'HOLD'`, o que retornava sempre
-  // em HOLD, tornando PRONTIDAO e ARREFECIMENTO código morto. Agora só
-  // retorna se `!permitidoPush` (risco genuíno). O sinal HOLD segue para o
-  // bloco de prontidão mais abaixo.
   if (!permitidoPush && !tradesAbertos.has(tradeKey)) {
     logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: permitido=false`);
     return;
@@ -2167,7 +2251,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
         dados.suggestion.entry != null && dados.suggestion.takeProfit != null && dados.suggestion.stopLoss != null) {
 
-      const esticSinal = avaliarEsticamento(dados.consolidated.score_reasons);
+      // ⭐ PATCH 4d — passar diagnostico_mercado ao avaliarEsticamento
+      const esticSinal = avaliarEsticamento(
+        dados.consolidated.score_reasons,
+        dados.consolidated.diagnostico_mercado
+      );
       if (esticSinal.esticado && esticSinal.nivel === 'ALTO') {
         logger.info(`⛔ [FILTRO EXTREMO][${sid}] ${symbol} (${mode}) SINAL ignorado — ${esticSinal.motivo}`);
         prontidaoAtiva.delete(tradeKey);
@@ -2238,10 +2326,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     );
     const scoreAtualNum = Number(scoreAtual) || 0;
 
-    // ⭐ v2.36 — FIX #PUSH-ARREFECIMENTO-DEAD (v1)
-    // Verificar arrefecimento ANTES de qualquer outra lógica. Se uma
-    // prontidão estava ativa e o score caiu/ficou em C durante N ciclos,
-    // enviar notificação "😴 Prontidão encerrada" e limpar estado.
     if (prontidaoAtiva.has(tradeKey)) {
       const cfgArr = getProntidaoConfig(mode);
       const zonaAtual = dados.consolidated.zona;
@@ -2273,13 +2357,44 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       }
     }
 
+    // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 5
+    // Respeitar `acao_recomendada` do diagnóstico. O motor já decidiu o que
+    // fazer. Quando o diagnóstico diz "não entrar CALL, aguarda pullback" ou
+    // "aguardar alinhamento", o painel NÃO emite PRONTIDAO.
+    const _acaoDiag = _diag?.acao_recomendada;
+    const _estadoDiag = _diag?.estado;
+
+    if (_acaoDiag === 'NAO_ENTRAR_CALL_AGUARDAR_PULLBACK' ||
+        _acaoDiag === 'NAO_ENTRAR_PUT_AGUARDAR_PULLBACK') {
+      logger.info(`⛰️ [DIAG-TOPO-LOCAL][${sid}] ${symbol} (${mode}) → ${_estadoDiag} — aguarda pullback (não emite PRONTIDAO)`);
+      prontidaoForaContagem.delete(tradeKey);
+      return;
+    }
+
+    if (_acaoDiag === 'NAO_ENTRAR_AGUARDAR_PULLBACK') {
+      logger.info(`⚠️ [DIAG-EXAUSTA][${sid}] ${symbol} (${mode}) → ${_estadoDiag} — não entrar agora`);
+      prontidaoForaContagem.delete(tradeKey);
+      return;
+    }
+
+    if (_acaoDiag === 'AGUARDAR_ALINHAMENTO' || _acaoDiag === 'AGUARDAR_DEFINICAO') {
+      logger.info(`⏸️ [DIAG-SEM-DIRECAO][${sid}] ${symbol} (${mode}) → ${_estadoDiag} — sem direcção clara`);
+      prontidaoForaContagem.delete(tradeKey);
+      return;
+    }
+
     const regimeAtualPush = dados.consolidated.regime || 'UNKNOWN';
     if (regimeAtualPush === 'CHOP') {
       logger.info(`🔇 [FIX #60][${sid}] PRONTIDAO ignorada em CHOP: ${symbol} (${mode})`);
       prontidaoForaContagem.delete(tradeKey);
       return;
     }
-    const estic = avaliarEsticamento(dados.consolidated.score_reasons);
+
+    // ⭐ PATCH 4c — passar diagnostico_mercado ao avaliarEsticamento
+    const estic = avaliarEsticamento(
+      dados.consolidated.score_reasons,
+      dados.consolidated.diagnostico_mercado
+    );
     if (estic.esticado && estic.nivel === 'ALTO') {
       logger.info(`⛔ [FILTRO EXTREMO][${sid}] ${symbol} (${mode}) PRONTIDAO ignorada — ${estic.motivo}`);
       prontidaoForaContagem.delete(tradeKey);
@@ -2288,7 +2403,11 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
 
     const matureAprovadoMotor = dados.consolidated?.mature_aprovado;
     const matureMotivo = dados.consolidated?.mature_motivo_bloqueio || null;
-    const proximidadePront = diagnosticoProximidade(dados.consolidated.score_reasons);
+    // ⭐ PATCH 4b — passar diagnostico_mercado ao diagnosticoProximidade
+    const proximidadePront = diagnosticoProximidade(
+      dados.consolidated.score_reasons,
+      dados.consolidated.diagnostico_mercado
+    );
     const bloqueioAtivo = proximidadePront && proximidadePront.nivel === 'BLOQUEADO';
 
     let deveForcarEarly;
@@ -2393,9 +2512,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       logger.info(`⏭️ [PRONTIDAO-COOLDOWN][${sid}] ${symbol} (${mode}) score ${scoreAtualNum} vs último ${ultimoScoreEnviado} — delta < ${cfg.scoreDeltaMin}`);
     }
   }
-  // ⭐ v2.36 — FIX #PUSH-ARREFECIMENTO-DEAD (v1) — branch anterior removido
-  // (era inalcançável: o `else if (signal === 'HOLD')` acima já apanha todos
-  // os HOLD). A lógica de arrefecimento vive agora dentro desse branch.
 }
 
 // ========== CRON ==========
@@ -2633,6 +2749,7 @@ app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 4g + PATCH 7
 app.post('/api/scan-group', authMiddleware, async (req, res) => {
   const { group, mode } = req.body;
   if (!group || !mode) return res.status(400).json({ error: 'Os campos "group" e "mode" são obrigatórios.' });
@@ -2676,14 +2793,36 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           mensagemProntidao = `⚪ Aguarda — ${distZonaB} pts p/ Zona B`;
         }
 
-        const estic = avaliarEsticamento(consolidated.score_reasons);
+        // ⭐ PATCH 4g — passar diagnostico_mercado ao avaliarEsticamento
+        const estic = avaliarEsticamento(consolidated.score_reasons, consolidated.diagnostico_mercado);
         if (estic.esticado && estic.nivel === 'ALTO') {
           mensagemProntidao = `🔥 ESTICADO — ${estic.motivo}`;
         }
 
-        const proximidade = diagnosticoProximidade(consolidated.score_reasons);
+        // ⭐ PATCH 4g — passar diagnostico_mercado ao diagnosticoProximidade
+        const proximidade = diagnosticoProximidade(consolidated.score_reasons, consolidated.diagnostico_mercado);
 
-        // ⭐ v2.35 — LIMIAR-DIAG: expor diagnóstico completo do LIMIAR
+        // ⭐ PATCH 7 — mensagemProntidao reflecte acao_recomendada
+        const _diagScan = consolidated.diagnostico_mercado;
+        if (_diagScan?.acao_recomendada) {
+          const _acaoScan = _diagScan.acao_recomendada;
+          const _estadoScan = _diagScan.estado || '';
+          if (_acaoScan === 'NAO_ENTRAR_CALL_AGUARDAR_PULLBACK') {
+            mensagemProntidao = `⛰️ TOPO LOCAL CALL — aguarda pullback para 2ª perna`;
+          } else if (_acaoScan === 'NAO_ENTRAR_PUT_AGUARDAR_PULLBACK') {
+            mensagemProntidao = `🕳️ FUNDO LOCAL PUT — aguarda pullback para 2ª perna`;
+          } else if (_acaoScan === 'AGUARDAR_ALINHAMENTO') {
+            mensagemProntidao = `⏸️ TENDÊNCIA FRACA — aguarda alinhamento dos TFs`;
+          } else if (_acaoScan === 'AGUARDAR_CONFIRMACAO_REVERSAO') {
+            mensagemProntidao = `🔄 REVERSÃO — aguarda confirmação do MACD`;
+          } else if (_acaoScan === 'AGUARDAR_FIM_PULLBACK') {
+            mensagemProntidao = `📉 PULLBACK EM CURSO — aguarda fim para entrar`;
+          } else if (_acaoScan === 'ENTRADA_VALIDA') {
+            mensagemProntidao = `✅ ENTRADA VÁLIDA — ${_diagScan.direcao || signal} confirmado`;
+          }
+        }
+
+        // ⭐ v2.35 — LIMIAR-DIAG
         const limiarInfo = consolidated.limiar_tendencia || null;
         const limiarModo = limiarInfo?.modo || 'NONE';
         const limiarAplicadoReal = consolidated.limiar_aplicado === true;
@@ -2704,7 +2843,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           mensagemProntidaoEnriquecida = `🔍 LIMIAR ${limiarDirecao || ''} rejeitado [${limiarRejeitadoEm}]${motivo ? ': ' + motivo : ''}`;
         }
 
-        logger.info(`🔍 [SCAN][${sid}] ${symbol} (${mode}) → signal=${signal} zona=${zona} score=${score} readiness=${consolidated.readiness_score ?? '--'} mature=${consolidated.mature_aprovado ?? '--'} proximidade=${proximidade.nivel} limiarModo=${limiarModo}${limiarBloqueadoPor ? ' bloq:'+limiarBloqueadoPor : ''}${limiarRejeitadoEm ? ' rej:'+limiarRejeitadoEm : ''}`);
+        logger.info(`🔍 [SCAN][${sid}] ${symbol} (${mode}) → signal=${signal} zona=${zona} score=${score} readiness=${consolidated.readiness_score ?? '--'} mature=${consolidated.mature_aprovado ?? '--'} proximidade=${proximidade.nivel} diagEstado=${_diagScan?.estado || 'NONE'} limiarModo=${limiarModo}${limiarBloqueadoPor ? ' bloq:'+limiarBloqueadoPor : ''}${limiarRejeitadoEm ? ' rej:'+limiarRejeitadoEm : ''}`);
 
         return {
           symbol, name: getFriendlyName(symbol),
@@ -2718,7 +2857,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           trendStatePullbackScaling: consolidated.trendState_pullbackScaling === true,
           origem: consolidated._origemSinal || 'motor',
 
-          // ⭐ v2.35 — LIMIAR-DIAG: campos adicionais
           limiarAplicado: limiarAplicadoReal,
           limiarModo,
           limiarBloqueadoPor,
@@ -2733,6 +2871,8 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
 
           proximidade,
           esticamento: estic,
+          // ⭐ PATCH 6c — propagar diagnosticoMercado no scan-group
+          diagnosticoMercado: consolidated.diagnostico_mercado || null,
           mensagemProntidao: mensagemProntidaoEnriquecida,
           distanciaZonaB: distZonaB,
           distanciaZonaA: distZonaA,
@@ -2883,6 +3023,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.37: PANEL-DIAG-AUTHORITY (painel confia no diagnóstico do motor — 7 alterações).`);
   logger.info(`v2.36: PUSH-DIAG-FIX + CONFIRM-FRESHNESS (retificações críticas).`);
   logger.info(`v2.35: LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR).`);
   logger.info(`v2.34: PUSH-DIAGNÓSTICO (logs detalhados + truncatura payload).`);
