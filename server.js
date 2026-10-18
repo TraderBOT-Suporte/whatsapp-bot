@@ -1,30 +1,25 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
+// v2.38 — PANEL-RELAY-STRICT:
+//         · PATCH #PANEL-RELAY-STRICT (v1) — extrairDirecaoPrep reescrita:
+//           a direcção para PRONTIDAO passa a vir EXCLUSIVAMENTE de:
+//             1) effectiveDirection (que respeita blocked_by_market_state)
+//             2) diagnostico_mercado.direcao quando o estado AUTORIZA entrada
+//           Todos os fallbacks antigos (regex em reasons, timings, limiar
+//           REJECTED, Tendência de fundo, etc.) foram REMOVIDOS — o painel
+//           não infere mais direcções que o motor não autorizou.
+//           O SINAL_CONFIRMADO (CALL/PUT) já era 100% relay de
+//           `consolidated.signal` + `suggestion.*` — sem mudanças nesse fluxo.
 // v2.37 — PANEL-DIAG-AUTHORITY (painel confia no diagnóstico do motor):
 //         · PATCH #PANEL-DIAG-AUTHORITY (v1) — 7 alterações:
-//           1) extrairDirecaoPrep() usa `diagnostico_mercado` como fonte primária
-//              estruturada. NÃO infere direção quando o motor diz "sem direção"
-//              (TENDENCIA_FRACA / INDEFINIDO), nem em topo/fundo local, nem em
-//              respiração, nem em reversão. Só prepara direção quando o motor
-//              autoriza (PULLBACK_EM_CURSO / TENDENCIA_FORTE_ALINHADA /
-//              acao_recomendada não bloqueante).
-//           2) diagnosticoProximidade(reasons, diag) mapeia estado → proximidade
-//              estruturado: TOPO_LOCAL_ALTA→PERTO, TENDENCIA_FRACA→LONGE,
-//              PULLBACK_EM_CURSO→PERTO, REVERSAO_*→LONGE, etc.
-//           3) avaliarEsticamento(reasons, diag) trata TOPO/FUNDO LOCAL como
-//              esticamento ALTO (com motivo estruturado do motor).
+//           1) extrairDirecaoPrep() usava `diagnostico_mercado` como fonte
+//              primária estruturada, mas ainda tinha 8 fallbacks de inferência.
+//           2) diagnosticoProximidade() mapeia estado → proximidade.
+//           3) avaliarEsticamento() trata TOPO/FUNDO LOCAL como esticamento.
 //           4) Todos os call-sites passam `consolidated.diagnostico_mercado`.
-//           5) PRONTIDAO respeita `acao_recomendada`: NAO_ENTRAR_* /
-//              AGUARDAR_ALINHAMENTO / AGUARDAR_DEFINICAO → não emite push.
-//           6) `diagnosticoMercado` propagado nos `detalhes` do push (SINAL +
-//              PRONTIDAO) e no payload do /api/scan-group.
+//           5) PRONTIDAO respeita `acao_recomendada` bloqueante.
+//           6) `diagnosticoMercado` propagado nos push SINAL + PRONTIDAO.
 //           7) scan-group usa `acao_recomendada` em `mensagemProntidao`.
-//         · Sem mudanças em motor de análise, Turso, Web Push, VAPID.
 // v2.36 — PUSH-DIAG-FIX + CONFIRM-FRESHNESS (retificações críticas):
-//         · FIX #PUSH-HOLD-NEVER-FIRED (v1)
-//         · FIX #PUSH-ARREFECIMENTO-DEAD (v1)
-//         · PATCH #PANEL-CONFIRM-FRESHNESS (v1)
-//         · PATCH #PANEL-EFF-DIRECTION (v1)
-//         · PATCH #PANEL-GUARDS-DISCORDANTES (v1)
 // v2.35 — LIMIAR-DIAG
 // v2.34 — PUSH-DIAGNÓSTICO
 // v2.33 — PUSH-CONTEXTO v2
@@ -1058,133 +1053,46 @@ async function loadStateFromTurso() {
 
 // ========== HELPERS ==========
 
-// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 1
-// `extrairDirecaoPrep` passa a usar `consolidated.diagnostico_mercado`
-// como fonte primária. Estados que NÃO autorizam direção:
-//   · TENDENCIA_FRACA / INDEFINIDO (sem direção clara)
-//   · TOPO_LOCAL_ALTA / FUNDO_LOCAL_BAIXA (aguarda pullback)
-//   · REVERSAO_CONFIRMADA / REVERSAO_EM_CURSO (aguarda cruzamento)
-//   · RESPIRACAO_* / TENDENCIA_EXAUSTA (aguarda normalizar)
-// Estados que autorizam direção:
-//   · PULLBACK_EM_CURSO / TENDENCIA_FORTE_ALINHADA → diag.direcao
-//   · acao_recomendada não bloqueante → diag.direcao
+// ⭐ PATCH #PANEL-RELAY-STRICT (v1) — v2.38
+// A direcção para PRONTIDAO passa a vir EXCLUSIVAMENTE de:
+//   1) effectiveDirection (que já respeita blocked_by_market_state do motor)
+//   2) diagnostico_mercado.direcao quando o estado AUTORIZA entrada
+// Todos os fallbacks antigos foram REMOVIDOS — o painel não infere direcções
+// que o motor não autorizou. Se o motor está bloqueado, PRONTIDAO não dispara.
 function extrairDirecaoPrep(dados) {
-  const nota = dados.consolidated.primaryTrendNote || '';
-  const reasonsTexto = (dados.consolidated.score_reasons || []).join(' ');
-
-  // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — diagnotico_mercado é autoritativo
-  const _diag = dados.consolidated?.diagnostico_mercado;
-  if (_diag?.estado) {
-    const _acao = _diag.acao_recomendada;
-
-    // Topo/fundo local → aguarda pullback (não prepara entrada)
-    if (_diag.estado === 'TOPO_LOCAL_ALTA' || _diag.estado === 'FUNDO_LOCAL_BAIXA') {
-      return null;
-    }
-    // Reversão → aguarda confirmação
-    if (_diag.estado === 'REVERSAO_CONFIRMADA' || _diag.estado === 'REVERSAO_EM_CURSO') {
-      return null;
-    }
-    // Sem direção clara
-    if (_diag.estado === 'TENDENCIA_FRACA' || _diag.estado === 'INDEFINIDO') {
-      return null;
-    }
-    // Exaustão / respiração → aguarda normalizar
-    if (_diag.estado.startsWith('RESPIRACAO') || _diag.estado === 'TENDENCIA_EXAUSTA') {
-      return null;
-    }
-    // Direção explícita para estados que autorizam entrada
-    if ((_diag.estado === 'PULLBACK_EM_CURSO' || _diag.estado === 'TENDENCIA_FORTE_ALINHADA') &&
-        (_diag.direcao === 'CALL' || _diag.direcao === 'PUT')) {
-      return _diag.direcao;
-    }
-    // Fallback estruturado: direção + acção não bloqueante
-    if ((_diag.direcao === 'CALL' || _diag.direcao === 'PUT') &&
-        _acao !== 'AGUARDAR_ALINHAMENTO' &&
-        _acao !== 'AGUARDAR_DEFINICAO' &&
-        _acao !== 'NAO_ENTRAR_CALL_AGUARDAR_PULLBACK' &&
-        _acao !== 'NAO_ENTRAR_PUT_AGUARDAR_PULLBACK' &&
-        _acao !== 'NAO_ENTRAR_AGUARDAR_PULLBACK') {
-      return _diag.direcao;
-    }
-  }
-
-  if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(reasonsTexto)) {
-    return null;
-  }
-
-  if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(reasonsTexto)) {
-    return null;
-  }
-
-  if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(reasonsTexto)) {
-    return null;
-  }
-
-  if (/MICRO-AGUARDA-FLIP/i.test(reasonsTexto)) {
-    if (/\bUP\b/.test(reasonsTexto))   return 'CALL';
-    if (/\bDOWN\b/.test(reasonsTexto)) return 'PUT';
-  }
-
-  if (/em correção real|em correcao real/i.test(reasonsTexto)) {
-    if (/\bUP\b/.test(reasonsTexto))   return 'CALL';
-    if (/\bDOWN\b/.test(reasonsTexto)) return 'PUT';
-  }
-
-  if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasonsTexto)) return null;
-  const notaindicaIncerteza = /NÃO confirmada|não confirmada|SEM DIREÇÃO DEFINIDA|sem direção definida|FRÁGIL|aguarda alinhamento/i.test(nota);
-  if (!notaindicaIncerteza) {
-    const matchNota = nota.match(/Tendência primária \([^)]+\):\s*(ALTA|BAIXA)/i);
-    if (matchNota) return matchNota[1].toUpperCase() === 'ALTA' ? 'CALL' : 'PUT';
-  }
-
-  const reversaoAFavorMatch = (dados.consolidated.score_reasons || [])
-    .find(r => /REVERSAO-A-FAVOR.*para\s+(UP|DOWN)/i.test(r));
-  if (reversaoAFavorMatch) {
-    const m = reversaoAFavorMatch.match(/para\s+(UP|DOWN)/i);
-    if (m) return m[1].toUpperCase() === 'UP' ? 'CALL' : 'PUT';
-  }
-
-  const razaoTrend = (dados.consolidated.score_reasons || []).find(r => r.includes('🧭'));
-  if (razaoTrend && !/NEUTRAL|neutro|não confirmada|SEM DIREÇÃO/i.test(razaoTrend)) {
-    if (/Tendência de fundo:\s*ALTA|Tendência assumida:\s*(UP|ALTA)|reversão para UP/i.test(razaoTrend)) return 'CALL';
-    if (/Tendência de fundo:\s*BAIXA|Tendência assumida:\s*(DOWN|BAIXA)|reversão para DOWN/i.test(razaoTrend)) return 'PUT';
-  }
-  const sinais = [];
-  for (const tf of ['m1_timing', 'm5_timing', 'm15_timing', 'h1_timing', 'h4_timing']) {
-    const t = dados.consolidated[tf];
-    if (!t) continue;
-    const s = t._direcaoMaioria || t.sinal;
-    if (s === 'PUT' || s === 'CALL') sinais.push(s);
-  }
-  if (sinais.length > 0) {
-    const puts = sinais.filter(s => s === 'PUT').length;
-    const calls = sinais.length - puts;
-    const ratio = Math.max(puts, calls) / sinais.length;
-    if (ratio >= 0.6) return puts > calls ? 'PUT' : 'CALL';
-  }
-
-  if (dados.consolidated?._pullbackResumption?.ativo === true) {
-    const dir = dados.consolidated._pullbackResumption.direcao;
-    if (dir === 'CALL' || dir === 'PUT') return dir;
-  }
-
+  // ── 1) effectiveDirection: campo estruturado do motor ──
+  // Se `effectiveDirectionSource === 'blocked_by_market_state'`, o motor
+  // já indicou que está bloqueado → NÃO usar a direcção de contexto.
   const _effDir = dados.consolidated?.effectiveDirection;
   const _effSrc = dados.consolidated?.effectiveDirectionSource;
-  if ((_effDir === 'CALL' || _effDir === 'PUT') && _effSrc !== 'none') {
+
+  if ((_effDir === 'CALL' || _effDir === 'PUT') &&
+      _effSrc !== 'blocked_by_market_state' &&
+      _effSrc !== 'none') {
     return _effDir;
   }
 
-  const limiarTend = dados.consolidated?.limiar_tendencia;
-  if (limiarTend
-      && (limiarTend.modo === 'DIRECT' || limiarTend.modo === 'REJECTED')
-      && (limiarTend.direcao === 'CALL' || limiarTend.direcao === 'PUT')) {
-    const bloqueadoresContra = /RESPIRAÇÃO\s+(SIMPLES|DUPLA)|REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA|EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF|MACRO AUTHORITY SUAVIZADA/i;
-    if (!bloqueadoresContra.test(reasonsTexto)) {
-      return limiarTend.direcao;
+  // ── 2) diagnostico_mercado.direcao — só se o estado AUTORIZA entrada ──
+  // Estados que autorizam: PULLBACK_EM_CURSO / TENDENCIA_FORTE_ALINHADA
+  // Estados bloqueantes: TOPO_LOCAL_ALTA, FUNDO_LOCAL_BAIXA, REVERSAO_*,
+  //                      TENDENCIA_FRACA, INDEFINIDO, RESPIRACAO_*,
+  //                      TENDENCIA_EXAUSTA
+  const _diag = dados.consolidated?.diagnostico_mercado;
+  if (_diag?.estado) {
+    const _autoriza =
+      _diag.estado === 'PULLBACK_EM_CURSO' ||
+      _diag.estado === 'TENDENCIA_FORTE_ALINHADA';
+
+    if (_autoriza &&
+        (_diag.direcao === 'CALL' || _diag.direcao === 'PUT') &&
+        _diag.acao_recomendada !== 'NAO_ENTRAR_CALL_AGUARDAR_PULLBACK' &&
+        _diag.acao_recomendada !== 'NAO_ENTRAR_PUT_AGUARDAR_PULLBACK' &&
+        _diag.acao_recomendada !== 'NAO_ENTRAR_AGUARDAR_PULLBACK') {
+      return _diag.direcao;
     }
   }
 
+  // ── Sem autorização do motor → sem PRONTIDAO ──
   return null;
 }
 
@@ -3023,6 +2931,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
+  logger.info(`v2.38: PANEL-RELAY-STRICT (extrairDirecaoPrep só aceita direcção do motor — sem inferência).`);
   logger.info(`v2.37: PANEL-DIAG-AUTHORITY (painel confia no diagnóstico do motor — 7 alterações).`);
   logger.info(`v2.36: PUSH-DIAG-FIX + CONFIRM-FRESHNESS (retificações críticas).`);
   logger.info(`v2.35: LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR).`);
