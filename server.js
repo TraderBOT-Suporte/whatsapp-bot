@@ -35,6 +35,7 @@
 // v2.23 — Multi-servidor de análise
 // v2.22 — Cooldown PRONTIDAO por modo + persistência de ultimo_score
 // v2.21 — Turso (libSQL) substitui Firestore
+// v2.39 — TRAVA-DIRECIONAL: Bloqueio de inversão de sinal (PUT->CALL) em 30min + Filtro de Aviso Crítico TP/SL
 
 import express from 'express';
 import cors from 'cors';
@@ -105,7 +106,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 
-// ========== ⭐ NORMALIZAÇÃO DE URL DOS SERVIDORES ==========
+// ========== 🔧 NORMALIZAÇÃO DE URL DOS SERVIDORES ==========
 function normalizeApiUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
   const trimmed = rawUrl.trim().replace(/\/+$/, '');
@@ -851,6 +852,7 @@ const prontidaoUltimoEnvio = new Map();
 const prontidaoUltimoScoreEnviado = new Map();
 const arrefecimentoUltimoEnvio = new Map();
 const prontidaoGlobalPorSymbol = new Map();
+const ultimaDirecaoPorPar = new Map(); // ⭐ TRAVA-DIRECIONAL
 
 setInterval(() => {
   const agora = Date.now();
@@ -868,6 +870,10 @@ setInterval(() => {
   }
   for (const [sym, ts] of prontidaoGlobalPorSymbol.entries()) {
     if (agora - ts > 30 * 60 * 1000) prontidaoGlobalPorSymbol.delete(sym);
+  }
+  // Limpeza da trava direcional após 30 min
+  for (const [key, data] of ultimaDirecaoPorPar.entries()) {
+    if (agora - data.timestamp > 30 * 60 * 1000) ultimaDirecaoPorPar.delete(key);
   }
 }, 60 * 1000);
 
@@ -1044,7 +1050,7 @@ async function loadStateFromTurso() {
 
     logger.info(`♻️ Estado restaurado: ${tradesRestaurados} trade(s), ${cdRestaurados} cooldown(s), ${prRestaurados} prontidão(ões) · ${scoresRestaurados} score(s) · ${cdExpirados} cooldown(s) expirado(s)`);
     if (tradesMigrados || cdMigrados || prMigrados) {
-      logger.info(`🔀 Migração multi-servidor: ${tradesMigrados} trade(s), ${cdMigrados} cooldown(s), ${prMigrados} prontidão(ões) prefixados com server1_`);
+      logger.info(`🔄 Migração multi-servidor: ${tradesMigrados} trade(s), ${cdMigrados} cooldown(s), ${prMigrados} prontidão(ões) prefixados com server1_`);
     }
   } catch (err) {
     logger.error(`❌ Erro ao carregar estado do Turso: ${err.message}`);
@@ -1054,15 +1060,7 @@ async function loadStateFromTurso() {
 // ========== HELPERS ==========
 
 // ⭐ PATCH #PANEL-RELAY-STRICT (v1) — v2.38
-// A direcção para PRONTIDAO passa a vir EXCLUSIVAMENTE de:
-//   1) effectiveDirection (que já respeita blocked_by_market_state do motor)
-//   2) diagnostico_mercado.direcao quando o estado AUTORIZA entrada
-// Todos os fallbacks antigos foram REMOVIDOS — o painel não infere direcções
-// que o motor não autorizou. Se o motor está bloqueado, PRONTIDAO não dispara.
 function extrairDirecaoPrep(dados) {
-  // ── 1) effectiveDirection: campo estruturado do motor ──
-  // Se `effectiveDirectionSource === 'blocked_by_market_state'`, o motor
-  // já indicou que está bloqueado → NÃO usar a direcção de contexto.
   const _effDir = dados.consolidated?.effectiveDirection;
   const _effSrc = dados.consolidated?.effectiveDirectionSource;
 
@@ -1072,11 +1070,6 @@ function extrairDirecaoPrep(dados) {
     return _effDir;
   }
 
-  // ── 2) diagnostico_mercado.direcao — só se o estado AUTORIZA entrada ──
-  // Estados que autorizam: PULLBACK_EM_CURSO / TENDENCIA_FORTE_ALINHADA
-  // Estados bloqueantes: TOPO_LOCAL_ALTA, FUNDO_LOCAL_BAIXA, REVERSAO_*,
-  //                      TENDENCIA_FRACA, INDEFINIDO, RESPIRACAO_*,
-  //                      TENDENCIA_EXAUSTA
   const _diag = dados.consolidated?.diagnostico_mercado;
   if (_diag?.estado) {
     const _autoriza =
@@ -1092,16 +1085,11 @@ function extrairDirecaoPrep(dados) {
     }
   }
 
-  // ── Sem autorização do motor → sem PRONTIDAO ──
   return null;
 }
 
 // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 2
-// `diagnosticoProximidade` aceita o `diagnostico_mercado` como 2.º argumento
-// e mapeia o estado → proximidade estruturado ANTES de qualquer parsing de
-// strings. Isto alinha o painel com a decisão do motor.
 function diagnosticoProximidade(reasons, diag = null) {
-  // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — mapear estado → proximidade
   if (diag?.estado) {
     switch (diag.estado) {
       case 'REVERSAO_CONFIRMADA':
@@ -1273,10 +1261,7 @@ function diagnosticoProximidade(reasons, diag = null) {
 }
 
 // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 3
-// `avaliarEsticamento` reconhece topo/fundo local + respiração + exaustão
-// a partir do `diagnostico_mercado`.
 function avaliarEsticamento(reasons, diag = null) {
-  // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — estados de exaustão estruturados
   if (diag?.estado) {
     if (diag.estado === 'TOPO_LOCAL_ALTA') {
       return { esticado: true, nivel: 'ALTO', motivo: 'Topo local CALL — exaustão coletiva', estado: diag.estado };
@@ -1394,7 +1379,7 @@ function detectarRespiracaoOuPullback(dados, trade, percentualPercorrido = 0) {
   const reasons = (dados?.consolidated?.score_reasons || []).join(' ');
   const nota = dados?.consolidated?.primaryTrendNote || '';
   const texto = `${reasons} ${nota}`;
-  const indicadoPeloMotor = /RESPIRAÇÃO\\s+(SIMPLES|DUPLA)|mercado precisa respirar|pullback em curso|pullback saudável|correção saudável|reteste|aguarda alinhamento|aguarda flip/i.test(texto);
+  const indicadoPeloMotor = /RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar|pullback em curso|pullback saudável|correção saudável|reteste|aguarda alinhamento|aguarda flip/i.test(texto);
   if (!indicadoPeloMotor || !trade) return false;
 
   const distanciaEntrada = Math.abs((dados?.consolidated?.price ?? trade.currentPrice) - trade.entry);
@@ -1404,7 +1389,6 @@ function detectarRespiracaoOuPullback(dados, trade, percentualPercorrido = 0) {
   return pertoDaEntrada && progressoValido;
 }
 
-// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 4f (call-site)
 function calcularCooldownDinamico(tipoFecho, dados, esticPreCalculado) {
   const COOLDOWN_DEFAULT = COOLDOWN_POS_TRADE_MS;
   const zona = dados?.consolidated?.zona || 'C';
@@ -1452,7 +1436,6 @@ function confirmaExaustaoMultiTF(dados, trade) {
 }
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
-// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 4a + PATCH 6b
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
@@ -1461,7 +1444,6 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nivel = extras.nivelProntidao || 'EARLY';
   const reasons = (dados.consolidated.score_reasons || []).join(' ');
 
-  // ⭐ PATCH 4a — passar diagnostico_mercado ao proximidade
   const proximidadeDiag = diagnosticoProximidade(
     dados.consolidated.score_reasons || [],
     dados.consolidated.diagnostico_mercado
@@ -1473,7 +1455,7 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   else if (nivel === 'MATURE') { emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada'; }
   else if (/REVERSÃO CONFIRMADA|REVERSAO CONFIRMADA/i.test(reasons)) { emoji = '🔄'; proximidade = 'LONGE'; detalhe = 'reversão confirmada — aguarda cruzamento do MACD'; }
   else if (/EXAUSTÃO MULTI-TF|EXAUSTAO MULTI-TF/i.test(reasons)) { emoji = '⛔'; proximidade = 'BLOQUEADO'; detalhe = 'exaustão multi-TF — aguarda correção'; }
-  else if (/em correção real|em correcao real/i.test(reasons)) { emoji = '📊'; proximidade = 'LONGE'; detalhe = 'pullback a terminar — aguarda alinhamento'; }
+  else if (/em correção real|em correcao real/i.test(reasons)) { emoji = '📉'; proximidade = 'LONGE'; detalhe = 'pullback a terminar — aguarda alinhamento'; }
   else if (/MACRO AUTHORITY SUAVIZADA|motor cede/i.test(reasons)) { emoji = '🧭'; proximidade = 'LONGE'; detalhe = 'macro manda mas TFs menores contra — aguarda alinhamento'; }
   else if (/MICRO-AGUARDA-FLIP/i.test(reasons)) { emoji = '🟡'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'micro contra mas a virar — prepara entrada'; }
   else if (/RESPIRAÇÃO\s+(SIMPLES|DUPLA)|mercado precisa respirar/i.test(reasons)) { emoji = '🌬️'; proximidade = 'BLOQUEADO'; detalhe = 'mercado precisa respirar — aguarda normalizar'; }
@@ -1487,7 +1469,7 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   else if (/Zona A rebaixada para B|Zona final rebaixada para B/i.test(reasons)) { emoji = '👀'; proximidade = 'EM FORMAÇÃO'; detalhe = 'confiança baixa — aguarda reforço'; }
   else if (/ADX muito fraco/i.test(reasons)) { emoji = '💤'; proximidade = 'LONGE'; detalhe = 'tendência macro sem força'; }
   else if (/CONFLITO|pullback em curso|aguarda histograma|aguarda alinhamento|aguarda flip/i.test(reasons)) { emoji = '👀'; proximidade = 'EM FORMAÇÃO'; detalhe = 'gatilho em ajuste — prepara-te'; }
-  else { emoji = '📊'; proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento'; }
+  else { emoji = '📉'; proximidade = 'EM FORMAÇÃO'; detalhe = 'aguardando alinhamento'; }
 
   const prefixoTitulo = bloqueio
     ? `⏸️ Em formação: ${nomeAmigavel}`
@@ -1501,7 +1483,6 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
       score, zona: dados.consolidated.zona, proximidade, detalhe,
       nivelProntidao: nivel, scoreQuase,
       readinessScore: dados.consolidated.readiness_score ?? null,
-      // ⭐ PATCH 6b — propagar diagnosticoMercado no push
       diagnosticoMercado: dados.consolidated.diagnostico_mercado || null,
       reasons: (dados.consolidated.score_reasons || []).slice(0, 14),
       price: dados.consolidated.price
@@ -1518,7 +1499,6 @@ function formatarMensagemArrefecimento(symbol, score, dados) {
   };
 }
 
-// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 6a
 function formatarMensagemSinal(symbol, dados, mode) {
   const { consolidated, suggestion } = dados;
   const emoji = consolidated.signal === 'CALL' ? '🟢' : '🔴';
@@ -1527,7 +1507,7 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const confNum = Number(consolidated?.confidence);
   const conf = (Number.isFinite(confNum) ? (confNum * 100).toFixed(1) : '0.0');
   const zona = consolidated.zona === 'B' ? 'B' : 'A';
-  const tituloBase = zona === 'A' ? '🚨 SINAL CONFIRMADO' : '⚡ SINAL MODERADO';
+  const tituloBase = zona === 'A' ? '🚨 SINAL CONFIRMADO' : '⚠️ SINAL MODERADO';
   const confBrutaNum = Number(consolidated?.confianca_bruta);
   const confBruta = Number.isFinite(confBrutaNum) ? (confBrutaNum * 100).toFixed(1) : null;
 
@@ -1538,7 +1518,7 @@ function formatarMensagemSinal(symbol, dados, mode) {
 
   return {
     titulo: `${tituloBase}: ${nomeAmigavel} · ${origemLabel}`,
-    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💰 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}\n🔎 Origem: ${origemLabel}`,
+    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💲 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}\n🔎 Origem: ${origemLabel}`,
     detalhes: { tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
       entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
       score: consolidated.score,
@@ -1548,7 +1528,6 @@ function formatarMensagemSinal(symbol, dados, mode) {
       price: consolidated.price,
       origem,
       origemLabel,
-      // ⭐ PATCH 6a — propagar diagnosticoMercado
       diagnosticoMercado: consolidated.diagnostico_mercado || null,
       reasons: (consolidated.score_reasons || []).slice(0, 14), zona }
   };
@@ -1605,7 +1584,7 @@ function formatarMensagemAutoClose90(trade, currentPrice, minutos) {
 
   return {
     titulo: `✅ Fecho em lucro parcial: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n💰 +${pct}% do alvo — ${currentPrice}\n⏱️ Duração: ${duracao}min · fecha a posição`,
+    corpo: `${nome} · ${trade.signal}\n💲 +${pct}% do alvo — ${currentPrice}\n⏱️ Duração: ${duracao}min · fecha a posição`,
     detalhes: {
       tipo: 'AUTO_CLOSE_90',
       nomeAmigavel: nome,
@@ -1644,7 +1623,7 @@ function formatarMensagemPullbackDoPico(trade, currentPrice, minutos, percentual
 function formatarMensagemWin(trade) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
-  return { titulo: `🎯 WIN: ${nome}`, corpo: `${nome} · ${trade.signal} ✅\n💰 Alvo ${trade.takeProfit} atingido!\n⏱️ Duração: ${duracao}min · fecha a posição`, detalhes: { tipo: 'WIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, takeProfit: trade.takeProfit, currentPrice: trade.currentPrice, duracao: duracao + 'min' } };
+  return { titulo: `🎯 WIN: ${nome}`, corpo: `${nome} · ${trade.signal} ✅\n💲 Alvo ${trade.takeProfit} atingido!\n⏱️ Duração: ${duracao}min · fecha a posição`, detalhes: { tipo: 'WIN', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, takeProfit: trade.takeProfit, currentPrice: trade.currentPrice, duracao: duracao + 'min' } };
 }
 
 function formatarMensagemStop(trade) {
@@ -1656,7 +1635,7 @@ function formatarMensagemStop(trade) {
 function formatarMensagemTempoEsgotado(trade) {
   const nome = getFriendlyName(trade.symbol);
   const duracao = Math.floor((Date.now() - trade.timestamp) / 60000);
-  return { titulo: `⏱️ Tempo esgotado: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço perto da entrada (${trade.currentPrice})\n✅ Considera fechar no breakeven`, detalhes: { tipo: 'TEMPO_ESGOTADO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: duracao + 'min' } };
+  return { titulo: `⏳ Tempo esgotado: ${nome}`, corpo: `${nome} · ${trade.signal}\n💵 Preço perto da entrada (${trade.currentPrice})\n✅ Considera fechar no breakeven`, detalhes: { tipo: 'TEMPO_ESGOTADO', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice: trade.currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: duracao + 'min' } };
 }
 
 function formatarMensagemExaustao(trade, currentPrice, tempoDecorridoMin, percentualPercorrido, motivo) {
@@ -1691,8 +1670,8 @@ function formatarMensagemCorrecaoReal(trade, currentPrice, minutos, motivo, tf) 
   const nome = getFriendlyName(trade.symbol);
   const duracao = minutos || Math.floor((Date.now() - trade.timestamp) / 60000);
   return {
-    titulo: `📊 Correção real: ${nome}`,
-    corpo: `${nome} · ${trade.signal}\n📊 ${motivo}\n⚠️ Profundidade aumentou — aguarda o flip do ${tf || 'trigger'} (${duracao}min)`,
+    titulo: `📉 Correção real: ${nome}`,
+    corpo: `${nome} · ${trade.signal}\n📉 ${motivo}\n⚠️ Profundidade aumentou — aguarda o flip do ${tf || 'trigger'} (${duracao}min)`,
     detalhes: {
       tipo: 'CORRECAO_REAL',
       nomeAmigavel: nome,
@@ -1736,7 +1715,7 @@ function formatarMensagemTimeout(trade, currentPrice, tempoDecorridoMin, motivo)
   const distanciaTotal = Math.abs(trade.takeProfit - trade.entry);
   const distanciaPercorrida = distanciaTotal > 0 ? (trade.signal === 'CALL' ? (currentPrice - trade.entry) : (trade.entry - currentPrice)) : 0;
   const pct = distanciaTotal > 0 ? ((distanciaPercorrida / distanciaTotal) * 100).toFixed(1) : '0.0';
-  return { titulo: `🕐 Encerrado por timeout: ${nome}`, corpo: `${nome} · ${trade.signal}\n⏱️ ${tempoDecorridoMin}min sem avanço suficiente (${pct}% do alvo)\n❌ Motivo: ${motivo} · fecha a posição`, detalhes: { tipo: 'TIMEOUT', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: tempoDecorridoMin + 'min', motivo, percentualPercorrido: pct + '%', extensoes: trade.extensoes || 0 } };
+  return { titulo: `🕰️ Encerrado por timeout: ${nome}`, corpo: `${nome} · ${trade.signal}\n⏱️ ${tempoDecorridoMin}min sem avanço suficiente (${pct}% do alvo)\n❌ Motivo: ${motivo} · fecha a posição`, detalhes: { tipo: 'TIMEOUT', nomeAmigavel: nome, direcao: trade.signal, modo: trade.mode, entry: trade.entry, currentPrice, takeProfit: trade.takeProfit, stopLoss: trade.stopLoss, duracao: tempoDecorridoMin + 'min', motivo, percentualPercorrido: pct + '%', extensoes: trade.extensoes || 0 } };
 }
 
 // ========== REGISTAR SINAL (Turso) ==========
@@ -1877,7 +1856,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
   const trade = tradesAbertos.get(tradeKey);
   if (trade) {
     trade.currentPrice = currentPrice;
-    // ⭐ PATCH 4e — passar diagnostico_mercado ao avaliarEsticamento
     const esticTradeCache = avaliarEsticamento(
       dados.consolidated.score_reasons,
       dados.consolidated.diagnostico_mercado
@@ -1984,7 +1962,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
             await registrarEEnviarSinal(symbol, mode, 'CORRECAO_REAL',
               formatarMensagemCorrecaoReal(trade, currentPrice, tempoDecorridoMin, _motivoCurto, _tfExtraido),
               { score: dados.consolidated.score }, watchers, sid);
-            logger.info(`📊 [PUSH-CONTEXTO] ${symbol} (${mode}) → CORRECAO_REAL (#${_contagem + 1})`);
+            logger.info(`📉 [PUSH-CONTEXTO] ${symbol} (${mode}) → CORRECAO_REAL (#${_contagem + 1})`);
           }
           else if (_estadoAtual === 'RESPIRACAO') {
             await registrarEEnviarSinal(symbol, mode, 'RESPIRACAO_SAUDAVEL',
@@ -2086,7 +2064,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
           trade.avisoExaustaoEnviado = true;
           logger.info(`⚠️ [FIX #56+#58] Exaustão CONFIRMADA em ${tradeKey}`);
         } else {
-          logger.info(`💨 [FIX #58] ${tradeKey} trigger esticado mas ${confirmacao.motivo} — aguarda confirmação`);
+          logger.info(`💡 [FIX #58] ${tradeKey} trigger esticado mas ${confirmacao.motivo} — aguarda confirmação`);
           if (!emRespiracaoOuPullback && !trade.avisoTempoEsgotadoEnviado && tempoDecorridoMin >= 10 && percentualPercorrido < 0.15) { msgObj = formatarMensagemTempoEsgotado(trade); tipo = 'TEMPO_ESGOTADO'; trade.avisoTempoEsgotadoEnviado = true; fecharTrade = true; }
           else if (!trade.avisoAceleracaoEnviado && tempoDecorridoMin <= 2 && percentualPercorrido >= 0.40) { msgObj = formatarMensagemAceleracao(trade); tipo = 'ACELERACAO'; trade.avisoAceleracaoEnviado = true; trade.avisoSeguindoEnviado = true; }
           else if (!trade.avisoSeguindoEnviado && percentualPercorrido >= 0.30) { msgObj = formatarMensagemSeguindo(trade); tipo = 'SEGUINDO'; trade.avisoSeguindoEnviado = true; }
@@ -2164,13 +2142,29 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         dados.consolidated.score_reasons,
         dados.consolidated.diagnostico_mercado
       );
-      if (esticSinal.esticado && esticSinal.nivel === 'ALTO') {
-        logger.info(`⛔ [FILTRO EXTREMO][${sid}] ${symbol} (${mode}) SINAL ignorado — ${esticSinal.motivo}`);
+
+      // ⭐ NOVO: TRAVA SE HOUVER AVISO CRÍTICO DE TP/SL NO MOTOR
+      const temAvisoCritico = (dados.consolidated.score_reasons || []).some(r => 
+        typeof r === 'string' && (r.includes('TP/SL apertados') || r.includes('zona CRÍTICO'))
+      );
+
+      if ((esticSinal.esticado && esticSinal.nivel === 'ALTO') || temAvisoCritico) {
+        logger.info(`⛔ [FILTRO CRÍTICO][${sid}] ${symbol} (${mode}) SINAL ignorado — ${temAvisoCritico ? 'Aviso de TP/SL Crítico detetado no motor' : esticSinal.motivo}`);
         prontidaoAtiva.delete(tradeKey);
         prontidaoHistorico.delete(tradeKey);
         prontidaoForaContagem.delete(tradeKey);
         prontidaoUltimoScoreEnviado.delete(tradeKey);
         return;
+      }
+
+      // ⭐ NOVO: TRAVA-DIRECIONAL (Evita whipsaw PUT->CALL em 30min)
+      const ultimaDir = ultimaDirecaoPorPar.get(tradeKey);
+      if (ultimaDir && ultimaDir.sinal !== dados.consolidated.signal) {
+        const minutosPassados = (Date.now() - ultimaDir.timestamp) / 60000;
+        if (minutosPassados < 30) {
+          logger.warn(`⛔ [DIRECTION-LOCK][${sid}] ${symbol} (${mode}) SINAL ${dados.consolidated.signal} BLOQUEADO. Último sinal foi ${ultimaDir.sinal} há ${minutosPassados.toFixed(0)}min (trava de 30min).`);
+          return;
+        }
       }
 
       const novoTrade = {
@@ -2200,6 +2194,12 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       tradesAbertos.set(tradeKey, novoTrade);
       persistTradeOpen(tradeKey, novoTrade);
       ultimoSinalPorPar.set(tradeKey, agora);
+
+      // Regista a direção para a trava
+      ultimaDirecaoPorPar.set(tradeKey, {
+        sinal: dados.consolidated.signal,
+        timestamp: agora
+      });
 
       const zonaTxt = dados.consolidated.zona === 'A' ? 'SINAL CONFIRMADO' : 'SINAL MODERADO';
       logger.info(`🚀 [${zonaTxt}][${sid}] ${symbol} (${mode}) → ${dados.consolidated.signal} @ ${dados.suggestion.entry}`);
@@ -2265,10 +2265,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       }
     }
 
-    // ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 5
-    // Respeitar `acao_recomendada` do diagnóstico. O motor já decidiu o que
-    // fazer. Quando o diagnóstico diz "não entrar CALL, aguarda pullback" ou
-    // "aguardar alinhamento", o painel NÃO emite PRONTIDAO.
     const _acaoDiag = _diag?.acao_recomendada;
     const _estadoDiag = _diag?.estado;
 
@@ -2286,7 +2282,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     }
 
     if (_acaoDiag === 'AGUARDAR_ALINHAMENTO' || _acaoDiag === 'AGUARDAR_DEFINICAO') {
-      logger.info(`⏸️ [DIAG-SEM-DIRECAO][${sid}] ${symbol} (${mode}) → ${_estadoDiag} — sem direcção clara`);
+      logger.info(`⏸️ [DIAG-SEM-DIRECAO][${sid}] ${symbol} (${mode}) → ${_estadoDiag} — sem direção clara`);
       prontidaoForaContagem.delete(tradeKey);
       return;
     }
@@ -2298,7 +2294,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       return;
     }
 
-    // ⭐ PATCH 4c — passar diagnostico_mercado ao avaliarEsticamento
     const estic = avaliarEsticamento(
       dados.consolidated.score_reasons,
       dados.consolidated.diagnostico_mercado
@@ -2311,7 +2306,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
 
     const matureAprovadoMotor = dados.consolidated?.mature_aprovado;
     const matureMotivo = dados.consolidated?.mature_motivo_bloqueio || null;
-    // ⭐ PATCH 4b — passar diagnostico_mercado ao diagnosticoProximidade
     const proximidadePront = diagnosticoProximidade(
       dados.consolidated.score_reasons,
       dados.consolidated.diagnostico_mercado
@@ -2657,7 +2651,6 @@ app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ⭐ PATCH #PANEL-DIAG-AUTHORITY (v1) — PATCH 4g + PATCH 7
 app.post('/api/scan-group', authMiddleware, async (req, res) => {
   const { group, mode } = req.body;
   if (!group || !mode) return res.status(400).json({ error: 'Os campos "group" e "mode" são obrigatórios.' });
@@ -2688,7 +2681,7 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
         if (signal !== 'HOLD' && zona === 'A') {
           mensagemProntidao = `🚨 Sinal CONFIRMADO ${signal} — score ${score}`;
         } else if (signal !== 'HOLD' && zona === 'B') {
-          mensagemProntidao = `⚡ Sinal MODERADO ${signal} — score ${score} (entrada validada)`;
+          mensagemProntidao = `⚠️ Sinal MODERADO ${signal} — score ${score} (entrada validada)`;
         } else if (zona === 'B') {
           const dirPrep = extrairDirecaoPrep(data);
           const dirTxt = dirPrep ? dirPrep : 'aguarda direção';
@@ -2698,19 +2691,16 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
         } else if (score >= zonaBMin - 20) {
           mensagemProntidao = `🔵 Em formação — score ${score} (faltam ${distZonaB} pts p/ Zona B)`;
         } else {
-          mensagemProntidao = `⚪ Aguarda — ${distZonaB} pts p/ Zona B`;
+          mensagemProntidao = `⏪ Aguarda — ${distZonaB} pts p/ Zona B`;
         }
 
-        // ⭐ PATCH 4g — passar diagnostico_mercado ao avaliarEsticamento
         const estic = avaliarEsticamento(consolidated.score_reasons, consolidated.diagnostico_mercado);
         if (estic.esticado && estic.nivel === 'ALTO') {
           mensagemProntidao = `🔥 ESTICADO — ${estic.motivo}`;
         }
 
-        // ⭐ PATCH 4g — passar diagnostico_mercado ao diagnosticoProximidade
         const proximidade = diagnosticoProximidade(consolidated.score_reasons, consolidated.diagnostico_mercado);
 
-        // ⭐ PATCH 7 — mensagemProntidao reflecte acao_recomendada
         const _diagScan = consolidated.diagnostico_mercado;
         if (_diagScan?.acao_recomendada) {
           const _acaoScan = _diagScan.acao_recomendada;
@@ -2730,7 +2720,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           }
         }
 
-        // ⭐ v2.35 — LIMIAR-DIAG
         const limiarInfo = consolidated.limiar_tendencia || null;
         const limiarModo = limiarInfo?.modo || 'NONE';
         const limiarAplicadoReal = consolidated.limiar_aplicado === true;
@@ -2779,7 +2768,6 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
 
           proximidade,
           esticamento: estic,
-          // ⭐ PATCH 6c — propagar diagnosticoMercado no scan-group
           diagnosticoMercado: consolidated.diagnostico_mercado || null,
           mensagemProntidao: mensagemProntidaoEnriquecida,
           distanciaZonaB: distZonaB,
@@ -2931,26 +2919,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   for (const id of VALID_SERVER_IDS) {
     logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
   }
-  logger.info(`v2.38: PANEL-RELAY-STRICT (extrairDirecaoPrep só aceita direcção do motor — sem inferência).`);
-  logger.info(`v2.37: PANEL-DIAG-AUTHORITY (painel confia no diagnóstico do motor — 7 alterações).`);
-  logger.info(`v2.36: PUSH-DIAG-FIX + CONFIRM-FRESHNESS (retificações críticas).`);
-  logger.info(`v2.35: LIMIAR-DIAG (diagnóstico completo de rejeições e bloqueios do LIMIAR).`);
-  logger.info(`v2.34: PUSH-DIAGNÓSTICO (logs detalhados + truncatura payload).`);
-  logger.info(`v2.33: PUSH-CONTEXTO v2 (Respiração / Correção / Reversão) — anti-spam por timeframe.`);
-  logger.info(`v2.32: Reconhecimento de autorizações do motor (FIX #DEM-TREND-EXPLOSIVO).`);
-  logger.info(`v2.31: Reconhecimento da ORIGEM do sinal (motor / limiar / pullback).`);
-  logger.info(`v2.30: Reconhecimento REVERSÃO CONFIRMADA + EXAUSTÃO MULTI-TF + validarPerdendoForca.`);
-  logger.info(`v2.29: Reconhecimento MACRO-AUTHORITY-GUARD e MICRO-AGUARDA-FLIP no painel.`);
-  logger.info(`v2.28: Consistência com FIX #PANEL-TIMING-CONTEXT + #PANEL-MATURE.`);
-  logger.info(`v2.27: MATURE fallback (motor pode ou não expor mature_aprovado) + readiness_score no detalhe.`);
-  logger.info(`v2.26: Auto-close 90% do alvo + Peak tracking (fecho em pullback do pico).`);
-  logger.info(`v2.25: Normalização automática de URL (fix 404 /analyze).`);
-  logger.info(`v2.24: Atualizações por modo (SNIPER 3min | CAÇADOR 10min | PESCADOR 30min | BALEEIRO 2h).`);
-  logger.info(`v2.23: Multi-servidor de análise (watchlist/engine por servidor, push combinado).`);
-  logger.info(`v2.22: Cooldown PRONTIDAO por modo + persistência de ultimo_score.`);
-  logger.info(`v2.21: Turso (libSQL) substitui Firestore.`);
-  logger.info(`FIX #80 + #80b: Respiração mode-aware activa.`);
-  logger.info(`FIX-PRONTIDAO v3: MATURE com fallback robusto.`);
+  logger.info(`v2.39: TRAVA-DIRECIONAL ativa (Bloqueia inversão de direção em 30min) + Filtro Crítico TP/SL`);
   try {
     await loadStateFromTurso();
   } catch (e) {
