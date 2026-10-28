@@ -1,15 +1,10 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
-// v2.41 — RE-FIRE-GUARD: 5 correções aplicadas
-//         · PATCH A — permitidoPush usa dados.risk_validation (não consolidated.risk_validation)
-//         · PATCH B — TRAVA-DIRECIONAL respeita reversões autorizadas pelo motor
-//         · PATCH C — Filtro TP/SL crítico aceita _tpslCriticoSizing
-//         · PATCH D — PRONTIDAO mostra claramente quando motor bloqueou MATURE
-//         · FIX 1 — _reenviarSinalConfirmado desativado por defeito (opt-in via PUSH_RETRY_ENABLED)
-//         · FIX 2 — ultimoFechoPorPar + guard contra re-fire agressivo pós-fecho (timeout)
-//         · FIX 3 — re-emissão com título "🔄 SINAL REFORÇADO" + motivo no corpo
-//         · FIX 4 — limpeza de ultimoFechoPorPar no setInterval (>1h)
-//         · FIX 5 — log explícito [RE-EMISSÃO] em registrarEEnviarSinal
-// (ver histórico completo em versões anteriores — mantido igual)
+// v2.42 — MATURE-ALIGN-MOTOR + HORIZONTE-FIX
+//         · FIX 1 — SCORE_QUASE_ENTRADA + DEFAULT_PREFS.scoreMature alinhados ao
+//                   motor pós-FIX #MATURE-SCORE-MIN-35 (35/33/40/43 em vez de 40/38/45/48)
+//         · FIX 2 — _horizonteMotor lê de dados.consolidated.horizonte (antes lia
+//                   dados.horizonte que não existe → PATCH #HORIZONTE-DINAMICO morto)
+// (v2.41 mantido: RE-FIRE-GUARD com 5 fixes anteriores)
 
 import express from 'express';
 import cors from 'cors';
@@ -157,10 +152,10 @@ CREATE TABLE IF NOT EXISTS user_watchlists (
 );
 CREATE TABLE IF NOT EXISTS user_preferences (
   token_hash TEXT PRIMARY KEY,
-  sniper_early INTEGER NOT NULL DEFAULT 25, sniper_mature INTEGER NOT NULL DEFAULT 40,
-  cacador_early INTEGER NOT NULL DEFAULT 28, cacador_mature INTEGER NOT NULL DEFAULT 42,
-  pescador_early INTEGER NOT NULL DEFAULT 30, pescador_mature INTEGER NOT NULL DEFAULT 45,
-  baleeiro_early INTEGER NOT NULL DEFAULT 35, baleeiro_mature INTEGER NOT NULL DEFAULT 48,
+  sniper_early INTEGER NOT NULL DEFAULT 25, sniper_mature INTEGER NOT NULL DEFAULT 35,
+  cacador_early INTEGER NOT NULL DEFAULT 28, cacador_mature INTEGER NOT NULL DEFAULT 33,
+  pescador_early INTEGER NOT NULL DEFAULT 30, pescador_mature INTEGER NOT NULL DEFAULT 40,
+  baleeiro_early INTEGER NOT NULL DEFAULT 35, baleeiro_mature INTEGER NOT NULL DEFAULT 43,
   atualizado_em INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS open_trades (trade_key TEXT PRIMARY KEY, data TEXT NOT NULL, atualizado_em INTEGER NOT NULL);
@@ -437,22 +432,24 @@ const PRONTIDAO_CONFIG = {
 function getProntidaoConfig(mode) { return PRONTIDAO_CONFIG[mode] || PRONTIDAO_CONFIG['CAÇADOR']; }
 
 const SCORE_PRONTIDAO_MIN = { SNIPER: 25, 'CAÇADOR': 28, PESCADOR: 30, BALEEIRO: 35 };
-// ⭐ PATCH #SCORE-QUASE-ENTRADA-CACADOR (v1) — alinha com motor
-// Motor (analyze-handler) usa SCORE_QUASE_ENTRADA_PANEL = {SNIPER:40, CAÇADOR:38, PESCADOR:45, BALEEIRO:48}
-// para decidir mature_aprovado. Server usava 42 no CAÇADOR → watchers
-// recebiam EARLY mesmo quando o motor já aprovou MATURE (score 38-41).
-const SCORE_QUASE_ENTRADA = { SNIPER: 40, 'CAÇADOR': 38, PESCADOR: 45, BALEEIRO: 48 };
-function getScoreProntidaoMin(mode) { return SCORE_PRONTIDAO_MIN[mode] || 30; }
-function getScoreQuaseEntrada(mode) { return SCORE_QUASE_ENTRADA[mode] || 40; }
 
-// ⭐ PATCH #DEFAULT-PREFS-ALINHADO-MOTOR (v1)
-// scoreMature segue SCORE_QUASE_ENTRADA_PANEL do motor.
-// scoreEarly é o "pre-early", mantém-se igual.
+// ⭐ FIX 1 (v2.42) — MATURE-ALIGN-MOTOR
+// Universal: alinha SCORE_QUASE_ENTRADA ao motor pós-FIX #MATURE-SCORE-MIN-35.
+// Antes o motor usava {SNIPER:40, CAÇADOR:38, PESCADOR:45, BALEEIRO:48}
+// e o server estava alinhado a essa versão. Agora o motor reduziu em 5pts
+// (35/33/40/43) e o server TEM DE ACOMPANHAR — senão envia EARLY mesmo
+// quando o motor já aprovou MATURE (score 35-39 no SNIPER, por ex.).
+const SCORE_QUASE_ENTRADA = { SNIPER: 35, 'CAÇADOR': 33, PESCADOR: 40, BALEEIRO: 43 };
+function getScoreProntidaoMin(mode) { return SCORE_PRONTIDAO_MIN[mode] || 30; }
+function getScoreQuaseEntrada(mode) { return SCORE_QUASE_ENTRADA[mode] || 35; }
+
+// ⭐ FIX 1 (v2.42) — DEFAULT_PREFS alinhado ao motor
+// scoreMature = SCORE_QUASE_ENTRADA. scoreEarly mantém-se igual.
 const DEFAULT_PREFS = {
-  SNIPER:    { scoreEarly: 25, scoreMature: 40 },
-  'CAÇADOR': { scoreEarly: 28, scoreMature: 38 },  // ← era 42
-  PESCADOR:  { scoreEarly: 30, scoreMature: 45 },
-  BALEEIRO:  { scoreEarly: 35, scoreMature: 48 }
+  SNIPER:    { scoreEarly: 25, scoreMature: 35 },
+  'CAÇADOR': { scoreEarly: 28, scoreMature: 33 },
+  PESCADOR:  { scoreEarly: 30, scoreMature: 40 },
+  BALEEIRO:  { scoreEarly: 35, scoreMature: 43 }
 };
 
 const prefsCache = new Map();
@@ -522,39 +519,23 @@ async function saveUserPreferences(tokenHash, raw) {
   return s;
 }
 
-// ⭐ PATCH #PRONTIDAO-GLOBAL-5MIN (v1) — universal
-// Universal: reduz de 10min para 5min.
-// Antes: se SNIPER enviava prontidão de BTC, CAÇADOR ficava bloqueado
-// durante 10min (mesmo sendo análises distintas). 5min deixa os modos
-// coexistirem (SNIPER 15min cooldown + CAÇADOR 20min cooldown já limitam
-// por si). O global evita spam de alertas idênticos em cascata.
 const PRONTIDAO_GLOBAL_COOLDOWN_MS = 5 * 60 * 1000;
-// ⭐ PATCH #HORIZONTE-DINAMICO (v1) — universal
-// Universal: usa o horizonte do motor (consolidated.horizonte) para calcular
-// timeout/intervalo. Motor emite SCALP/MID/SWING com base em macro real.
-// Um sinal SNIPER pode ter horizonte MID (2-8h) se macro alinhada.
-// Um sinal BALEEIRO pode ter horizonte SCALP (5-30min) se contra macro.
-//
-// ANTES: timeout fixo por modo (SNIPER=15min) → cortava trades MID/SWING do SNIPER.
-// DEPOIS: timeout = horizonte. Compat: trades antigos sem horizonte
-// caem no fallback por modo.
 const HORIZONTE_TIMEOUT_MS = {
-  SCALP: 30 * 60 * 1000,           // 30min
-  MID:   8 * 60 * 60 * 1000,       // 8h
-  SWING: 5 * 24 * 60 * 60 * 1000   // 5 dias
+  SCALP: 30 * 60 * 1000,
+  MID:   8 * 60 * 60 * 1000,
+  SWING: 5 * 24 * 60 * 60 * 1000
 };
 const HORIZONTE_TIMEOUT_EXTEND_MS = {
-  SCALP: 15 * 60 * 1000,           // +15min
-  MID:   2 * 60 * 60 * 1000,       // +2h
-  SWING: 24 * 60 * 60 * 1000       // +1 dia
+  SCALP: 15 * 60 * 1000,
+  MID:   2 * 60 * 60 * 1000,
+  SWING: 24 * 60 * 60 * 1000
 };
 const HORIZONTE_INTERVALO_ATUALIZACAO_MS = {
-  SCALP: 3 * 60 * 1000,            // 3min
-  MID:   30 * 60 * 1000,           // 30min
-  SWING: 2 * 60 * 60 * 1000        // 2h
+  SCALP: 3 * 60 * 1000,
+  MID:   30 * 60 * 1000,
+  SWING: 2 * 60 * 60 * 1000
 };
 
-// Fallback por modo (usado quando trade.horizonte é null — trades antigos)
 const TRADE_TIMEOUT_POR_MODO_MS = { 'SNIPER': 15*60*1000, 'CAÇADOR': 60*60*1000, 'PESCADOR': 12*60*60*1000, 'BALEEIRO': 72*60*60*1000 };
 const TRADE_TIMEOUT_EXTEND_POR_MODO_MS = { 'SNIPER': 8*60*1000, 'CAÇADOR': 30*60*1000, 'PESCADOR': 6*60*60*1000, 'BALEEIRO': 48*60*60*1000 };
 const TRADE_TIMEOUT_MS_DEFAULT = 20 * 60 * 1000;
@@ -562,6 +543,7 @@ const TRADE_TIMEOUT_EXTEND_MS_DEFAULT = 15 * 60 * 1000;
 
 function getTimeoutModo(mode) { return TRADE_TIMEOUT_POR_MODO_MS[mode] || TRADE_TIMEOUT_MS_DEFAULT; }
 function getTimeoutExtendModo(mode) { return TRADE_TIMEOUT_EXTEND_POR_MODO_MS[mode] || TRADE_TIMEOUT_EXTEND_MS_DEFAULT; }
+const INTERVALO_ATUALIZACAO_POR_MODO_MS = { 'SNIPER': 3*60*1000, 'CAÇADOR': 10*60*1000, 'PESCADOR': 30*60*1000, 'BALEEIRO': 120*60*1000 };
 function getIntervaloAtualizacao(mode) { return INTERVALO_ATUALIZACAO_POR_MODO_MS[mode] || 10 * 60 * 1000; }
 
 function getTimeoutTrade(trade) {
@@ -581,8 +563,6 @@ function getIntervaloAtualizacaoTrade(trade) {
 }
 const PROGRESSO_MINIMO_EXTENSAO = 0.05;
 const EXTENSOES_MAX = 3;
-// ⭐ PATCH #HORIZONTE-DINAMICO (v1) — apenas constante; função já está acima
-const INTERVALO_ATUALIZACAO_POR_MODO_MS = { 'SNIPER': 3*60*1000, 'CAÇADOR': 10*60*1000, 'PESCADOR': 30*60*1000, 'BALEEIRO': 120*60*1000 };
 
 async function getUserWatchlist(tokenHash, serverId = DEFAULT_SERVER_ID) {
   if (!tursoInitialized) return null;
@@ -664,18 +644,10 @@ const prontidaoUltimoScoreEnviado = new Map();
 const arrefecimentoUltimoEnvio = new Map();
 const prontidaoGlobalPorSymbol = new Map();
 const ultimaDirecaoPorPar = new Map();
-
-// ⭐ PATCH #RE-FIRE-GUARD (v1) — universal
-// Universal: guarda o último fecho por tradeKey para controlar re-emissões.
-//   • Se o trade fechou nos últimos N minutos, o próximo SINAL_CONFIRMADO
-//     exige score/confiança ESTREITAMENTE MAIORES para evitar repetição
-//     em timeout (o caso mais comum).
-//   • Sem este guard, SNIPER (timeout 15min) re-emite o mesmo sinal após
-//     5min de cooldown se o motor continuar a dizer "entrar".
-const ultimoFechoPorPar = new Map();  // tradeKey → { tipo, timestamp, score, confidence, signal }
-const RE_FIRE_GUARD_MS = 15 * 60 * 1000;     // 15min de proteção
-const RE_FIRE_SCORE_DELTA_MIN = 8;           // +8pts de score mínimo
-const RE_FIRE_CONF_DELTA_MIN = 0.08;         // +8% de confiança mínima
+const ultimoFechoPorPar = new Map();
+const RE_FIRE_GUARD_MS = 15 * 60 * 1000;
+const RE_FIRE_SCORE_DELTA_MIN = 8;
+const RE_FIRE_CONF_DELTA_MIN = 0.08;
 
 setInterval(() => {
   const agora = Date.now();
@@ -690,8 +662,6 @@ setInterval(() => {
   }
   for (const [sym, ts] of prontidaoGlobalPorSymbol.entries()) if (agora - ts > 30 * 60 * 1000) prontidaoGlobalPorSymbol.delete(sym);
   for (const [key, data] of ultimaDirecaoPorPar.entries()) if (agora - data.timestamp > 30 * 60 * 1000) ultimaDirecaoPorPar.delete(key);
-
-  // ⭐ PATCH #RE-FIRE-GUARD (v1) — limpar entradas antigas (>1h)
   for (const [key, data] of ultimoFechoPorPar.entries()) if (agora - data.timestamp > 60 * 60 * 1000) ultimoFechoPorPar.delete(key);
 }, 60 * 1000);
 
@@ -757,8 +727,7 @@ async function loadStateFromTurso() {
       if (!parsed) continue;
       const newKey = buildTradeKey(parsed.serverId, parsed.symbol, parsed.mode);
       const t = JSON.parse(row.data);
-      // ⭐ PATCH #HORIZONTE-DINAMICO (v1) — restauro usa horizonte (fallback modo)
-      if (!t.horizonte) t.horizonte = null;  // compat trades antigos
+      if (!t.horizonte) t.horizonte = null;
       const timeoutAt = t.timeoutAt || (t.timestamp + getTimeoutTrade(t));
       if (agora > timeoutAt) t.timeoutAt = agora + 60 * 1000;
       if (t.peakPercentual === undefined) t.peakPercentual = 0;
@@ -798,7 +767,6 @@ async function loadStateFromTurso() {
 
 // ========== HELPERS ==========
 
-// ⭐ PATCH #PANEL-RELAY-STRICT — direção só quando autorizada
 function extrairDirecaoPrep(dados) {
   const _effDir = dados.consolidated?.effectiveDirection;
   const _effSrc = dados.consolidated?.effectiveDirectionSource;
@@ -914,12 +882,11 @@ function confirmaExaustaoMultiTF(dados, trade) {
 
 // ========== FORMATAÇÃO DE MENSAGENS ==========
 
-// ⭐ PATCH D — mensagem clara quando motor bloqueou MATURE
 function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const nomeAmigavel = getFriendlyName(symbol);
   const dirLabel = direcao === 'CALL' ? 'COMPRA (CALL)' : 'VENDA (PUT)';
   const score = extras.scoreAtual ?? dados.consolidated.score;
-  const scoreQuase = extras.scoreQuase ?? 40;
+  const scoreQuase = extras.scoreQuase ?? 35;
   const nivel = extras.nivelProntidao || 'EARLY';
 
   const proximidadeDiag = diagnosticoProximidade(dados.consolidated.score_reasons || [], dados.consolidated.diagnostico_mercado);
@@ -980,9 +947,6 @@ function formatarMensagemSinal(symbol, dados, mode) {
   const conf = (Number.isFinite(confNum) ? (confNum * 100).toFixed(1) : '0.0');
   const zona = consolidated.zona === 'B' ? 'B' : 'A';
 
-  // ⭐ PATCH #RE-FIRE-LABEL (v1) — universal
-  // Universal: quando dados._reEmissao=true, o título muda para "🔄 SINAL REFORÇADO"
-  // e o corpo mostra o motivo. Isto evita que o utilizador pense que é um sinal novo.
   const _ehReEmissao = dados._reEmissao === true;
   const tituloBase = _ehReEmissao
     ? (zona === 'A' ? '🔄 SINAL REFORÇADO' : '🔄 SINAL REFORÇADO (moderado)')
@@ -1096,7 +1060,6 @@ async function registrarEEnviarSinal(symbol, mode, tipo, msg, extra = {}, watche
   const sid = resolveServerId(serverId);
   const { titulo, corpo, detalhes } = msg;
 
-  // ⭐ PATCH #RE-FIRE-LOG (v1) — log explícito quando é re-emissão
   const _ehReEmissao = extra._reEmissao === true || /^🔄/.test(titulo);
   if (_ehReEmissao) {
     logger.warn(`[RE-EMISSÃO][${sid}] ${symbol} (${mode}) [${tipo}] ${titulo} — motivo: ${extra._reEmissaoMotivo || 'não especificado'}`);
@@ -1142,19 +1105,11 @@ async function buscarSinalAnalise(symbol, mode, serverId = DEFAULT_SERVER_ID) {
   } catch (err) { logger.error(`❌ Erro conexão ${symbol} [${server.id}]:`, err.message); return null; }
 }
 
-// ⭐ PATCH #RETRY-OPT-IN (v1) — universal
-// Universal: só faz retry se o utilizador ativar via env var.
-// Por defeito NÃO faz (evita duplicação visual).
-//   • PUSH_RETRY_ENABLED=true   → ativa (default: false)
-//   • PUSH_RETRY_DELAY_MS=30000 → delay do retry (default: 30s)
-//
-// Recomendação: deixar OFF. Users com push funcional recebem 1 notificação.
-// Users sem push ativo podem ativar via env var se quiserem retry agressivo.
 const PUSH_RETRY_ENABLED = String(process.env.PUSH_RETRY_ENABLED || 'false').toLowerCase() === 'true';
 const PUSH_RETRY_DELAY_MS = parseInt(process.env.PUSH_RETRY_DELAY_MS, 10) || 30 * 1000;
 
 async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers, serverId = DEFAULT_SERVER_ID) {
-  if (!PUSH_RETRY_ENABLED) return;  // ← skip se desativado (default)
+  if (!PUSH_RETRY_ENABLED) return;
 
   setTimeout(async () => {
     try {
@@ -1173,10 +1128,6 @@ async function _reenviarSinalConfirmado(symbol, mode, tradeKey, watchers, server
   }, PUSH_RETRY_DELAY_MS);
 }
 
-// ⭐═══════════════════════════════════════════════════════════════════
-// FUNÇÃO PRINCIPAL — analisarEEnviarSinais
-// Contém PATCH A, B, C aplicados + FIX 2 (re-fire guard) + FIX 5 (flags)
-// ⭐═══════════════════════════════════════════════════════════════════
 async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEFAULT_SERVER_ID) {
   const sid = resolveServerId(serverId);
   const dados = await buscarSinalAnalise(symbol, mode, sid);
@@ -1207,7 +1158,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     if (percentualPercorrido > (trade.peakPercentual || 0)) trade.peakPercentual = percentualPercorrido;
     const pullbackDoPico = (trade.peakPercentual || 0) - percentualPercorrido;
 
-    // ⭐ PATCH #HORIZONTE-DINAMICO (v1) — usa horizonte do trade (fallback modo)
     const timeoutModo = getTimeoutTrade(trade);
     const timeoutExtendModo = getTimeoutExtendTrade(trade);
     const emRespiracaoOuPullback = detectarRespiracaoOuPullback(dados, trade, percentualPercorrido);
@@ -1291,7 +1241,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         cooldownPosTrade.set(tradeKey, agora + cdMsTimeout);
         persistCooldown(tradeKey, agora + cdMsTimeout);
 
-        // ⭐ PATCH #RE-FIRE-GUARD (v1) — registar timeout para guard futuro
         ultimoFechoPorPar.set(tradeKey, {
           tipo: 'TIMEOUT',
           timestamp: agora,
@@ -1342,7 +1291,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       cooldownPosTrade.set(tradeKey, agora + cdMs);
       persistCooldown(tradeKey, agora + cdMs);
 
-      // ⭐ PATCH #RE-FIRE-GUARD (v1) — registar fecho para guard futuro
       ultimoFechoPorPar.set(tradeKey, {
         tipo,
         timestamp: agora,
@@ -1365,7 +1313,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     return;
   }
 
-  // ⭐ PATCH A — corrigido: dados.risk_validation (não consolidated.risk_validation)
   const consolidadoPush = dados.consolidated || {};
   const sinalPush = String(consolidadoPush.signal || 'HOLD').toUpperCase();
   const permitidoPush = consolidadoPush.permitido !== false &&
@@ -1387,7 +1334,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         typeof r === 'string' && (r.includes('TP/SL apertados') || r.includes('zona CRÍTICO'))
       );
 
-      // ⭐ PATCH C — aceita quando motor compensou o risco (sizing reduzido)
       const _motorCompensouRisco =
         dados.consolidated._tpslCriticoSizing != null &&
         dados.consolidated._tpslCriticoSizing > 0 &&
@@ -1408,7 +1354,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         logger.warn(`⚠️ [TP-SL-CRITICO-CONFLUENCE][${sid}] ${symbol} (${mode}) relay com aviso — motor compensou (sizing=${dados.consolidated._tpslCriticoSizing}× score=${dados.consolidated.score} conf=${(dados.consolidated.confidence*100).toFixed(0)}%)`);
       }
 
-      // ⭐ PATCH B — TRAVA-DIRECIONAL respeita reversões autorizadas
       const _diagRev = dados.consolidated?.diagnostico_mercado;
       const _origemRev = dados.consolidated?._origemSinal;
       const _ehReversaoAutorizada =
@@ -1431,10 +1376,14 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         }
       }
 
-      // ⭐ PATCH #HORIZONTE-DINAMICO (v1) — guarda horizonte do motor
-      const _horizonteMotor = dados.horizonte || dados.consolidated?._horizonte?.horizonte || null;
+      // ⭐ FIX 2 (v2.42) — HORIZONTE-DINAMICO
+      // Universal: o motor expõe o horizonte em `consolidated.horizonte`
+      // (já resolvido — SCALP/MID/SWING). Antes o server lia `dados.horizonte`
+      // (que não existe) e `dados.consolidated._horizonte` (que também não é
+      // exposto — só o campo `horizonte` final é). Resultado: `_horizonteMotor`
+      // ficava SEMPRE null e o PATCH #HORIZONTE-DINAMICO nunca disparava.
+      const _horizonteMotor = dados.consolidated?.horizonte || null;
 
-      // ⭐ PATCH #RE-FIRE-GUARD (v1) — verificar se está a re-emitir
       const _fechoRecente = ultimoFechoPorPar.get(tradeKey);
       const _tempoDesdeFecho = _fechoRecente ? (agora - _fechoRecente.timestamp) : Infinity;
       const _ehReEmissaoRecente = _tempoDesdeFecho < RE_FIRE_GUARD_MS;
@@ -1444,7 +1393,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         const _scoreSubiu = (dados.consolidated.score ?? 0) >= (_fechoRecente.score + RE_FIRE_SCORE_DELTA_MIN);
         const _confSubiu = (dados.consolidated.confidence ?? 0) >= (_fechoRecente.confidence + RE_FIRE_CONF_DELTA_MIN);
 
-        // Bloquear re-emissão se: mesmo lado + não subiu o suficiente
         if (_mesmoLado && !_scoreSubiu && !_confSubiu) {
           logger.info(
             `⏭️ [RE-FIRE-GUARD] ${symbol} (${mode}) ${dados.consolidated.signal} bloqueado — ` +
@@ -1456,7 +1404,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
           return;
         }
 
-        // Se passou o guard → marcar como re-emissão (aviso visual)
         if (_mesmoLado && (_scoreSubiu || _confSubiu)) {
           logger.info(
             `🔄 [RE-FIRE-GUARD] ${symbol} (${mode}) RE-EMISSÃO aceite — ` +
@@ -1476,7 +1423,7 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
         takeProfit: dados.suggestion.takeProfit,
         stopLoss: dados.suggestion.stopLoss,
         zonaEntrada: dados.consolidated.zona,
-        horizonte: _horizonteMotor,   // ← NOVO: SCALP | MID | SWING | null
+        horizonte: _horizonteMotor,
         watchers: [...watchers],
         timestamp: agora,
         avisoSeguindoEnviado: false, avisoZeroRiscoEnviado: false,
@@ -1500,7 +1447,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
           score: dados.consolidated.score, confidence: dados.consolidated.confidence,
           zona: dados.consolidated.zona,
           entry: dados.suggestion.entry, takeProfit: dados.suggestion.takeProfit, stopLoss: dados.suggestion.stopLoss,
-          // ⭐ PATCH #RE-FIRE-LOG (v1) — propagar flags de re-emissão
           _reEmissao: dados._reEmissao === true,
           _reEmissaoMotivo: dados._reEmissaoMotivo || null
         }, watchers, sid);
@@ -1544,13 +1490,6 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       } else { prontidaoForaContagem.delete(tradeKey); }
     }
 
-     // ⭐ PATCH #PRONTIDAO-BLOQUEIA-ACAO-MOTOR (v1) — universal
-    // Universal: cobre todas as ações que o motor usa para dizer "não entrar".
-    // Antes faltavam:
-    //   • AGUARDAR_FIM_PULLBACK (motor emite em PULLBACK_EM_CURSO)
-    //   • AGUARDAR_CONFIRMACAO_REVERSAO (motor emite em REVERSAO_*)
-    // Resultado: server enviava prontidão em pullback/reversão ativo,
-    // confundindo o utilizador com "está quase" quando o motor está a dizer "aguarda".
     const _acaoDiag = _diag?.acao_recomendada;
     const _estadoDiag = _diag?.estado;
 
@@ -1560,8 +1499,8 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
       'NAO_ENTRAR_AGUARDAR_PULLBACK',
       'AGUARDAR_ALINHAMENTO',
       'AGUARDAR_DEFINICAO',
-      'AGUARDAR_FIM_PULLBACK',           // ← NOVO
-      'AGUARDAR_CONFIRMACAO_REVERSAO'    // ← NOVO
+      'AGUARDAR_FIM_PULLBACK',
+      'AGUARDAR_CONFIRMACAO_REVERSAO'
     ]);
 
     if (_acaoDiag && _acoesQueBloqueiamProntidao.has(_acaoDiag)) {
@@ -1855,9 +1794,6 @@ app.delete('/api/engine-watchlist', authMiddleware, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ⭐═══════════════════════════════════════════════════════════════════
-// SCAN-GROUP — mantém o comportamento atual, ordenando por zona e score
-// ⭐═══════════════════════════════════════════════════════════════════
 app.post('/api/scan-group', authMiddleware, async (req, res) => {
   const { group, mode } = req.body;
   if (!group || !mode) return res.status(400).json({ error: 'group e mode obrigatórios.' });
@@ -1873,18 +1809,13 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
         const data = await buscarSinalAnalise(symbol, mode, sid);
         if (!data || !data.success) return { symbol, name: getFriendlyName(symbol), signal: 'HOLD', zona: '?', score: 0, reasons: ['Erro'], error: true };
         const consolidated = data.consolidated || {};
-        // Score usa readiness_score (proximidade real) ou score (efetivo de entrada)
         const score = (consolidated.readiness_score ?? consolidated.score ?? 0) || 0;
         const zona = consolidated.zona || '?';
         const signal = consolidated.signal || 'HOLD';
 
-       // ⭐ PATCH #ZONA-B-SCAN-ALINHADO (v1) — alinha com motor
-// Motor: ZONA_B = {40,45,50,55}, ZONA_A = ZONA_B + 15.
-// Diferença anterior (+5 e +10) fazia o painel mostrar
-// "faltam 8 p/ Zona B" quando o motor já aprovou entrada.
-const ZONA_B_MIN = { 'SNIPER': 40, 'CAÇADOR': 45, 'PESCADOR': 50, 'BALEEIRO': 55 };
-const zonaBMin = ZONA_B_MIN[mode] || 45;
-const zonaAMin = zonaBMin + 15;
+        const ZONA_B_MIN = { 'SNIPER': 40, 'CAÇADOR': 45, 'PESCADOR': 50, 'BALEEIRO': 55 };
+        const zonaBMin = ZONA_B_MIN[mode] || 45;
+        const zonaAMin = zonaBMin + 15;
         const distZonaB = Math.max(0, zonaBMin - score);
         const distZonaA = Math.max(0, zonaAMin - score);
 
@@ -2029,7 +1960,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push Retry: ${PUSH_RETRY_ENABLED ? `Ativo (delay ${PUSH_RETRY_DELAY_MS/1000}s)` : 'Desativado (default)'}`);
   logger.info(`🌐 Servidores de análise:`);
   for (const id of VALID_SERVER_IDS) logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
-  logger.info(`v2.41: RE-FIRE-GUARD (5 fixes aplicados)`);
+  logger.info(`v2.42: MATURE-ALIGN-MOTOR + HORIZONTE-FIX + RE-FIRE-GUARD`);
   try { await loadStateFromTurso(); } catch (e) { logger.error('loadStateFromTurso falhou:', e.message); }
 });
 
