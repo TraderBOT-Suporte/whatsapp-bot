@@ -1375,6 +1375,64 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: permitido=false`);
     return;
   }
+    // ═══════════════════════════════════════════════════════════════════════
+  // ⭐ FIX v8.1 — GUARD DI ADAPTATIVO (universal, todos os ativos/modos)
+  // ═══════════════════════════════════════════════════════════════════════
+  // Bloqueia sinal quando o TF de magnitude tem +DI/-DI claramente CONTRA
+  // a direcção do sinal, exigindo ADX mínimo adaptativo por modo e tipo.
+  //
+  // REQUER: analyze-handler deve expor `consolidated.timeframes`
+  // (bloco 1.3 desta lista). Sem isso, `_magDataDI` fica undefined
+  // e o guard degrada graciosamente (passa sem bloquear).
+  // ═══════════════════════════════════════════════════════════════════════
+  const _MAG_TF_DI = { 'SNIPER': 'H4', 'CAÇADOR': 'H24', 'PESCADOR': 'MN1', 'BALEEIRO': 'MN1' };
+  const _ADX_MIN_DI_POR_MODO = { 'SNIPER': 20, 'CAÇADOR': 18, 'PESCADOR': 16, 'BALEEIRO': 13 };
+  const _MULT_DI_POR_TIPO = {
+    'volatility_index': 1.0,
+    'forex':            1.0,
+    'commodity':        1.0,
+    'indice_normal':    1.0,
+    'criptomoeda':      1.1,
+    'step_index':       1.3,
+    'boom_index':       1.5,
+    'crash_index':      1.5,
+    'jump_index':       1.5
+  };
+
+  const _magTFKeyDI    = _MAG_TF_DI[mode];
+  const _magDataDI     = _magTFKeyDI ? dados.consolidated.timeframes?.[_magTFKeyDI] : null;
+  const _magPlusDI     = _magDataDI?.plusDI;
+  const _magMinusDI    = _magDataDI?.minusDI;
+  const _magAdxDI      = _magDataDI?.adx ?? 0;
+  const _magForcaDirDI = _magDataDI?.forcaDirecional;
+  const _tipoAtivoDI   = dados.consolidated.tipo_ativo || 'indice_normal';
+  const _adxMinDI      = Math.round(
+    (_ADX_MIN_DI_POR_MODO[mode] ?? 20) *
+    (_MULT_DI_POR_TIPO[_tipoAtivoDI] ?? 1.0)
+  );
+
+  if (_magPlusDI != null && _magMinusDI != null && _magAdxDI >= _adxMinDI) {
+    const _diContraSinal =
+      (dados.consolidated.signal === 'CALL' && _magMinusDI > _magPlusDI) ||
+      (dados.consolidated.signal === 'PUT'  && _magPlusDI > _magMinusDI);
+
+    if (_diContraSinal) {
+      logger.warn(
+        `⛔ [DI-GUARD][${sid}] ${symbol} (${mode}) ${dados.consolidated.signal} REJEITADO — ` +
+        `${_magTFKeyDI} +DI ${Number(_magPlusDI).toFixed(1)} vs -DI ${Number(_magMinusDI).toFixed(1)} ` +
+        `(ADX ${Number(_magAdxDI).toFixed(1)} ≥ ${_adxMinDI}) forcaDirecional=${_magForcaDirDI || '?'} ` +
+        `[tipo=${_tipoAtivoDI}]`
+      );
+      return;
+    }
+
+    logger.info(
+      `✅ [DI-GUARD][${sid}] ${symbol} (${mode}) ${dados.consolidated.signal} aceite — ` +
+      `${_magTFKeyDI} +DI ${Number(_magPlusDI).toFixed(1)} / -DI ${Number(_magMinusDI).toFixed(1)} a favor ` +
+      `(ADX ${Number(_magAdxDI).toFixed(1)} ≥ ${_adxMinDI}) [tipo=${_tipoAtivoDI}]`
+    );
+  }
+  // ─── fim GUARD DI ADAPTATIVO ───
 
   if (sinalPush !== 'HOLD' && (dados.consolidated.zona === 'A' || dados.consolidated.zona === 'B')) {
     if (dados.suggestion && dados.suggestion.action === 'ENTRADA' &&
