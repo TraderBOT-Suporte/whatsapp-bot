@@ -773,7 +773,19 @@ function extrairDirecaoPrep(dados) {
   if ((_effDir === 'CALL' || _effDir === 'PUT') && _effSrc !== 'blocked_by_market_state' && _effSrc !== 'none') return _effDir;
   const _diag = dados.consolidated?.diagnostico_mercado;
   if (_diag?.estado) {
-    const _autoriza = _diag.estado === 'PULLBACK_EM_CURSO' || _diag.estado === 'TENDENCIA_FORTE_ALINHADA';
+// ⭐ FIX v8 — aceitar também estados da Fase 3 do motor.
+// Sem isto, PULLBACK_RESUMIDO / TOPO_CONFIRMADO / FUNDO_CONFIRMADO /
+// NOVA_TENDENCIA_EMERGENTE eram ignorados → prontidão MATURE nunca dispara
+// nos cenários onde o motor está mais próximo de entrar.
+const _estadosQueAutorizamProntidao = new Set([
+  'PULLBACK_EM_CURSO',        // clássico
+  'TENDENCIA_FORTE_ALINHADA', // clássico
+  'PULLBACK_RESUMIDO',        // ⭐ Fase 3 (Corr.18) — pullback a terminar
+  'TOPO_CONFIRMADO',          // ⭐ Fase 3 (Corr.19) — topo confirmado
+  'FUNDO_CONFIRMADO',         // ⭐ Fase 3 (Corr.19) — fundo confirmado
+  'NOVA_TENDENCIA_EMERGENTE', // ⭐ Fase 3 (Corr.20) — nova tendência a emergir
+]);
+const _autoriza = _estadosQueAutorizamProntidao.has(_diag.estado);
     if (_autoriza &&
         (_diag.direcao === 'CALL' || _diag.direcao === 'PUT') &&
         _diag.acao_recomendada !== 'NAO_ENTRAR_CALL_AGUARDAR_PULLBACK' &&
@@ -953,9 +965,40 @@ function formatarMensagemSinal(symbol, dados, mode) {
     : (zona === 'A' ? '🚨 SINAL CONFIRMADO' : '⚠️ SINAL MODERADO');
 
   const origem = consolidated?._origemSinal || 'motor';
-  const origemLabel = origem === 'PULLBACK_RESUMPTION' ? '🔄 Pullback Resumption'
-    : origem === 'LIMIAR_TENDENCIA' ? '🚀 Limiar Tendência'
-    : '🧠 Motor 3 Camadas';
+  const origemLabel =
+    origem === 'PULLBACK_RESUMPTION'           ? '🔄 Pullback Resumption'
+  : origem === 'LIMIAR_TENDENCIA'              ? '🚀 Limiar Tendência'
+  : origem === 'CONTINUATION'                  ? '🚀 Continuação (trend explosivo)'
+  : origem === 'SWING_MACRO_ALIGNED'           ? '🎯 Swing (macro alinhada)'
+  : origem === 'SWING_REVERSAL'                ? '🔄 Reversão (exaustão contra macro)'
+  : origem === 'LIQUIDITY_SWEEP_OVERRIDE'      ? '💧 Liquidez (sweep)'
+  : origem === 'CONFIRM_OPPOSITE_GATE'         ? '⛔ Confirm oposto (bloqueio)'
+  : origem === 'CONFIRM_OPPOSITE_GATE'         ? '⛔ Confirm oposto (bloqueio)'
+  : origem.startsWith('OVERRIDE_')             ? `🎯 Override ${origem.replace('OVERRIDE_', '')}`
+  : '🧠 Motor 3 Camadas';
+
+  // ⭐ FIX v8 — expor positionSizeMultiplier ao watcher
+  // ─────────────────────────────────────────────────────────────────────
+  // O motor expõe `consolidated.positionSizeMultiplier` (0 a 1). Se for
+  // < 1.0, o watcher deve saber que o motor recomendou sizing reduzido
+  // (ex: TP/SL apertados → 0.5×, confluência média → 0.5×, etc).
+  //
+  // Antes: o corpo da mensagem não mencionava o sizing — o watcher
+  // não sabia que estava a entrar com risco reduzido.
+  //
+  // Depois: se positionSizeMultiplier < 1.0, aparece uma linha extra
+  // "🎯 Sizing X×" no corpo, E o valor vai em `detalhes.positionSizeMultiplier`
+  // para o painel poder renderizar.
+  const _sizingMotor = (() => {
+    const v = Number(consolidated?.positionSizeMultiplier);
+    if (!Number.isFinite(v) || v <= 0) return null;
+    if (v >= 0.99) return null; // sizing normal, não mencionar
+    return v;
+  })();
+
+  const _sizingLinha = _sizingMotor !== null
+    ? `\n🎯 Sizing ${_sizingMotor.toFixed(2)}× (motor recomendou risco reduzido)`
+    : '';
 
   const _motivoReEmissao = _ehReEmissao && dados._reEmissaoMotivo
     ? `\n🔔 Re-emissão: ${dados._reEmissaoMotivo}`
@@ -963,7 +1006,12 @@ function formatarMensagemSinal(symbol, dados, mode) {
 
   return {
     titulo: `${tituloBase}: ${nomeAmigavel} · ${origemLabel}`,
-    corpo: `${emoji} ${dirLabel} · ${nomeAmigavel}\n💲 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}\n🔎 Origem: ${origemLabel}${_motivoReEmissao}`,
+    corpo:
+      `${emoji} ${dirLabel} · ${nomeAmigavel}\n` +
+      `💲 Entrada ${suggestion.entry} · 🎯 TP ${suggestion.takeProfit} · 🛑 SL ${suggestion.stopLoss}\n` +
+      `⚡ Score ${consolidated.score}/100 · Confiança ${conf}% · Zona ${zona}` +
+      `${_sizingLinha}` +
+      `\n🔎 Origem: ${origemLabel}${_motivoReEmissao}`,
     detalhes: {
       tipo: 'SINAL_CONFIRMADO', nomeAmigavel, direcao: consolidated.signal, modo: mode,
       entry: suggestion.entry, takeProfit: suggestion.takeProfit, stopLoss: suggestion.stopLoss,
@@ -972,6 +1020,10 @@ function formatarMensagemSinal(symbol, dados, mode) {
       confidence: conf,
       confidenceBruta: Number.isFinite(Number(consolidated?.confianca_bruta)) ? (Number(consolidated.confianca_bruta) * 100).toFixed(1) : null,
       price: consolidated.price, origem, origemLabel,
+      // ⭐ FIX v8 — expor sizing + override ao painel
+      positionSizeMultiplier: _sizingMotor,
+      tpslCriticoSizing:      consolidated?._tpslCriticoSizing ?? null,
+      confluenceOverride:     consolidated?._confluenceOverride ?? null,
       diagnosticoMercado: consolidated.diagnostico_mercado || null,
       reasons: (consolidated.score_reasons || []).slice(0, 14), zona
     }
@@ -1356,12 +1408,33 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
 
       const _diagRev = dados.consolidated?.diagnostico_mercado;
       const _origemRev = dados.consolidated?._origemSinal;
-      const _ehReversaoAutorizada =
-        _origemRev === 'REVERSAL_EARLY' || _origemRev === 'CASCADE_ENTRY' ||
-        _origemRev === 'REVERSAO_A_FAVOR' || _origemRev === 'MACRO_REVERSAO_LED' ||
-        _diagRev?.estado === 'REVERSAO_CONFIRMADA' ||
-        _diagRev?.estado === 'REVERSAO_LIDERADA' ||
-        _diagRev?.estado === 'REVERSAL_EARLY_ENTRY';
+     // ⭐ FIX v8 — alinhar com TODAS as origens de reversão emitidas pelo motor.
+// Sem isto, MACRO_CROSS e OVERRIDE_* (do BLOCO-14) eram bloqueados pelo
+// DIRECTION-LOCK mesmo sendo reversões autorizadas pelo próprio motor.
+const _origensReversaoMotor = new Set([
+  'REVERSAL_EARLY',
+  'CASCADE_ENTRY',
+  'REVERSAO_A_FAVOR',
+  'MACRO_REVERSAO_LED',
+  'MACRO_CROSS',                  // ⭐ PATCH #MACRO-CROSS-REVERSAL
+  'STRUCTURE_LED_REVERSAL',       // ⭐ PATCH #STRUCTURE-LED-REVERSAL
+  'OVERRIDE_REVERSAL',            // ⭐ BLOCO-14
+  'OVERRIDE_PULLBACK_RESUMIDO',   // ⭐ BLOCO-14
+  'OVERRIDE_CONTINUATION',        // ⭐ BLOCO-14
+  'LIQUIDITY_SWEEP_OVERRIDE',     // ⭐ PATCH #LIQUIDITY-SWEEP
+]);
+
+const _estadosReversaoMotor = new Set([
+  'REVERSAO_CONFIRMADA',
+  'REVERSAO_LIDERADA',
+  'REVERSAL_EARLY_ENTRY',
+  'PULLBACK_RESUMIDO',            // ⭐ Fase 3 — pullback resumido é "reversão" da correção
+  'NOVA_TENDENCIA_EMERGENTE',     // ⭐ Fase 3 — nova tendência a emergir
+]);
+
+const _ehReversaoAutorizada =
+  _origensReversaoMotor.has(_origemRev) ||
+  _estadosReversaoMotor.has(_diagRev?.estado);
 
       const ultimaDir = ultimaDirecaoPorPar.get(tradeKey);
       if (ultimaDir && ultimaDir.sinal !== dados.consolidated.signal) {
