@@ -904,6 +904,11 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
   const proximidadeDiag = diagnosticoProximidade(dados.consolidated.score_reasons || [], dados.consolidated.diagnostico_mercado);
   const bloqueio = proximidadeDiag && proximidadeDiag.nivel === 'BLOQUEADO';
   const matureBloqueadoPorMotor = dados.consolidated?.mature_aprovado === false;
+  // ⭐ P6 — quando o motor está em continuação real mas bloqueado por
+  // respiração/estado, `mature_aprovado_cauteloso: true` + `mature_aprovado: false`.
+  // Nesse caso, "motor disse NÃO ENTRAR" é falso — o motor está a dizer
+  // "continuação real, sizing 0.5×, só falta a respiração normalizar".
+  const matureCautelosoP6 = dados.consolidated?.mature_aprovado_cauteloso === true;
 
   let proximidade, detalhe, emoji;
   if (bloqueio) {
@@ -911,6 +916,10 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
     detalhe = proximidadeDiag.detalhe || 'bloqueio ativo — aguarda normalizar';
   } else if (nivel === 'MATURE') {
     emoji = '🔥'; proximidade = 'PERTO DE ENTRAR'; detalhe = 'setup quase confirmado — prepara a entrada';
+  } else if (matureCautelosoP6) {
+    // ⭐ P6 — continuação real com sizing reduzido; só falta respirar
+    emoji = '🟡'; proximidade = 'PREPARAR (cauteloso)';
+    detalhe = 'motor confirmou continuação — aguarda respiração normalizar · sizing 0.5×';
   } else if (matureBloqueadoPorMotor) {
     emoji = '⏸️'; proximidade = 'INFORMATIVO';
     detalhe = dados.consolidated?.mature_motivo_bloqueio
@@ -922,9 +931,11 @@ function formatarMensagemPrep(symbol, direcao, dados, extras = {}) {
 
   const prefixoTitulo = bloqueio
     ? `⏸️ Em formação (bloqueado): ${nomeAmigavel}`
-    : (matureBloqueadoPorMotor
-        ? `⏸️ Informativo (motor: não entrar): ${nomeAmigavel}`
-        : (nivel === 'MATURE' ? `🔥 Perto de entrar: ${nomeAmigavel}` : `👀 Em formação: ${nomeAmigavel}`));
+    : (matureCautelosoP6
+        ? `🟡 Preparar (cauteloso): ${nomeAmigavel}`
+        : (matureBloqueadoPorMotor
+            ? `⏸️ Informativo (motor: não entrar): ${nomeAmigavel}`
+            : (nivel === 'MATURE' ? `🔥 Perto de entrar: ${nomeAmigavel}` : `👀 Em formação: ${nomeAmigavel}`)));
 
   return {
     titulo: prefixoTitulo,
@@ -1020,11 +1031,14 @@ function formatarMensagemSinal(symbol, dados, mode) {
       confidence: conf,
       confidenceBruta: Number.isFinite(Number(consolidated?.confianca_bruta)) ? (Number(consolidated.confianca_bruta) * 100).toFixed(1) : null,
       price: consolidated.price, origem, origemLabel,
-      // ⭐ FIX v8 — expor sizing + override ao painel
+            // ⭐ FIX v8 — expor sizing + override ao painel
       positionSizeMultiplier: _sizingMotor,
       tpslCriticoSizing:      consolidated?._tpslCriticoSizing ?? null,
       confluenceOverride:     consolidated?._confluenceOverride ?? null,
       diagnosticoMercado: consolidated.diagnostico_mercado || null,
+      // ⭐ P1-P7 — auditoria do motor
+      matureAprovadoCauteloso: consolidated?.mature_aprovado_cauteloso === true,
+      respiracaoBypassP7:      consolidated?._respiracaoBypassP7 === true,
       reasons: (consolidated.score_reasons || []).slice(0, 14), zona
     }
   };
@@ -1371,10 +1385,13 @@ async function analisarEEnviarSinais(symbol, mode, watchers = [], serverId = DEF
     consolidadoPush._permitidoReal !== false &&
     dados.risk_validation?.operavel !== false;
 
-  if (!permitidoPush && !tradesAbertos.has(tradeKey)) {
+ // ⭐ FIX PUSH-GUARD — só bloqueia sinais DIRECCIONAIS.
+// HOLD entra no ramo de PRONTIDAO (que tem os seus próprios gates).
+const _ehHold = sinalPush === 'HOLD';
+if (!_ehHold && !permitidoPush && !tradesAbertos.has(tradeKey)) {
     logger.info(`⏸️ [PUSH-GUARD][${sid}] ${symbol} (${mode}) bloqueado: permitido=false`);
     return;
-  }
+}
     // ═══════════════════════════════════════════════════════════════════════
   // ⭐ FIX v8.1 — GUARD DI ADAPTATIVO (universal, todos os ativos/modos)
   // ═══════════════════════════════════════════════════════════════════════
@@ -1975,10 +1992,12 @@ app.post('/api/scan-group', authMiddleware, async (req, res) => {
           else if (a === 'ENTRADA_VALIDA') mensagemProntidao = `✅ ENTRADA VÁLIDA — ${_diagScan.direcao || signal} confirmado`;
         }
 
-        return {
+              return {
           symbol, name: getFriendlyName(symbol), signal, zona, score,
           readinessScore: consolidated.readiness_score ?? null,
           matureAprovado: consolidated.mature_aprovado ?? false,
+          matureAprovadoCauteloso: consolidated.mature_aprovado_cauteloso === true,   // ⭐ P6
+          respiracaoBypassP7: consolidated.respiracao_bypass_p7 === true,             // ⭐ P7
           matureMotivoBloqueio: consolidated.mature_motivo_bloqueio ?? null,
           origem: consolidated._origemSinal || 'motor',
           proximidade, esticamento: estic,
