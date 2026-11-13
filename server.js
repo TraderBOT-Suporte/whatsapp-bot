@@ -1,10 +1,16 @@
 // ===================== server.js (Painel de Sinais) — TURSO EDITION =====================
-// v2.42 — MATURE-ALIGN-MOTOR + HORIZONTE-FIX
-//         · FIX 1 — SCORE_QUASE_ENTRADA + DEFAULT_PREFS.scoreMature alinhados ao
-//                   motor pós-FIX #MATURE-SCORE-MIN-35 (35/33/40/43 em vez de 40/38/45/48)
-//         · FIX 2 — _horizonteMotor lê de dados.consolidated.horizonte (antes lia
-//                   dados.horizonte que não existe → PATCH #HORIZONTE-DINAMICO morto)
-// (v2.41 mantido: RE-FIRE-GUARD com 5 fixes anteriores)
+// v2.43 — ALIGN-ORIGEM-REVERSAL
+//         · FIX 1 — `_origensReversaoMotor` sincronizado com TODOS os valores
+//                   realmente emitidos por analyze-handler.js (`_origemSinal`).
+//                   Antes tinha 7 entradas "dead" (nunca emitidas), 2 com nome
+//                   errado (MACRO_CROSS, OVERRIDE_PULLBACK_RESUMIDO) e faltavam
+//                   10 origens reais → DIRECTION-LOCK bloqueava reversões
+//                   legítimas (SWING_REVERSAL, MACRO_CROSS_REVERSAL,
+//                   PULLBACK_RESUMPTION, etc).
+//         · FIX 2 — `_estadosReversaoMotor` inclui `REVERSAO_EM_CURSO`,
+//                   `TOPO_CONFIRMADO`, `FUNDO_CONFIRMADO` (todos emitidos
+//                   pelo classificador-único).
+// (v2.42 mantido: MATURE-ALIGN-MOTOR + HORIZONTE-FIX + RE-FIRE-GUARD)
 
 import express from 'express';
 import cors from 'cors';
@@ -1483,33 +1489,68 @@ if (!_ehHold && !permitidoPush && !tradesAbertos.has(tradeKey)) {
 
       const _diagRev = dados.consolidated?.diagnostico_mercado;
       const _origemRev = dados.consolidated?._origemSinal;
-     // ⭐ FIX v8 — alinhar com TODAS as origens de reversão emitidas pelo motor.
-// Sem isto, MACRO_CROSS e OVERRIDE_* (do BLOCO-14) eram bloqueados pelo
-// DIRECTION-LOCK mesmo sendo reversões autorizadas pelo próprio motor.
-const _origensReversaoMotor = new Set([
-  'REVERSAL_EARLY',
-  'CASCADE_ENTRY',
-  'REVERSAO_A_FAVOR',
-  'MACRO_REVERSAO_LED',
-  'MACRO_CROSS',                  // ⭐ PATCH #MACRO-CROSS-REVERSAL
-  'STRUCTURE_LED_REVERSAL',       // ⭐ PATCH #STRUCTURE-LED-REVERSAL
-  'OVERRIDE_REVERSAL',            // ⭐ BLOCO-14
-  'OVERRIDE_PULLBACK_RESUMIDO',   // ⭐ BLOCO-14
-  'OVERRIDE_CONTINUATION',        // ⭐ BLOCO-14
-  'LIQUIDITY_SWEEP_OVERRIDE',     // ⭐ PATCH #LIQUIDITY-SWEEP
-]);
 
-const _estadosReversaoMotor = new Set([
-  'REVERSAO_CONFIRMADA',
-  'REVERSAO_LIDERADA',
-  'REVERSAL_EARLY_ENTRY',
-  'PULLBACK_RESUMIDO',            // ⭐ Fase 3 — pullback resumido é "reversão" da correção
-  'NOVA_TENDENCIA_EMERGENTE',     // ⭐ Fase 3 — nova tendência a emergir
-]);
+      // ═══════════════════════════════════════════════════════════════════════
+      // ⭐ FIX v2.43 — ALIGN-ORIGEM-REVERSAL (UNIVERSAL)
+      // ───────────────────────────────────────────────────────────────────────
+      // Sincroniza os Sets com TODOS os valores realmente emitidos por
+      // analyze-handler.js (motor) no campo `consolidated._origemSinal`.
+      //
+      // ANTES (v2.42):
+      //   • Set tinha 7 entradas "dead" (REVERSAL_EARLY, CASCADE_ENTRY, etc —
+      //     nunca atribuídas a `_origemSinal`) — código morto.
+      //   • 2 entradas com nome errado: 'MACRO_CROSS' (real: MACRO_CROSS_REVERSAL)
+      //     e 'OVERRIDE_PULLBACK_RESUMIDO' (real: OVERRIDE_PULLBACK).
+      //   • Faltavam 10 origens reais emitidas pelo motor:
+      //       PULLBACK_RESUMPTION, LIMIAR_TENDENCIA, SWING_MACRO_ALIGNED,
+      //       SWING_REVERSAL, CONTINUATION, PULLBACK_TRIGGER_FLIPADO,
+      //       MACRO_CROSS_REVERSAL, SMC_OVERRIDE, OVERRIDE_SWING,
+      //       OVERRIDE_MACRO_CROSS
+      //
+      // CONSEQUÊNCIA: o DIRECTION-LOCK (bloqueio de inversão de direcção
+      // em <30min) bloqueava reversões LEGÍTIMAS do motor — o server não
+      // reconhecia a origem como autorizada.
+      //
+      // Caso real frxXAGUSD 2026-11-13: motor gerou SWING_REVERSAL para CALL
+      // após PUT anterior — DIRECTION-LOCK bloqueou porque SWING_REVERSAL
+      // não estava no Set.
+      // ═══════════════════════════════════════════════════════════════════════
+      const _origensReversaoMotor = new Set([
+        // ── Overrides do motor (BLOCO-14) ──
+        'OVERRIDE_REVERSAL',
+        'OVERRIDE_PULLBACK',
+        'OVERRIDE_PULLBACK_RESUMIDO',   // alias defensivo (retrocompat)
+        'OVERRIDE_CONTINUATION',
+        'OVERRIDE_SWING',
+        'OVERRIDE_MACRO_CROSS',
+        // ── Overrides directos do handler ──
+        'SWING_MACRO_ALIGNED',          // SWING-OVERRIDE
+        'SWING_REVERSAL',               // REVERSAL-OVERRIDE (explícito)
+        'CONTINUATION',                 // CONTINUATION-OVERRIDE
+        'PULLBACK_RESUMPTION',          // PULLBACK-RESUM DIRECT
+        'PULLBACK_TRIGGER_FLIPADO',     // PATCH PULLBACK-TRIGGER-FLIPADO
+        'LIMIAR_TENDENCIA',             // LIMIAR DIRECT
+        'MACRO_CROSS_REVERSAL',         // PATCH MACRO-CROSS-ZONE-B
+        'SMC_OVERRIDE',                 // SMC-OVERRIDE v5
+        'LIQUIDITY_SWEEP_OVERRIDE',     // LIQUIDITY-SWEEP-OVERRIDE v2
+      ]);
 
-const _ehReversaoAutorizada =
-  _origensReversaoMotor.has(_origemRev) ||
-  _estadosReversaoMotor.has(_diagRev?.estado);
+      // Estados do diagnóstico que autorizam flips de direcção.
+      // Inclui TODOS os estados de reversão possíveis do classificador-único.
+      const _estadosReversaoMotor = new Set([
+        'REVERSAO_CONFIRMADA',
+        'REVERSAO_EM_CURSO',            // ⭐ FALTAVA — estado mais comum em reversões
+        'REVERSAO_LIDERADA',
+        'REVERSAL_EARLY_ENTRY',
+        'PULLBACK_RESUMIDO',            // Fase 3 — pullback resumido é "reversão" da correção
+        'NOVA_TENDENCIA_EMERGENTE',     // Fase 3 — nova tendência a emergir
+        'TOPO_CONFIRMADO',              // ⭐ FALTAVA (Fase 3)
+        'FUNDO_CONFIRMADO',             // ⭐ FALTAVA (Fase 3)
+      ]);
+
+      const _ehReversaoAutorizada =
+        _origensReversaoMotor.has(_origemRev) ||
+        _estadosReversaoMotor.has(_diagRev?.estado);
 
       const ultimaDir = ultimaDirecaoPorPar.get(tradeKey);
       if (ultimaDir && ultimaDir.sinal !== dados.consolidated.signal) {
@@ -2110,7 +2151,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   logger.info(`Push Retry: ${PUSH_RETRY_ENABLED ? `Ativo (delay ${PUSH_RETRY_DELAY_MS/1000}s)` : 'Desativado (default)'}`);
   logger.info(`🌐 Servidores de análise:`);
   for (const id of VALID_SERVER_IDS) logger.info(`   · ${id} (${ANALYSIS_SERVERS[id].name}) → ${ANALYSIS_SERVERS[id].url}`);
-  logger.info(`v2.42: MATURE-ALIGN-MOTOR + HORIZONTE-FIX + RE-FIRE-GUARD`);
+  logger.info(`v2.43: ALIGN-ORIGEM-REVERSAL + MATURE-ALIGN-MOTOR + HORIZONTE-FIX + RE-FIRE-GUARD`);
   try { await loadStateFromTurso(); } catch (e) { logger.error('loadStateFromTurso falhou:', e.message); }
 });
 
